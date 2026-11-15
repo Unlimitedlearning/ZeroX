@@ -13,11 +13,23 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
 
+# ==========================================
+# [全局变量区域]
+# ==========================================
 current_log_handle = None
 current_process = None
+TEST_LOG_FILE = None
+WORK_JSON_FILE = None
+CURRENT_BUG = None
+
+# 新增：状态锁与计时器变量
+IS_TASK_INITIALIZED = False
+START_TIME = None
+CURRENT_ROUND = 0
+TOTAL_ATTEMPTS = 0
 
 # ==========================================
-# [Cross-Platform] Runtime Environment Check: Windows via WSL forwarding, Linux native execution
+# [跨平台] 运行环境检测
 # ==========================================
 IS_WINDOWS = sys.platform == "win32"
 
@@ -27,12 +39,11 @@ BACKUP_ROOT = os.path.join(BASE_DIR, "backups")
 LOG_FILE = os.path.join(LOG_DIR, "mcp_server.log")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
+# 基准测试结果文件
+METRICS_FILE = os.path.join(LOG_DIR, "benchmark_metrics.jsonl")
+
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(BACKUP_ROOT, exist_ok=True)
-
-TEST_LOG_FILE = None
-WORK_JSON_FILE = None
-CURRENT_BUG = None
 
 handler = RotatingFileHandler(
     LOG_FILE, maxBytes=5*1024*1024, backupCount=2, encoding='utf-8'
@@ -166,6 +177,34 @@ def restore_written_files(applied_files, staged_writes):
             broken.append(wsl_path)
     return restored, broken
 
+# ==========================================
+# 指标记录器（JSONL）
+# ==========================================
+def record_metric(status: str):
+    global START_TIME, IS_TASK_INITIALIZED
+    if START_TIME is None:
+        return
+    
+    end_time = time.time()
+    elapsed = round(end_time - START_TIME, 2)
+    
+    metric_data = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "bug_id": CURRENT_BUG,
+        "status": status,
+        "total_time_seconds": elapsed,
+        "current_round": CURRENT_ROUND,      # 最终停留在第几轮
+        "total_attempts": TOTAL_ATTEMPTS     # 真实的 API 调用/修改次数
+    }
+    
+    with open(METRICS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(metric_data, ensure_ascii=False) + "\n")
+    
+    logging.info(f"📊 记录基准数据: {metric_data}")
+    
+    # 记录完毕，重置计时器和锁状态，准备好下一个 Bug
+    START_TIME = None
+    IS_TASK_INITIALIZED = False
 
 server = Server("zerox-server")
 
@@ -268,10 +307,14 @@ async def list_tools():
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
-    # 【多 Bug 隔离】WORK_JSON_FILE / TEST_LOG_FILE / CURRENT_BUG 会按 bug_id 重新赋值
     global current_log_handle, current_process, WORK_JSON_FILE, TEST_LOG_FILE, CURRENT_BUG
+    global IS_TASK_INITIALIZED, START_TIME, CURRENT_ROUND, TOTAL_ATTEMPTS 
 
     if name == "run_defects4j_test":
+        # 🚨 防呆锁：只初始化一次
+        if IS_TASK_INITIALIZED:
+            return [types.TextContent(type="text", text=f"【系统强制拒绝】当前任务 `{CURRENT_BUG}` 的测试环境已初始化！严禁重复执行 checkout。如果你认为代码已被彻底改坏，请先调用 `rollback(target_round=1)` 重置代码，再继续修复。", isError=True)]
+        
         if current_process is not None and current_process.poll() is None:
             return [types.TextContent(type="text", text="【系统拒绝】上一轮测试仍在运行中，请先调用 read_test_log 确认其状态，或等待其完成。", isError=True)]
 
@@ -310,6 +353,13 @@ async def call_tool(name: str, arguments: dict):
             f = open(TEST_LOG_FILE, "w", encoding="utf-8")
             current_log_handle = f
             current_process = popen_in_target(full_cmd, stdout=f, stderr=subprocess.STDOUT)
+
+            # 计时器与状态锁更新
+            IS_TASK_INITIALIZED = True
+            START_TIME = time.time()
+            CURRENT_ROUND = 0
+            TOTAL_ATTEMPTS = 0
+
             logging.info("后台任务已启动")
             return [types.TextContent(type="text", text=f"任务已在后台启动！当前 Bug 为 `{CURRENT_BUG}`，workdir 是 `{workdir}`。请在 1-3 分钟后使用 `read_test_log` 工具查看执行结果。不要立刻重复执行！")]
         except Exception as e:
@@ -317,37 +367,37 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text=f"启动失败: {str(e)}")]
 
     elif name == "read_test_log":
-        # 【多 Bug 隔离】还没跑过 run_defects4j_test 时不知道读哪个文件
+
         if TEST_LOG_FILE is None:
             return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_defects4j_test 初始化当前 Bug 的测试环境。", isError=True)]
 
         if not os.path.exists(TEST_LOG_FILE):
             return [types.TextContent(type="text", text="日志文件不存在，可能任务还没开始。")]
 
-        # 【P1-5】进程状态机：先 poll() 判断测试进程死活，再解析日志
+        # 进程状态机：先判断测试进程死活，再解析日志
         is_running = current_process is not None and current_process.poll() is None
         exit_code = None
         if current_process is not None and not is_running:
             exit_code = current_process.returncode
 
-        # 状态 0：进程还活着 —— 阻塞等待
+        # 状态 0：阻塞等待
         if is_running:
             try:
-                # 阻塞等待进程结束，最多等 5 分钟（300秒）
-                # 这期间不消耗任何大模型 Token，纯 Python 在等
+                # 最多等300秒，期间不消耗Token
                 current_process.wait(timeout=300)
             except subprocess.TimeoutExpired:
-                # 如果等了 5 分钟还没跑完，说明可能卡死了
+                # ⏱️ 记录超时
+                record_metric("Timeout")
                 return [types.TextContent(type="text", text="【系统提示】测试已运行超过 5 分钟仍未结束，可能发生死锁或超时。建议检查环境或结束任务。")]
             
-            # 走到这里，说明进程已经跑完了，更新状态
+            # 更新状态
             is_running = False
             exit_code = current_process.returncode
 
         with open(TEST_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
 
-        # 状态 0.5：日志还是空的
+
         if not content.strip():
             return [types.TextContent(type="text", text="【日志为空】测试还没有输出任何内容，请稍后再试。")]
 
@@ -355,8 +405,10 @@ async def call_tool(name: str, arguments: dict):
         if current_process is None and "Running ant" in content and "Failing tests:" not in content and "BUILD FAILED" not in content:
             return [types.TextContent(type="text", text="【系统提示】当前正在编译或运行测试中，请勿盲目猜测。请等待 1 分钟后再次调用此工具查看结果。")]
 
-        # 状态 2：全部通过 (必须放在失败前面！)
+        # 状态 2：全部通过
         if "Failing tests: 0" in content:
+            # ⏱️ 记录成功
+            record_metric("Fixed")
             note = "" if exit_code in (None, 0) else f"（注意：进程退出码为 {exit_code}，可查看日志尾部确认是否有编译告警）"
             return [types.TextContent(type="text", text=f"【测试全部通过】该 Bug 已成功修复！请结束任务。{note}")]
 
@@ -366,7 +418,7 @@ async def call_tool(name: str, arguments: dict):
 
         # 状态 3：测试失败，提取失败列表
         if "Failing tests:" in content:
-            # 【P1-4 修复】去掉 (?=\n\n|\Z) 的限制，防止遇到空行截断，保留完整堆栈
+            
             match = re.search(r"Failing tests:\s*([1-9]\d*)([\s\S]*)", content, re.DOTALL)
             if match:
                 failing_info = match.group(2).strip() if match.group(2) else "无详细堆栈"
@@ -416,7 +468,7 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text=f"异常: {str(e)}")]
 
     elif name == "run_test_only":
-        # 【多 Bug 隔离】没初始化就不知道日志该写哪个文件，直接拒绝
+        # 先初始化
         if TEST_LOG_FILE is None:
             return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_defects4j_test 初始化当前 Bug 的测试环境。", isError=True)]
 
@@ -428,7 +480,7 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text=f"参数错误：必须提供 workdir（形如 {build_workdir('Lang', '2b')}）", isError=True)]
 
         d4j = shlex.quote(D4J_PATH)
-        # 【P1-6】目录先校验再跑：目录写错会白等十分钟；顺便 quote 掉带空格的路径
+        # 目录先校验再跑，顺便 quote 掉带空格的路径
         wsl_workdir = shlex.quote(workdir)
         # 【修复】用 {} 包起来，目录不存在时写入提示并 exit 1，不再往下执行
         full_cmd = f"test -d {wsl_workdir} || {{ echo 'WORKDIR_NOT_FOUND: 指定的目录不存在'; exit 1; }}; {d4j} test -w {wsl_workdir}"
@@ -453,7 +505,7 @@ async def call_tool(name: str, arguments: dict):
     # 下面是合并后的核心工具：记录日志 + 应用补丁
     # ==========================================
     elif name == "patch_and_log":
-        # 【多 Bug 隔离】没有当前 Bug 就不知道该写哪个工作日志
+        # 先初始化
         if WORK_JSON_FILE is None:
             return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_defects4j_test 初始化当前 Bug 的测试环境。", isError=True)]
 
@@ -463,10 +515,7 @@ async def call_tool(name: str, arguments: dict):
         fix_summary = arguments.get("fix_summary")
         changes = arguments.get("changes", [])
 
-        # 第一阶段：全部在内存中校验和替换（不碰硬盘）
-        # 【P0-1】staged_writes 改成 dict[wsl_path] = {"content": 最新内容, "original": 磁盘原文}。
-        #         同一轮里对同一个文件的多段 diff，会基于「上一段改完的内容」继续替换，
-        #         不会出现后一段把前一段覆盖掉的静默丢失。order 用来保持落盘顺序。
+        # 第一阶段：全部在内存中校验和替换，order 用来保持落盘顺序。
         staged_writes = {}
         order = []
 
@@ -508,31 +557,28 @@ async def call_tool(name: str, arguments: dict):
         # 第二阶段：确认所有文件都能改，才开始统一落盘
         applied_files = []
 
-        # 【新增 2 / 多 Bug 隔离】备份按 Bug 分目录：backups/Lang_1b/、backups/Lang_2b/ ...
+        # 备份按 Bug 分目录：backups/Lang_1b/、backups/Lang_2b/ ...
         backup_dir = current_backup_dir()
         if not os.path.exists(backup_dir):
             os.makedirs(backup_dir)
 
         try:
-            # 【P0-1】按 order 遍历 dict，每个文件只写一次
+            # 每个文件只写一次
             for wsl_path in order:
                 new_content = staged_writes[wsl_path]["content"]
                 original_content = staged_writes[wsl_path]["original"]
 
-                # 【新增 4】：写入前，先保存原始文件的备份
-                # 用完整路径替换斜杠来命名，防止不同目录的同名文件互相覆盖
+                # 写入前，先保存备份，用完整路径替换斜杠来命名，防止不同目录的同名文件互相覆盖
                 safe_name = wsl_path.replace("/", "_").replace(":", "_")
                 backup_filename = f"{safe_name}_round_{round_num}.bak"
                 backup_win_path = os.path.join(backup_dir, backup_filename)
                 with open(backup_win_path, "w", encoding="utf-8", newline="\n") as f_bak:
                     f_bak.write(original_content)
-                # ----------------------------------------
-
-                # 原有的写入逻辑（抽成 write_target_file，临时文件名唯一，不会串味）
+                
                 write_target_file(wsl_path, new_content)
                 applied_files.append(wsl_path)
         except Exception as e:
-            # 【P0-2】写盘中途失败：立刻用内存里的原文把已写入的文件强行还原，
+            # 写盘中途失败：立刻用内存里的原文把已写入的文件强行还原，
             # 避免出现「工具说失败、代码却半改、日志里也查不到」的静默脏状态
             restored, broken = restore_written_files(applied_files, staged_writes)
             msg = f"写入硬盘时发生异常：{str(e)}。已自动回滚 {len(restored)} 个文件"
@@ -555,16 +601,19 @@ async def call_tool(name: str, arguments: dict):
         with open(WORK_JSON_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
 
+        # 更新全局轮次变量，供指标记录使用
+        CURRENT_ROUND = round_num
+        
+        TOTAL_ATTEMPTS += 1
         return [types.TextContent(type="text", text=f"修复成功！代码差异已原子化应用到 {len(applied_files)} 个文件，工作日志（{os.path.basename(WORK_JSON_FILE)}）已持久化。现在你可以调用 run_test_only 跑测试了。")]
 
     elif name == "get_work_log":
-        # 【多 Bug 隔离】只读当前 Bug 自己的工作日志，避免串台
+        # 【多 Bug 隔离】只读当前 Bug 的工作日志
         if WORK_JSON_FILE is None:
             return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_defects4j_test 初始化当前 Bug 的测试环境。", isError=True)]
 
         limit = arguments.get("limit", 3)
 
-        # 修复 limit=0 的 Bug
         if limit <= 0:
             return [types.TextContent(type="text", text="已跳过读取历史日志（limit <= 0）。")]
 
@@ -578,7 +627,7 @@ async def call_tool(name: str, arguments: dict):
         return [types.TextContent(type="text", text=f"当前 Bug（{CURRENT_BUG}）最近的工作日志如下：\n" + "".join(recent_logs))]
 
     elif name == "rollback":
-        # 【多 Bug 隔离】没有当前 Bug 就找不到对应的工作日志与备份目录
+
         if WORK_JSON_FILE is None:
             return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_defects4j_test 初始化当前 Bug 的测试环境。", isError=True)]
 
@@ -613,7 +662,7 @@ async def call_tool(name: str, arguments: dict):
                     wsl_path = change.get("file_path")
                     if not wsl_path: continue
 
-                    # 寻找对应的备份文件（修复：把 round_num 改为当前循环的轮次变量 r）
+                    # 寻找对应的备份文件，r为当前循环的轮次 
                     safe_name = wsl_path.replace("/", "_").replace(":", "_")
                     backup_filename = f"{safe_name}_round_{r}.bak"
                     backup_win_path = os.path.join(backup_dir, backup_filename)
@@ -630,7 +679,7 @@ async def call_tool(name: str, arguments: dict):
                             logging.error(f"恢复文件 {wsl_path} 失败: {str(e)}")
                             # 记录失败但继续恢复下一个文件
 
-        # 【P0-3】先判断有没有真正恢复文件：一个都没恢复就绝不动工作日志，
+        # 先判断是否真正恢复文件：一个都没恢复就绝不动工作日志，
         # 否则会出现「日志被删干净、代码还是脏的、以后也没法回滚」的最坏情况
         if not restored_files:
             return [types.TextContent(type="text", text=f"在第 {target_round} 轮及之后没有找到可用的备份文件，未改动任何代码和日志。")]
