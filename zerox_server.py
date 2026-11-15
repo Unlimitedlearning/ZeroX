@@ -324,9 +324,6 @@ async def call_tool(name: str, arguments: dict):
         if not os.path.exists(TEST_LOG_FILE):
             return [types.TextContent(type="text", text="日志文件不存在，可能任务还没开始。")]
 
-        with open(TEST_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-
         # 【P1-5】进程状态机：先 poll() 判断测试进程死活，再解析日志
         is_running = current_process is not None and current_process.poll() is None
         exit_code = None
@@ -346,6 +343,9 @@ async def call_tool(name: str, arguments: dict):
             # 走到这里，说明进程已经跑完了，更新状态
             is_running = False
             exit_code = current_process.returncode
+
+        with open(TEST_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
 
         # 状态 0.5：日志还是空的
         if not content.strip():
