@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+
+# ZeroX specific
+logs/
+backups/
+config.json
+temp_code_*.txt
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

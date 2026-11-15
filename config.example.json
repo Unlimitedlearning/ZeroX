@@ -1,0 +1,4 @@
+{
+  "defects4j_path": "/path/to/defects4j/framework/bin/defects4j",
+  "work_root": "/path/to/your/workdir"
+}
