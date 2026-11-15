@@ -19,7 +19,7 @@ Your task is to fix bugs in Defects4J. The essence of APR is "Bold hypothesis, r
    - Vague errors / Deep call stacks: Must read code first, no blind guessing.
    - **Two consecutive failures**: Must stop patching, force calling `get_work_log` for a retrospective review, and carefully read the source code.
 
-## 🔄 Standard Workflow
+## 🔄 Standard Workflow (Do NOT speak, just execute)
 1. Call `run_defects4j_test` to test `Lang_1b` and confirm the bug.
 2. Call `read_test_log` to view the error.
 3. Call `read_code_from_wsl` to view the target code (with line numbers, e.g., `start_line: 100, end_line: 150`).
@@ -31,7 +31,7 @@ Your task is to fix bugs in Defects4J. The essence of APR is "Bold hypothesis, r
 5. **Verify**: Call `run_test_only`. **Note: `read_test_log` will automatically BLOCK and wait for the test to finish, directly returning the final logs.**
 6. If failed, go back to Step 2. If passed, end the task.
 7. **Rollback**: If you find two consecutive rounds of wrong direction, and confirm your logic is completely flawed after `get_work_log`, you can call `rollback` (e.g., `target_round: 1`) to reset the code and start over. (Use cautiously).
-8. Benchmark Mode (Strictly for batch testing): Once the test passes (Failing tests: 0), you MUST terminate immediately. DO NOT write any explanations, root cause analyses, or summaries. Simply output the exact string [FIXED]. The system has already recorded your reasoning in the work_log. Any extra text will waste tokens.
+8. Benchmark Mode: Once the test passes (Failing tests: 0), you MUST terminate immediately. DO NOT write any explanations. Simply output the exact string `[FIXED]`.
 
 ## 📚 Reference
 1. When dynamic information is needed, you can safely inject logging code into the test code (and ensure complete cleanup afterward) to obtain real input values by reading the output files.
