@@ -328,12 +328,16 @@ async def call_tool(name: str, arguments: dict):
         project, bug_num, suffix = match.groups()
         version = bug_num + (suffix if suffix else "b") # 默认加 b
 
-        # 【多 Bug 隔离】解析出 project/version 后立刻锁定当前 Bug，并切到该 Bug 专属的日志路径，
-        # 这样子测完 Lang_1 再测 Lang_2，两边的测试日志和工作日志不会互相覆盖/追加污染
+        # 【多 Bug 隔离】
         CURRENT_BUG = f"{project}_{version}"
-        TEST_LOG_FILE = os.path.join(LOG_DIR, f"test_{CURRENT_BUG}.log")
-        WORK_JSON_FILE = os.path.join(LOG_DIR, f"work_log_{CURRENT_BUG}.json")
-        logging.info(f"切换当前 Bug 为 {CURRENT_BUG} | 测试日志: {TEST_LOG_FILE} | 工作日志: {WORK_JSON_FILE}")
+        CURRENT_BUG_DIR = os.path.join(LOG_DIR, CURRENT_BUG)
+        os.makedirs(CURRENT_BUG_DIR, exist_ok=True) # 如果文件夹不存在则创建
+
+        # 修改路径指向新文件夹：
+        TEST_LOG_FILE = os.path.join(CURRENT_BUG_DIR, "test.log") # 名字可以精简了
+        WORK_JSON_FILE = os.path.join(CURRENT_BUG_DIR, "work_log.jsonl")
+
+        logging.info(f"切换当前 Bug 为 {CURRENT_BUG} | 专属目录: {CURRENT_BUG_DIR}")
 
         workdir = build_workdir(project, version)
         d4j = shlex.quote(D4J_PATH)
@@ -680,7 +684,7 @@ async def call_tool(name: str, arguments: dict):
                             # 记录失败但继续恢复下一个文件
 
         # 先判断是否真正恢复文件：一个都没恢复就绝不动工作日志，
-        # 否则会出现「日志被删干净、代码还是脏的、以后也没法回滚」的最坏情况
+
         if not restored_files:
             return [types.TextContent(type="text", text=f"在第 {target_round} 轮及之后没有找到可用的备份文件，未改动任何代码和日志。")]
 
@@ -696,6 +700,13 @@ async def call_tool(name: str, arguments: dict):
             r = log_data.get("round")
             if r is None or r < target_round:
                 new_lines.append(line)
+            else: 
+                bug_dir = os.path.dirname(WORK_JSON_FILE)
+                audit_file = os.path.join(bug_dir, "human_audit.jsonl")
+                with open(audit_file, "a", encoding="utf-8") as f_audit:
+                    # 增加回滚标记，方便复盘
+                    log_data["rollback_target"] = target_round
+                    f_audit.write(json.dumps(log_data, ensure_ascii=False) + "\n")
 
         with open(WORK_JSON_FILE, "w", encoding="utf-8") as f:
             f.writelines(new_lines)

@@ -11,6 +11,8 @@
 2. **Atomic Patch Operations**: Through the `patch_and_log` tool, the LLM is strictly forced to output `old/new` code diffs instead of full code. This guarantees atomicity: automatic backups before writing, and automatic rollback upon failure.
 3. **Emergent Self-Healing under Minimalist Tools**: 
    Under the constraint of only 6 basic tools, when facing missing static metadata in Defects4J, the agent spontaneously exhibited advanced debugging behavior: autonomously injecting diagnostic probes into test/production code, writing runtime variables to temporary files, and actively cleaning them up after getting the ground truth. This proves that under a non-polluted context, a lightweight LLM possesses emergent abilities to break through information blind spots. (This emergent behavior has been solidified into an SOP in `AGENTS.md`).
+4. **Nudge Theory & Asymmetric Memory Architecture**: 
+   We separate the memory for AI and humans. For the AI, rollback means a clean slate (Preventing Context Poisoning and "Learned Helplessness"). For human developers, all discarded patches and failed trajectories are strictly preserved in `rollback_history.jsonl`. This provides an untainted exploration space for the LLM while offering researchers invaluable data for Prompt optimization and Error Analysis.
 
 ## 📊 Experimental Results (Defects4J Benchmark)
 
