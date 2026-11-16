@@ -77,11 +77,16 @@ def load_config():
             logging.error(f"❌ Fatal: Missing or empty '{key}' in '{CONFIG_FILE}'.")
             sys.exit(1)
 
+    if not isinstance(config["max_attempts"], int) or config["max_attempts"] <= 0:
+        logging.error(f"❌ Fatal: 'max_attempts' must be a positive integer in '{CONFIG_FILE}'.")
+        sys.exit(1)
+
     return config
 
 CONFIG = load_config()
 D4J_PATH = CONFIG["defects4j_path"]
 WORK_ROOT = CONFIG["work_root"].rstrip("/")
+MAX_ATTEMPTS = CONFIG["max_attempts"]
 
 logging.info(
     f"运行环境：{'Windows(WSL 转发)' if IS_WINDOWS else 'Linux(原生)'} | "
@@ -512,7 +517,11 @@ async def call_tool(name: str, arguments: dict):
         # 先初始化
         if WORK_JSON_FILE is None:
             return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_defects4j_test 初始化当前 Bug 的测试环境。", isError=True)]
-
+        
+        if TOTAL_ATTEMPTS >= MAX_ATTEMPTS:
+            record_metric("Failed") # 直接记为失败
+            return [types.TextContent(type="text", text=f"【任务失败】已达最大尝试次数 ({MAX_ATTEMPTS} 次)。请立刻停止修复，并输出 [FAILED]。", isError=True)]
+        
         round_num = arguments.get("round")
         status = arguments.get("status")
         reasoning = arguments.get("reasoning")
