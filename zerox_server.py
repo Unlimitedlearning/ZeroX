@@ -196,7 +196,7 @@ def record_metric(status: str):
         return
     
     end_time = time.time()
-    elapsed = round(end_time - START_TIME, 2)
+    elapsed = round(time.time() - START_TIME, 2) if START_TIME is not None else 0.0
     
     metric_data = {
         "timestamp": datetime.datetime.now().isoformat(),
