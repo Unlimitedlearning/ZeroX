@@ -1,5 +1,11 @@
 {
   "defects4j_path": "/path/to/defects4j/framework/bin/defects4j",
   "work_root": "/path/to/your/workdir",
-  "max_attempts": 10
+  "max_attempts": 10,
+  "llm_config": {
+    "api_key": "${DEEPSEEK_API_KEY}",
+    "base_url": "https://api.deepseek.com/v1",
+    "model_name": "deepseek-flash"
+  },
+  "benchmark_bugs": ["Lang_1", "Lang_2", "Lang_3", "Lang_4"]
 }
