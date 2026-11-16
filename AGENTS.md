@@ -16,7 +16,9 @@ Your task is to fix Defects4J bugs. DO NOT TALK. Just use tools.
 
 ## 🔄 Standard Workflow(Do NOT speak, just execute)
 1. `run_test` (initial bug confirmation)
-2. `search_code` and `read_code_from_wsl` (targeted analysis)
+2. `search_code` to locate the target file.
+   - If you don't know the exact line number, you MUST call `get_file_structure` first to find the method's starting line.
+   - Then use `read_code_from_wsl` to read the exact line range. Do NOT read the whole file blindly.
 3. `patch_and_log`
 4. `run_test` (verify. This tool will return the final result directly)
 5. If passed, output `[FIXED]`. If failed, go back to step 2.

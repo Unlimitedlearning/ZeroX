@@ -325,7 +325,17 @@ async def list_tools():
                 "required": ["target_round"]
             }
         ),
-        
+        types.Tool(
+            name="get_file_structure",
+            description="获取 Java 文件的代码结构（包含类名和方法名及其起始行号）。在你使用 search_code 找到文件后，强烈建议先调用此工具，再精准定位需要读取的行范围。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "wsl_file_path": {"type": "string", "description": "Java 文件的绝对路径"}
+                },
+                "required": ["wsl_file_path"]
+            }
+        ),
     ]
 
 @server.call_tool()
@@ -485,13 +495,47 @@ async def call_tool(name: str, arguments: dict):
             formatted_lines = [f"{start_idx + i + 1}: {line}" for i, line in enumerate(selected_lines)]
 
             nudge_msg = ""
-            if READ_CODE_COUNT >= 3:
-                nudge_msg = f"\n\n⚠️ **[System Nudge]** You have read the code {READ_CODE_COUNT} times consecutively. You have gathered enough context. Please stop reading and try to call `patch_and_log` to make a bold hypothesis now!"   
+            if READ_CODE_COUNT >= 5:
+                nudge_msg = f"\n\n⚠️ **[System Nudge]** You have read the code {READ_CODE_COUNT} times consecutively. Please stop reading and try to call `patch_and_log` to make a bold hypothesis now!"   
             return [types.TextContent(type="text", text=f"文件 {wsl_path} 第 {start_line}-{end_line} 行内容如下:\n" + "\n".join(formatted_lines) + nudge_msg)]
         except Exception as e:
             return [types.TextContent(type="text", text=f"异常: {str(e)}")]
 
+    elif name == "get_file_structure":
+        wsl_path = arguments.get("wsl_file_path")
+        try:
+            # 读出文件内容
+            result = execute_in_target(f"cat {shlex.quote(wsl_path)}")
+            if result.returncode != 0:
+                return [types.TextContent(type="text", text=f"读取失败: {result.stderr}")]
+            
+            lines = result.stdout.splitlines()
+            structure_info = []
+            
+            # 正则匹配类名和方法名
+            # 匹配类：public class Foo / interface Foo / enum Foo
+            class_pattern = re.compile(r'^\s*(?:public|protected|private)?\s*(?:static)?\s*(?:final)?\s*(?:abstract)?\s*(class|interface|enum)\s+(\w+)')
+            # 匹配方法：public void foo() / private String bar(int a)
+            method_pattern = re.compile(r'^\s*(?:public|protected|private)\s+(?:static\s+)?(?:final\s+)?(?:synchronized\s+)?[\w<>\[\]]+\s+(\w+)\s*\(')
 
+            for i, line in enumerate(lines):
+                class_match = class_pattern.search(line)
+                method_match = method_pattern.search(line)
+                
+                if class_match:
+                    structure_info.append(f"[第 {i+1} 行] {class_match.group(1).capitalize()}: {class_match.group(2)}")
+                elif method_match:
+                    # 过滤掉 if/for/while 等控制语句，只保留方法定义
+                    if method_match.group(1) not in ["if", "for", "while", "switch", "catch"]:
+                        structure_info.append(f"[第 {i+1} 行] 方法: {method_match.group(1)}")
+
+            if not structure_info:
+                return [types.TextContent(type="text", text="未在文件中找到明显的类或方法结构，请直接使用 read_code_from_wsl 读取全量代码（不传 start_line），自行分析。")]
+
+            return [types.TextContent(type="text", text=f"文件 {wsl_path} 的结构如下：\n" + "\n".join(structure_info))]
+            
+        except Exception as e:
+            return [types.TextContent(type="text", text=f"结构解析异常: {str(e)}")]
 
     # ==========================================
     # 下面是合并后的核心工具：记录日志 + 应用补丁
