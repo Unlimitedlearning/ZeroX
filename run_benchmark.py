@@ -66,6 +66,30 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     final_status = "Timeout/Failed"
 
     for turn in range(MAX_TURNS):
+
+        if turn > 0 and turn % 20 == 0:
+            print(f"  ✂️ [{bug_id}] 触发上下文压缩！清理历史冗余对话，逼迫 AI 读取工作日志...")
+            
+            # 保留 System Prompt
+            system_prompt = messages[0]
+            
+            # 找到最近一次的工具返回（比如最后的报错信息）
+            recent_tool_outputs = []
+            for msg in reversed(messages):
+                # 只保留最近的 tool 消息，最多保留 1 条
+                if getattr(msg, "role", "") == "tool":
+                    recent_tool_outputs.append(msg)
+                    break
+            
+            reset_prompt = {
+                "role": "user",
+                "content": "SYSTEM NOTICE: The conversation history has been compacted to save memory. I have kept your most recent test result below. You should immediately call `get_work_log` to review your past attempts, and then continue fixing."
+            }
+            
+            # 重新组装：System + 历史报错(如果找到的话) + 提示词
+            messages = [system_prompt] + recent_tool_outputs + [reset_prompt]
+            # 注意：因为现在 messages 最后一条是 user，符合 API 规范，AI 收到后必须回复（大概率会去调 get_work_log）
+
         try:
             response = await client.chat.completions.create(
                 model=LLM_CONF["model_name"],
