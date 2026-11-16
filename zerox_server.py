@@ -211,17 +211,32 @@ def record_metric(status: str):
     START_TIME = None
     IS_TASK_INITIALIZED = False
 
+def wait_for_previous_process():
+    """统一阻塞等待函数：如果有测试在跑，最多等 5 分钟。"""
+    global current_process
+    if current_process is not None and current_process.poll() is None:
+        try:
+            # 阻塞等待
+            current_process.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            # 强制超时处理（可选：直接 kill 掉）
+            logging.warning("测试进程超时（>5分钟），准备强制终止。")
+            current_process.kill()
+
 server = Server("zerox-server")
 
 @server.list_tools()
 async def list_tools():
     return [
         types.Tool(
-            name="run_defects4j_test",
-            description="后台运行 Defects4J 测试（包含 checkout 和 test），立刻返回。稍后用 read_test_log 查看结果。",
+            name="run_test",
+            description="运行 Defects4J 测试。首次调用会自动下载并编译代码，后续调用只在原有代码上跑测试。",
             inputSchema={
                 "type": "object",
-                "properties": {"bug_id": {"type": "string"}},
+                "properties": {
+                    "bug_id": {"type": "string", "description": "必填，如 Lang_1"},
+                    "force_checkout": {"type": "boolean", "description": "如果你需要彻底重置代码到初始状态，传 true。"}
+                },
                 "required": ["bug_id"]
             }
         ),
@@ -277,15 +292,6 @@ async def list_tools():
             }
         ),
         types.Tool(
-            name="run_test_only",
-            description="在已有的 workdir 中直接运行测试（不重新 checkout）。打完补丁后使用此工具验证。",
-            inputSchema={
-                "type": "object",
-                "properties": {"workdir": {"type": "string"}},
-                "required": ["workdir"]
-            }
-        ),
-        types.Tool(
             name="get_work_log",
             description="读取你之前轮次的修复记录，用于回忆你做过哪些修改。",
             inputSchema={
@@ -315,43 +321,53 @@ async def call_tool(name: str, arguments: dict):
     global current_log_handle, current_process, WORK_JSON_FILE, TEST_LOG_FILE, CURRENT_BUG
     global IS_TASK_INITIALIZED, START_TIME, CURRENT_ROUND, TOTAL_ATTEMPTS 
 
-    if name == "run_defects4j_test":
-        # 🚨 防呆锁：只初始化一次
-        if IS_TASK_INITIALIZED:
-            return [types.TextContent(type="text", text=f"【系统强制拒绝】当前任务 `{CURRENT_BUG}` 的测试环境已初始化！严禁重复执行 checkout。如果你认为代码已被彻底改坏，请先调用 `rollback(target_round=1)` 重置代码，再继续修复。", isError=True)]
-        
-        if current_process is not None and current_process.poll() is None:
-            return [types.TextContent(type="text", text="【系统拒绝】上一轮测试仍在运行中，请先调用 read_test_log 确认其状态，或等待其完成。", isError=True)]
+    # 🚨 绝杀：每次调用任何工具前，强制等待上一次的测试进程跑完（防并发冲突）
+    wait_for_previous_process()
 
+    if name == "run_test":
         bug_id = arguments.get("bug_id", "Lang_1")
-
-        # 校验格式，比如 Lang_1 或 Lang_1b
+        force_checkout = arguments.get("force_checkout", False)
+        
+        # 校验格式
         match = re.match(r"^([A-Za-z]+)_(\d+)([bf]?)$", bug_id)
         if not match:
             return [types.TextContent(type="text", text="bug_id 格式错误，应为 Project_Number，如 Lang_1", isError=True)]
 
         project, bug_num, suffix = match.groups()
-        version = bug_num + (suffix if suffix else "b") # 默认加 b
-
-        # 【多 Bug 隔离】
-        CURRENT_BUG = f"{project}_{version}"
-        CURRENT_BUG_DIR = os.path.join(LOG_DIR, CURRENT_BUG)
-        os.makedirs(CURRENT_BUG_DIR, exist_ok=True) # 如果文件夹不存在则创建
-
-        # 修改路径指向新文件夹：
-        TEST_LOG_FILE = os.path.join(CURRENT_BUG_DIR, "test.log") # 名字可以精简了
-        WORK_JSON_FILE = os.path.join(CURRENT_BUG_DIR, "work_log.jsonl")
-
-        logging.info(f"切换当前 Bug 为 {CURRENT_BUG} | 专属目录: {CURRENT_BUG_DIR}")
+        version = bug_num + (suffix if suffix else "b")
+        new_bug_id = f"{project}_{version}"
+        
+        # 判断是否需要重新 checkout
+        # 条件：强制，或没初始化，或换了另一个 Bug
+        need_checkout = force_checkout or (not IS_TASK_INITIALIZED) or (CURRENT_BUG != new_bug_id)
 
         workdir = build_workdir(project, version)
         d4j = shlex.quote(D4J_PATH)
         wsl_workdir = shlex.quote(workdir)
 
-        full_cmd = f"rm -rf {wsl_workdir} && {d4j} checkout -p {project} -v {version} -w {wsl_workdir} && {d4j} test -w {wsl_workdir}"
+        if need_checkout:
+            # 【重置多 Bug 隔离环境】
+            CURRENT_BUG = new_bug_id
+            CURRENT_BUG_DIR = os.path.join(LOG_DIR, CURRENT_BUG)
+            os.makedirs(CURRENT_BUG_DIR, exist_ok=True)
+            TEST_LOG_FILE = os.path.join(CURRENT_BUG_DIR, "test.log")
+            WORK_JSON_FILE = os.path.join(CURRENT_BUG_DIR, "work_log.jsonl")
+            
+            # 重置锁和计时器
+            IS_TASK_INITIALIZED = True
+            START_TIME = time.time()
+            CURRENT_ROUND = 0
+            TOTAL_ATTEMPTS = 0
+            
+            logging.info(f"切换当前 Bug 为 {CURRENT_BUG} | 执行全量 Checkout")
+            full_cmd = f"rm -rf {wsl_workdir} && {d4j} checkout -p {project} -v {version} -w {wsl_workdir} && {d4j} test -w {wsl_workdir}"
+            msg = f"任务已在后台启动（全新Checkout）！当前 Bug 为 `{CURRENT_BUG}`，workdir 是 `{workdir}`。请稍后用 `read_test_log` 查看结果。"
+        else:
+            logging.info(f"当前 Bug {CURRENT_BUG} | 执行增量测试")
+            full_cmd = f"test -d {wsl_workdir} || {{ echo 'WORKDIR_NOT_FOUND: 指定的目录不存在'; exit 1; }}; {d4j} test -w {wsl_workdir}"
+            msg = f"已在当前 Bug（{CURRENT_BUG}）的 workdir 启动增量测试！请稍后读取日志。"
 
         try:
-            # 打开新的 TEST_LOG_FILE 之前，先把上一轮日志句柄安全关闭，防止句柄泄漏
             if current_log_handle is not None:
                 try:
                     current_log_handle.close()
@@ -363,45 +379,16 @@ async def call_tool(name: str, arguments: dict):
             current_log_handle = f
             current_process = popen_in_target(full_cmd, stdout=f, stderr=subprocess.STDOUT)
 
-            # 计时器与状态锁更新
-            IS_TASK_INITIALIZED = True
-            START_TIME = time.time()
-            CURRENT_ROUND = 0
-            TOTAL_ATTEMPTS = 0
-
-            logging.info("后台任务已启动")
-            return [types.TextContent(type="text", text=f"任务已在后台启动！当前 Bug 为 `{CURRENT_BUG}`，workdir 是 `{workdir}`。请在 1-3 分钟后使用 `read_test_log` 工具查看执行结果。不要立刻重复执行！")]
+            return [types.TextContent(type="text", text=msg)]
         except Exception as e:
             logging.error(f"启动失败: {str(e)}")
             return [types.TextContent(type="text", text=f"启动失败: {str(e)}")]
-
+        
     elif name == "read_test_log":
 
-        if TEST_LOG_FILE is None:
-            return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_defects4j_test 初始化当前 Bug 的测试环境。", isError=True)]
-
-        if not os.path.exists(TEST_LOG_FILE):
+        if TEST_LOG_FILE is None or not os.path.exists(TEST_LOG_FILE):
             return [types.TextContent(type="text", text="日志文件不存在，可能任务还没开始。")]
 
-        # 进程状态机：先判断测试进程死活，再解析日志
-        is_running = current_process is not None and current_process.poll() is None
-        exit_code = None
-        if current_process is not None and not is_running:
-            exit_code = current_process.returncode
-
-        # 状态 0：阻塞等待
-        if is_running:
-            try:
-                # 最多等300秒，期间不消耗Token
-                current_process.wait(timeout=300)
-            except subprocess.TimeoutExpired:
-                # ⏱️ 记录超时
-                record_metric("Timeout")
-                return [types.TextContent(type="text", text="【系统提示】测试已运行超过 5 分钟仍未结束，可能发生死锁或超时。建议检查环境或结束任务。")]
-            
-            # 更新状态
-            is_running = False
-            exit_code = current_process.returncode
 
         with open(TEST_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
@@ -409,6 +396,8 @@ async def call_tool(name: str, arguments: dict):
 
         if not content.strip():
             return [types.TextContent(type="text", text="【日志为空】测试还没有输出任何内容，请稍后再试。")]
+
+        exit_code = current_process.returncode if current_process else None
 
         # 状态 1：服务重启后拿不到进程状态，退化为看日志关键字（兼容旧日志）
         if current_process is None and "Running ant" in content and "Failing tests:" not in content and "BUILD FAILED" not in content:
@@ -476,39 +465,7 @@ async def call_tool(name: str, arguments: dict):
         except Exception as e:
             return [types.TextContent(type="text", text=f"异常: {str(e)}")]
 
-    elif name == "run_test_only":
-        # 先初始化
-        if TEST_LOG_FILE is None:
-            return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_defects4j_test 初始化当前 Bug 的测试环境。", isError=True)]
 
-        if current_process is not None and current_process.poll() is None:
-            return [types.TextContent(type="text", text="【系统拒绝】上一轮测试仍在运行中，请先调用 read_test_log 确认其状态。", isError=True)]
-
-        workdir = arguments.get("workdir")
-        if not workdir:
-            return [types.TextContent(type="text", text=f"参数错误：必须提供 workdir（形如 {build_workdir('Lang', '2b')}）", isError=True)]
-
-        d4j = shlex.quote(D4J_PATH)
-        # 目录先校验再跑，顺便 quote 掉带空格的路径
-        wsl_workdir = shlex.quote(workdir)
-        # 【修复】用 {} 包起来，目录不存在时写入提示并 exit 1，不再往下执行
-        full_cmd = f"test -d {wsl_workdir} || {{ echo 'WORKDIR_NOT_FOUND: 指定的目录不存在'; exit 1; }}; {d4j} test -w {wsl_workdir}"
-
-        try:
-            # 打开新的 TEST_LOG_FILE 之前，先把上一轮日志句柄安全关闭，防止句柄泄漏
-            if current_log_handle is not None:
-                try:
-                    current_log_handle.close()
-                except Exception:
-                    pass
-                current_log_handle = None
-
-            f = open(TEST_LOG_FILE, "w", encoding="utf-8")
-            current_log_handle = f
-            current_process = popen_in_target(full_cmd, stdout=f, stderr=subprocess.STDOUT)
-            return [types.TextContent(type="text", text=f"已在当前 Bug（{CURRENT_BUG}）的 workdir 启动测试！请稍后读取日志。（目录已存在性校验：{workdir}）")]
-        except Exception as e:
-            return [types.TextContent(type="text", text=f"启动失败: {str(e)}")]
 
     # ==========================================
     # 下面是合并后的核心工具：记录日志 + 应用补丁

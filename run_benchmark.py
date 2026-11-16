@@ -39,7 +39,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Please fix the bug for {bug_id}. Begin by calling run_defects4j_test."}
+        {"role": "user", "content": f"Please fix the bug for {bug_id}. Begin by calling run_test with bug_id='{bug_id}'."}
     ]
     
     mcp_tools = await session.list_tools()
@@ -94,8 +94,20 @@ async def run_single_bug(bug_id: str, session: ClientSession):
 
             for tool_call in response_msg.tool_calls:
                 fn_name = tool_call.function.name
-                fn_args = json.loads(tool_call.function.arguments)
                 print(f"  [{bug_id}] Turn {turn+1} Call: {fn_name}")
+
+                # 删掉 try 外面那一行原生的 json.loads！！！
+                try:
+                    fn_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError as e:
+                    print(f"  ⚠️ [{bug_id}] 大模型输出了坏 JSON，已要求重试。Error: {e}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": fn_name,
+                        "content": f"System Error: Invalid JSON arguments. {str(e)}. Please fix your JSON formatting (ensure all quotes are escaped) and try again."
+                    })
+                    continue # 直接进入下一轮对话，放弃执行本次工具
                 
                 try:
                     result = await session.call_tool(fn_name, arguments=fn_args)
