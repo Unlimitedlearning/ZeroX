@@ -2,6 +2,10 @@
   "defects4j_path": "/path/to/defects4j/framework/bin/defects4j",
   "work_root": "/path/to/your/workdir",
   "max_attempts": 10,
+  "timeouts": {
+    "test_execution": 300,
+    "llm_client": 360
+  },
   "llm_config": {
     "api_key": "${DEEPSEEK_API_KEY}",
     "base_url": "https://api.deepseek.com/v1",

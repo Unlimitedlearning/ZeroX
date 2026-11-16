@@ -27,6 +27,7 @@ IS_TASK_INITIALIZED = False
 START_TIME = None
 CURRENT_ROUND = 0
 TOTAL_ATTEMPTS = 0
+READ_CODE_COUNT = 0 
 
 # ==========================================
 # [跨平台] 运行环境检测
@@ -71,14 +72,17 @@ def load_config():
         logging.error(f"❌ Fatal: Failed to parse '{CONFIG_FILE}': {err}")
         sys.exit(1)
 
-    # 校验必须的字段
-    for key in ["defects4j_path", "work_root"]:
-        if key not in config or not isinstance(config[key], str) or not config[key].strip():
-            logging.error(f"❌ Fatal: Missing or empty '{key}' in '{CONFIG_FILE}'.")
+    for key in ["defects4j_path", "work_root", "timeouts"]:
+        if key not in config:
+            logging.error(f"❌ Fatal: Missing '{key}' in '{CONFIG_FILE}'.")
             sys.exit(1)
 
     if not isinstance(config["max_attempts"], int) or config["max_attempts"] <= 0:
         logging.error(f"❌ Fatal: 'max_attempts' must be a positive integer in '{CONFIG_FILE}'.")
+        sys.exit(1)
+        
+    if not isinstance(config["timeouts"].get("test_execution"), int):
+        logging.error(f"❌ Fatal: 'timeouts.test_execution' must be an integer in '{CONFIG_FILE}'.")
         sys.exit(1)
 
     return config
@@ -87,6 +91,7 @@ CONFIG = load_config()
 D4J_PATH = CONFIG["defects4j_path"]
 WORK_ROOT = CONFIG["work_root"].rstrip("/")
 MAX_ATTEMPTS = CONFIG["max_attempts"]
+TEST_TIMEOUT = CONFIG["timeouts"]["test_execution"]
 
 logging.info(
     f"运行环境：{'Windows(WSL 转发)' if IS_WINDOWS else 'Linux(原生)'} | "
@@ -212,15 +217,14 @@ def record_metric(status: str):
     IS_TASK_INITIALIZED = False
 
 def wait_for_previous_process():
-    """统一阻塞等待函数：如果有测试在跑，最多等 5 分钟。"""
+    """统一阻塞等待函数：如果有测试在跑，最多等TEST_TIMEOUT秒。"""
     global current_process
     if current_process is not None and current_process.poll() is None:
         try:
-            # 阻塞等待
-            current_process.wait(timeout=300)
+            # 使用配置中的超时时间
+            current_process.wait(timeout=TEST_TIMEOUT)
         except subprocess.TimeoutExpired:
-            # 强制超时处理（可选：直接 kill 掉）
-            logging.warning("测试进程超时（>5分钟），准备强制终止。")
+            logging.warning(f"测试进程超时（>{TEST_TIMEOUT}秒），准备强制终止。")
             current_process.kill()
 
 server = Server("zerox-server")
@@ -230,7 +234,7 @@ async def list_tools():
     return [
         types.Tool(
             name="run_test",
-            description="运行 Defects4J 测试。首次调用会自动下载并编译代码，后续调用只在原有代码上跑测试。",
+            description="运行 Defects4J 测试并【阻塞等待结果】。首次调用会自动下载并编译代码，后续调用跑增量测试。返回测试日志和结果。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -241,9 +245,16 @@ async def list_tools():
             }
         ),
         types.Tool(
-            name="read_test_log",
-            description="读取 Defects4J 测试的实时日志",
-            inputSchema={"type": "object", "properties": {}}
+            name="search_code",
+            description="在代码库中搜索关键字（类名、方法名、变量名、报错信息），返回匹配的文件路径和行号。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "要搜索的关键字，例如 'toLocale'"},
+                    "file_pattern": {"type": "string", "description": "可选，限定搜索范围，例如 '*.java'"}
+                },
+                "required": ["keyword"]
+            }
         ),
         types.Tool(
             name="read_code_from_wsl",
@@ -313,13 +324,25 @@ async def list_tools():
                 },
                 "required": ["target_round"]
             }
+        ),
+        types.Tool(
+            name="search_code",
+            description="在代码库中搜索关键字（类名、方法名、变量名、报错信息），返回匹配的文件路径和行号。这比盲目读取整个文件高效得多！",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "要搜索的关键字，例如 'toLocale'"},
+                    "file_pattern": {"type": "string", "description": "可选，限定搜索范围，例如 '*.java'"}
+                },
+                "required": ["keyword"]
+            }
         )
     ]
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
     global current_log_handle, current_process, WORK_JSON_FILE, TEST_LOG_FILE, CURRENT_BUG
-    global IS_TASK_INITIALIZED, START_TIME, CURRENT_ROUND, TOTAL_ATTEMPTS 
+    global IS_TASK_INITIALIZED, START_TIME, CURRENT_ROUND, TOTAL_ATTEMPTS, READ_CODE_COUNT
 
     # 🚨 绝杀：每次调用任何工具前，强制等待上一次的测试进程跑完（防并发冲突）
     wait_for_previous_process()
@@ -361,11 +384,11 @@ async def call_tool(name: str, arguments: dict):
             
             logging.info(f"切换当前 Bug 为 {CURRENT_BUG} | 执行全量 Checkout")
             full_cmd = f"rm -rf {wsl_workdir} && {d4j} checkout -p {project} -v {version} -w {wsl_workdir} && {d4j} test -w {wsl_workdir}"
-            msg = f"任务已在后台启动（全新Checkout）！当前 Bug 为 `{CURRENT_BUG}`，workdir 是 `{workdir}`。请稍后用 `read_test_log` 查看结果。"
+
         else:
             logging.info(f"当前 Bug {CURRENT_BUG} | 执行增量测试")
             full_cmd = f"test -d {wsl_workdir} || {{ echo 'WORKDIR_NOT_FOUND: 指定的目录不存在'; exit 1; }}; {d4j} test -w {wsl_workdir}"
-            msg = f"已在当前 Bug（{CURRENT_BUG}）的 workdir 启动增量测试！请稍后读取日志。"
+
 
         try:
             if current_log_handle is not None:
@@ -379,63 +402,74 @@ async def call_tool(name: str, arguments: dict):
             current_log_handle = f
             current_process = popen_in_target(full_cmd, stdout=f, stderr=subprocess.STDOUT)
 
-            return [types.TextContent(type="text", text=msg)]
+            logging.info(f"开始阻塞等待测试进程结束（超时限制 {TEST_TIMEOUT}s）...")
+            try:
+                current_process.wait(timeout=TEST_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                current_process.kill()
+                record_metric("Timeout")
+                return [types.TextContent(type="text", text=f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。", isError=True)]
+
+            logging.info("测试进程结束，正在解析日志...")
+            
+            # 读取并解析日志
+            if not os.path.exists(TEST_LOG_FILE):
+                return [types.TextContent(type="text", text="测试完成，但日志文件不存在。", isError=True)]
+            
+            with open(TEST_LOG_FILE, "r", encoding="utf-8", errors="replace") as log_f:
+                content = log_f.read()
+
+            if not content.strip():
+                return [types.TextContent(type="text", text="【日志为空】测试没有任何输出。")]
+
+            exit_code = current_process.returncode
+
+            if "Failing tests: 0" in content:
+                record_metric("Fixed")
+                return [types.TextContent(type="text", text=f"【测试全部通过】该 Bug 已成功修复！请结束任务并输出 [FIXED]。")]
+
+            if exit_code not in (None, 0) and "Failing tests:" not in content:
+                return [types.TextContent(type="text", text=f"【编译失败】退出码 {exit_code}。请根据日志修复语法/类型错误：\n{content[-2500:]}")]
+
+            if "Failing tests:" in content:
+                match_log = re.search(r"Failing tests:\s*([1-9]\d*)([\s\S]*)", content, re.DOTALL)
+                if match_log:
+                    failing_info = match_log.group(2).strip() if match_log.group(2) else "无详细堆栈"
+                    if len(failing_info) > 2500:
+                        lines = failing_info.split("\n")
+                        combined = "\n".join(lines[:15]) + "\n... [省略] ...\n" + failing_info[-2500:]
+                    else:
+                        combined = failing_info
+                    return [types.TextContent(type="text", text=f"【测试失败】共 {match_log.group(1)} 个用例失败。\n以下是报错信息：\n{combined}\n\n请分析并修复。")]
+
+            return [types.TextContent(type="text", text=f"最新日志如下（退出码 {exit_code}）:\n{content[-2000:]}")]
+
         except Exception as e:
             logging.error(f"启动失败: {str(e)}")
-            return [types.TextContent(type="text", text=f"启动失败: {str(e)}")]
+            return [types.TextContent(type="text", text=f"测试执行异常: {str(e)}", isError=True)]
+
+    elif name == "search_code":
+        if CURRENT_BUG is None:
+            return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_test 初始化 Bug 环境。", isError=True)]
         
-    elif name == "read_test_log":
-
-        if TEST_LOG_FILE is None or not os.path.exists(TEST_LOG_FILE):
-            return [types.TextContent(type="text", text="日志文件不存在，可能任务还没开始。")]
-
-
-        with open(TEST_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-
-
-        if not content.strip():
-            return [types.TextContent(type="text", text="【日志为空】测试还没有输出任何内容，请稍后再试。")]
-
-        exit_code = current_process.returncode if current_process else None
-
-        # 状态 1：服务重启后拿不到进程状态，退化为看日志关键字（兼容旧日志）
-        if current_process is None and "Running ant" in content and "Failing tests:" not in content and "BUILD FAILED" not in content:
-            return [types.TextContent(type="text", text="【系统提示】当前正在编译或运行测试中，请勿盲目猜测。请等待 1 分钟后再次调用此工具查看结果。")]
-
-        # 状态 2：全部通过
-        if "Failing tests: 0" in content:
-            # ⏱️ 记录成功
-            record_metric("Fixed")
-            note = "" if exit_code in (None, 0) else f"（注意：进程退出码为 {exit_code}，可查看日志尾部确认是否有编译告警）"
-            return [types.TextContent(type="text", text=f"【测试全部通过】该 Bug 已成功修复！请结束任务。{note}")]
-
-        # 状态 2.5：编译/构建失败（进程已退出，且日志里没有测试失败清单）
-        if exit_code not in (None, 0) and "Failing tests:" not in content:
-            return [types.TextContent(type="text", text=f"【编译失败 / BUILD FAILED】测试进程退出码为 {exit_code}，且日志里没有测试失败清单，说明代码没通过编译。请根据下面的日志修复语法/类型错误：\n{content[-2500:]}")]
-
-        # 状态 3：测试失败，提取失败列表
-        if "Failing tests:" in content:
+        keyword = arguments.get("keyword")
+        pattern = arguments.get("file_pattern", "*.java")
+        
+        # 🚨 修复了 build_workdir 参数缺失的 bug
+        project = CURRENT_BUG.split("_")[0]
+        version = CURRENT_BUG.split("_")[1]
+        workdir = build_workdir(project, version)
+        
+        cmd = f"grep -rn --include='{pattern}' {shlex.quote(keyword)} {shlex.quote(workdir)} | head -n 20"
+        res = execute_in_target(cmd)
+        
+        if res.returncode != 0 or not res.stdout.strip():
+            return [types.TextContent(type="text", text=f"未找到关键字 '{keyword}'。请换个词或直接读取文件。")]
             
-            match = re.search(r"Failing tests:\s*([1-9]\d*)([\s\S]*)", content, re.DOTALL)
-            if match:
-                failing_info = match.group(2).strip() if match.group(2) else "无详细堆栈"
-                # 【修复】不超长就原样返回，超长才头部+尾部截断
-                if len(failing_info) <= 2500:
-                    combined = failing_info
-                else:
-                    lines = failing_info.split("\n")
-                    head = "\n".join(lines[:15])
-                    tail = failing_info[-2500:]
-                    combined = head + "\n... [中间日志省略] ...\n" + tail
-
-                return [types.TextContent(type="text", text=f"【测试失败】共 {match.group(1)} 个用例失败。\n以下是失败的测试用例信息：\n{combined}\n\n请结合报错信息进行分析。")]
-
-        # 其他情况，返回尾部信息（带上退出码，方便区分「跑完了但没结果」与「还在跑」）
-        code_note = f"（进程退出码 {exit_code}）" if exit_code is not None else ""
-        return [types.TextContent(type="text", text=f"最新日志如下{code_note}:\n{content[-2000:]}")]
+        return [types.TextContent(type="text", text=f"搜索结果：\n{res.stdout}")]
 
     elif name == "read_code_from_wsl":
+        READ_CODE_COUNT += 1
         wsl_path = arguments.get("wsl_file_path")
         start_line = arguments.get("start_line")
         end_line = arguments.get("end_line")
@@ -461,7 +495,10 @@ async def call_tool(name: str, arguments: dict):
             # 带行号输出
             formatted_lines = [f"{start_idx + i + 1}: {line}" for i, line in enumerate(selected_lines)]
 
-            return [types.TextContent(type="text", text=f"文件 {wsl_path} 第 {start_line}-{end_line} 行内容如下:\n" + "\n".join(formatted_lines))]
+            nudge_msg = ""
+            if READ_CODE_COUNT >= 3:
+                nudge_msg = f"\n\n⚠️ **[System Nudge]** You have read the code {READ_CODE_COUNT} times consecutively. You have gathered enough context. Please stop reading and try to call `patch_and_log` to make a bold hypothesis now!"   
+            return [types.TextContent(type="text", text=f"文件 {wsl_path} 第 {start_line}-{end_line} 行内容如下:\n" + "\n".join(formatted_lines) + nudge_msg)]
         except Exception as e:
             return [types.TextContent(type="text", text=f"异常: {str(e)}")]
 
@@ -575,7 +612,8 @@ async def call_tool(name: str, arguments: dict):
         CURRENT_ROUND = round_num
         
         TOTAL_ATTEMPTS += 1
-        return [types.TextContent(type="text", text=f"修复成功！代码差异已原子化应用到 {len(applied_files)} 个文件，工作日志（{os.path.basename(WORK_JSON_FILE)}）已持久化。现在你可以调用 run_test_only 跑测试了。")]
+        READ_CODE_COUNT = 0
+        return [types.TextContent(type="text", text=f"Patch applied successfully. IMMEDIATELY call run_test to verify. Do NOT speak.")]
 
     elif name == "get_work_log":
         # 【多 Bug 隔离】只读当前 Bug 的工作日志

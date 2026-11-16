@@ -19,15 +19,22 @@ def load_config():
 CONFIG = load_config()
 LLM_CONF = CONFIG["llm_config"]
 
+# 读取客户端超时
+CLIENT_TIMEOUT = CONFIG.get("timeouts", {}).get("llm_client", 360.0)
+
 # 兼容环境变量读取（如果你在 config 里写了 ${DEEPSEEK_API_KEY}）
 api_key = LLM_CONF["api_key"]
 if api_key.startswith("${") and api_key.endswith("}"):
     api_key = os.getenv(api_key[2:-1])
 
 BUGS_TO_TEST = CONFIG.get("benchmark_bugs", ["Lang_1"])
-MAX_TURNS = 20
+MAX_TURNS = 100
 
-client = AsyncOpenAI(api_key=api_key, base_url=LLM_CONF["base_url"])
+client = AsyncOpenAI(
+    api_key=api_key, 
+    base_url=LLM_CONF["base_url"],
+    timeout=CLIENT_TIMEOUT  
+)
 
 with open("AGENTS.md", "r", encoding="utf-8") as f:
     SYSTEM_PROMPT = f.read()
@@ -88,9 +95,15 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                     break
 
             if not response_msg.tool_calls:
-                print(f"  ⚠️ [{bug_id}] AI 没有调用工具，也没有输出结束符。")
-                messages.append({"role": "user", "content": "Please use tools or output [FIXED]/[FAILED]."})
-                continue
+                print(f"  🗣️ [{bug_id}] AI 违规闲聊: {text[:50]}... (强制拦截)")
+                messages.append(response_msg) # 依然要把它的废话放进去，保持 OpenAI API 的上下文连贯
+                messages.append({
+                    "role": "user", 
+                    "content": "SYSTEM WARNING: You are violating the ZERO CHATTER rule. Do NOT output natural language. You MUST call a tool immediately to proceed."
+                })
+                continue # 进入下一轮
+            else:
+                print(f"  ⚠️ [{bug_id}] AI 夹带废话: {text[:30]}...")
 
             for tool_call in response_msg.tool_calls:
                 fn_name = tool_call.function.name
@@ -136,7 +149,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
             final_status = "Error"
             break
 
-    # 【修复 Bug 1】return 必须放在 for 循环外面，否则只跑第一轮就退出
+
     elapsed = time.time() - start_time
     print(f"  ⏱️ [{bug_id}] 结束。状态: {final_status}, 耗时: {elapsed:.2f}s, Tokens: {total_tokens_used}")
     return final_status, elapsed, total_tokens_used
