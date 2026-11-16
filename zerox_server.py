@@ -325,18 +325,7 @@ async def list_tools():
                 "required": ["target_round"]
             }
         ),
-        types.Tool(
-            name="search_code",
-            description="在代码库中搜索关键字（类名、方法名、变量名、报错信息），返回匹配的文件路径和行号。这比盲目读取整个文件高效得多！",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "keyword": {"type": "string", "description": "要搜索的关键字，例如 'toLocale'"},
-                    "file_pattern": {"type": "string", "description": "可选，限定搜索范围，例如 '*.java'"}
-                },
-                "required": ["keyword"]
-            }
-        )
+        
     ]
 
 @server.call_tool()

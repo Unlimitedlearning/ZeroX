@@ -74,36 +74,32 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                 temperature=0.0
             )
             response_msg = response.choices[0].message
-            # 注意：response_msg 是一个 Pydantic 对象，直接 append 进去某些 API 会报错，通常需要用 .model_dump() 或作为 dict 处理
-            # 但在 OpenAI SDK 里直接 append 是支持的，保持你的写法。
+
             messages.append(response_msg)
             
             if response.usage:
                 total_tokens_used += response.usage.total_tokens
 
-            if response_msg.content:
-                text = response_msg.content.strip()
+            # 安全提取文本（解决了 UnboundLocalError）
+            text = response_msg.content.strip() if response_msg.content else ""
+
+            # 如果 AI 输出了文本，简单打印并检查是否通关
+            if text:
                 print(f"  [{bug_id}] Turn {turn+1} AI: {text[:100]}...")
-                
                 if "[FIXED]" in text:
-                    print(f"  🎉 [{bug_id}] 修复成功！")
                     final_status = "Fixed"
                     break
                 if "[FAILED]" in text:
-                    print(f"  💀 [{bug_id}] AI 主动放弃或触发熔断。")
                     final_status = "Failed"
                     break
 
+            # 如果 AI 没调用工具，直接给系统警告，强制它继续
             if not response_msg.tool_calls:
-                print(f"  🗣️ [{bug_id}] AI 违规闲聊: {text[:50]}... (强制拦截)")
-                messages.append(response_msg) # 依然要把它的废话放进去，保持 OpenAI API 的上下文连贯
                 messages.append({
                     "role": "user", 
-                    "content": "SYSTEM WARNING: You are violating the ZERO CHATTER rule. Do NOT output natural language. You MUST call a tool immediately to proceed."
+                    "content": "SYSTEM WARNING: Do NOT output natural language. You MUST call a tool immediately to proceed."
                 })
-                continue # 进入下一轮
-            else:
-                print(f"  ⚠️ [{bug_id}] AI 夹带废话: {text[:30]}...")
+                continue # 直接进入下一轮，不用打印乱七八糟的警告了
 
             for tool_call in response_msg.tool_calls:
                 fn_name = tool_call.function.name
