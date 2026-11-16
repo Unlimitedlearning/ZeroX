@@ -28,6 +28,7 @@ START_TIME = None
 CURRENT_ROUND = 0
 TOTAL_ATTEMPTS = 0
 READ_CODE_COUNT = 0 
+CODE_MODIFIED = False
 
 # ==========================================
 # [跨平台] 运行环境检测
@@ -342,6 +343,7 @@ async def list_tools():
 async def call_tool(name: str, arguments: dict):
     global current_log_handle, current_process, WORK_JSON_FILE, TEST_LOG_FILE, CURRENT_BUG
     global IS_TASK_INITIALIZED, START_TIME, CURRENT_ROUND, TOTAL_ATTEMPTS, READ_CODE_COUNT
+    global CODE_MODIFIED
 
     # 🚨 绝杀：每次调用任何工具前，强制等待上一次的测试进程跑完（防并发冲突）
     wait_for_previous_process()
@@ -363,6 +365,9 @@ async def call_tool(name: str, arguments: dict):
         # 条件：强制，或没初始化，或换了另一个 Bug
         need_checkout = force_checkout or (not IS_TASK_INITIALIZED) or (CURRENT_BUG != new_bug_id)
 
+        if not need_checkout and not CODE_MODIFIED:
+            return [types.TextContent(type="text", text="【系统强制拒绝】代码没有被修改过，重复运行测试没有任何意义！请先调用 `patch_and_log` 提交你的修改猜想！", isError=True)]
+
         workdir = build_workdir(project, version)
         d4j = shlex.quote(D4J_PATH)
         wsl_workdir = shlex.quote(workdir)
@@ -380,6 +385,7 @@ async def call_tool(name: str, arguments: dict):
             START_TIME = time.time()
             CURRENT_ROUND = 0
             TOTAL_ATTEMPTS = 0
+            CODE_MODIFIED = False
             
             logging.info(f"切换当前 Bug 为 {CURRENT_BUG} | 执行全量 Checkout")
             full_cmd = f"rm -rf {wsl_workdir} && {d4j} checkout -p {project} -v {version} -w {wsl_workdir} && {d4j} test -w {wsl_workdir}"
@@ -400,6 +406,8 @@ async def call_tool(name: str, arguments: dict):
             f = open(TEST_LOG_FILE, "w", encoding="utf-8")
             current_log_handle = f
             current_process = popen_in_target(full_cmd, stdout=f, stderr=subprocess.STDOUT)
+
+            CODE_MODIFIED = False
 
             logging.info(f"开始阻塞等待测试进程结束（超时限制 {TEST_TIMEOUT}s）...")
             try:
@@ -531,6 +539,9 @@ async def call_tool(name: str, arguments: dict):
 
             if not structure_info:
                 return [types.TextContent(type="text", text="未在文件中找到明显的类或方法结构，请直接使用 read_code_from_wsl 读取全量代码（不传 start_line），自行分析。")]
+            
+            # 增加强制信任的提示词
+            header = f"【权威结构索引】文件 {wsl_path} 的真实结构如下。这是系统底层解析的精准行号，请【完全信任】此结果，直接使用 read_code_from_wsl 读取对应行，不要盲目猜行号或读取全量文件：\n"
 
             return [types.TextContent(type="text", text=f"文件 {wsl_path} 的结构如下：\n" + "\n".join(structure_info))]
             
@@ -646,6 +657,7 @@ async def call_tool(name: str, arguments: dict):
         
         TOTAL_ATTEMPTS += 1
         READ_CODE_COUNT = 0
+        CODE_MODIFIED = True
         return [types.TextContent(type="text", text=f"Patch applied successfully. IMMEDIATELY call run_test to verify. Do NOT speak.")]
 
     elif name == "get_work_log":
