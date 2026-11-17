@@ -1,8 +1,10 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import time
+from datetime import datetime
 from openai import AsyncOpenAI
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -13,6 +15,13 @@ CONFIG_FILE = "config.json"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, CONFIG_FILE)
 SERVER_SCRIPT = os.path.join(BASE_DIR, "zerox_server.py")
+
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+# 基准指标由客户端写：token 用量只有调用 LLM 的这一端拿得到，服务端无法记录
+METRICS_FILE = os.path.join(LOG_DIR, "benchmark_metrics.jsonl")
+
+# 上下文压缩时保留的工具输出尾部长度（防止单条输出又把上下文撑爆）
+COMPACT_TOOL_TAIL_CHARS = 6000
 
 # agent 段落默认值：与 zerox_server.py 的 DEFAULT_AGENT 保持一致
 DEFAULT_AGENT = {
@@ -76,6 +85,65 @@ client = AsyncOpenAI(
 with open(resolve_path(AGENT_CONF["system_prompt_file"]), "r", encoding="utf-8") as f:
     SYSTEM_PROMPT = f.read()
 
+
+def usage_to_counts(usage):
+    """把 openai 的 usage 对象归一化成 (prompt, completion, total) 三个整数。"""
+    if not usage:
+        return 0, 0, 0
+    prompt = getattr(usage, "prompt_tokens", None) or 0
+    completion = getattr(usage, "completion_tokens", None) or 0
+    total = getattr(usage, "total_tokens", None) or (prompt + completion)
+    return prompt, completion, total
+
+
+def parse_work_log(text: str):
+    """从 get_work_log 的返回文本里解析出 (轮次, 补丁数, 服务端解析出的 bug 名)。"""
+    rounds = 0
+    patches = 0
+    resolved_bug = None
+
+    match = re.match(r"\s*当前 Bug（(.+?)）", text)
+    if match:
+        resolved_bug = match.group(1)
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        patches += 1
+        try:
+            rounds = max(rounds, int(record.get("round") or 0))
+        except (TypeError, ValueError):
+            continue
+    return rounds, patches, resolved_bug
+
+
+async def fetch_work_log_stats(session, bug_id):
+    """向服务端要一次工作日志，用它的轮次/补丁数填充指标；失败就退化成 0。"""
+    try:
+        result = await session.call_tool("get_work_log", arguments={"limit": 500})
+        text = "".join([c.text for c in result.content if c.type == "text"])
+    except Exception as e:
+        print(f"  ⚠️ [{bug_id}] 读取工作日志失败，指标的轮次记为 0: {e}")
+        return 0, 0, None
+    return parse_work_log(text)
+
+
+def append_metric(metric: dict):
+    """把一条指标追加到 logs/benchmark_metrics.jsonl；写盘失败不影响批量测试。"""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(METRICS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(metric, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"  ⚠️ 写入指标文件失败: {e}")
+
 async def run_single_bug(bug_id: str, session: ClientSession):
     print(f"\n" + "="*50)
     print(f"🚀 开始测试 Bug: {bug_id}")
@@ -99,7 +167,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
         })
 
     start_time = time.time()
-    total_tokens_used = 0
+    usage_totals = {"prompt": 0, "completion": 0, "total": 0, "calls": 0, "turns": 0}
     final_status = "Timeout/Failed"
 
     for turn in range(MAX_TURNS):
@@ -111,22 +179,27 @@ async def run_single_bug(bug_id: str, session: ClientSession):
             system_prompt = messages[0]
             
             # 找到最近一次的工具返回（比如最后的报错信息）
-            recent_tool_outputs = []
+            recent_tool_output = ""
             for msg in reversed(messages):
                 # 兼容 dict 和 SDK 对象两种消息形态，否则永远匹配不到 tool 消息
                 role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
                 # 只保留最近的 tool 消息，最多保留 1 条
                 if role == "tool":
-                    recent_tool_outputs.append(msg)
+                    content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
+                    recent_tool_output = content if isinstance(content, str) else str(content)
                     break
             
-            reset_prompt = {
-                "role": "user",
-                "content": "SYSTEM NOTICE: The conversation history has been compacted to save memory. I have kept your most recent test result below. You should immediately call `get_work_log` to review your past attempts, and then continue fixing."
-            }
+            reset_content = "SYSTEM NOTICE: The conversation history has been compacted to save memory. I have kept your most recent test result below. You should immediately call `get_work_log` to review your past attempts, and then continue fixing."
+            if recent_tool_output:
+                # 只留尾部：测试报错的关键信息都在最后，也能避免单条输出再次撑爆上下文
+                reset_content += "\n\n--- Most recent tool output (tail) ---\n" + recent_tool_output[-COMPACT_TOOL_TAIL_CHARS:]
             
-            # 重新组装：System + 历史报错(如果找到的话) + 提示词
-            messages = [system_prompt] + recent_tool_outputs + [reset_prompt]
+            reset_prompt = {"role": "user", "content": reset_content}
+            
+            # 重新组装：System + 提示词(user)，最近一次报错写进 user 内容里
+            # 🚨 绝不能把 role="tool" 的消息单独留下：tool 消息必须紧跟在带 tool_calls 的 assistant 消息之后，
+            #    否则 API 直接 400（Messages with role 'tool' must be a response to a preceding message with 'tool_calls'）
+            messages = [system_prompt, reset_prompt]
             # 注意：因为现在 messages 最后一条是 user，符合 API 规范，AI 收到后必须回复（大概率会去调 get_work_log）
 
         try:
@@ -140,8 +213,13 @@ async def run_single_bug(bug_id: str, session: ClientSession):
 
             messages.append(response_msg)
             
-            if response.usage:
-                total_tokens_used += response.usage.total_tokens
+            # token 用量只有客户端拿得到：按 bug 累加，最后写进 benchmark_metrics.jsonl
+            prompt_tokens, completion_tokens, turn_tokens = usage_to_counts(response.usage)
+            usage_totals["prompt"] += prompt_tokens
+            usage_totals["completion"] += completion_tokens
+            usage_totals["total"] += turn_tokens
+            usage_totals["calls"] += 1
+            usage_totals["turns"] = turn + 1
 
             # 安全提取文本（解决了 UnboundLocalError）
             text = response_msg.content.strip() if response_msg.content else ""
@@ -210,8 +288,9 @@ async def run_single_bug(bug_id: str, session: ClientSession):
 
 
     elapsed = time.time() - start_time
-    print(f"  ⏱️ [{bug_id}] 结束。状态: {final_status}, 耗时: {elapsed:.2f}s, Tokens: {total_tokens_used}")
-    return final_status, elapsed, total_tokens_used
+    print(f"  ⏱️ [{bug_id}] 结束。状态: {final_status}, 耗时: {elapsed:.2f}s, "
+          f"Tokens: {usage_totals['total']} (prompt {usage_totals['prompt']} / completion {usage_totals['completion']})")
+    return final_status, elapsed, usage_totals
 
 async def main():
     server_params = StdioServerParameters(
@@ -231,11 +310,29 @@ async def main():
             
             for bug in BUGS_TO_TEST:
                 # 【修复 Bug 2】接收 3 个返回值
-                status, elapsed, tokens = await run_single_bug(bug, session)
+                status, elapsed, usage = await run_single_bug(bug, session)
+                # 轮次/补丁数来自服务端 work_log（服务端唯一知道的状态），token 来自本轮统计
+                rounds, patches, resolved_bug = await fetch_work_log_stats(session, bug)
+                append_metric({
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "bug_id": resolved_bug or bug,
+                    "bug_id_requested": bug,
+                    "status": status,
+                    "total_time_seconds": round(elapsed, 2),
+                    "prompt_tokens": usage["prompt"],
+                    "completion_tokens": usage["completion"],
+                    "total_tokens": usage["total"],
+                    "api_calls": usage["calls"],
+                    "turns": usage["turns"],
+                    "current_round": rounds,
+                    "total_attempts": patches
+                })
                 results[bug] = {
                     "status": status, 
                     "time": round(elapsed, 2),
-                    "tokens": tokens
+                    "tokens": usage["total"],
+                    "turns": usage["turns"],
+                    "rounds": rounds
                 }
                 await asyncio.sleep(2)
                 
@@ -244,19 +341,19 @@ async def main():
             print("\n" + "="*55)
             print("📊 批量测试最终报告")
             print("="*55)
-            print(f"{'Bug ID':<12} | {'Status':<10} | {'Time (s)':<10} | {'Tokens':<10}")
-            print("-" * 55)
+            print(f"{'Bug ID':<12} | {'Status':<10} | {'Time (s)':<10} | {'Tokens':<10} | {'Turns':<6} | {'Rounds':<6}")
+            print("-" * 72)
             
             success_count = 0
             total_tokens = 0
             for bug, res in results.items():
                 icon = "✅" if res["status"] == "Fixed" else "❌"
-                print(f"{icon} {bug:<10} | {res['status']:<10} | {res['time']:<10} | {res['tokens']:<10}")
+                print(f"{icon} {bug:<10} | {res['status']:<10} | {res['time']:<10} | {res['tokens']:<10} | {res['turns']:<6} | {res['rounds']:<6}")
                 if res["status"] == "Fixed":
                     success_count += 1
                 total_tokens += res["tokens"]
             
-            print("-" * 55)
+            print("-" * 72)
             total_bugs = len(BUGS_TO_TEST)
             if total_bugs > 0:
                 print(f"总修复率: {success_count}/{total_bugs} ({(success_count/total_bugs)*100:.1f}%)")
@@ -264,7 +361,7 @@ async def main():
             print(f"总耗时: {total_time:.2f} 秒")
             print("="*55)
             
-            print("\n💡 提示: 详细 Token 消耗与轮次数据，请查看 logs/benchmark_metrics.jsonl")
+            print("\n💡 提示: 每个 Bug 的 token / 轮次 / 耗时详情已写入 logs/benchmark_metrics.jsonl")
 
 if __name__ == "__main__":
     asyncio.run(main())

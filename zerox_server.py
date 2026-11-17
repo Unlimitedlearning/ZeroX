@@ -43,8 +43,8 @@ BACKUP_ROOT = os.path.join(BASE_DIR, "backups")
 LOG_FILE = os.path.join(LOG_DIR, "mcp_server.log")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
-# 基准测试结果文件
-METRICS_FILE = os.path.join(LOG_DIR, "benchmark_metrics.jsonl")
+# 基准测试指标（logs/benchmark_metrics.jsonl）由 run_benchmark.py 负责写入：
+# token 用量只有调用 LLM 的客户端才知道，服务端这一侧只留耗时日志
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(BACKUP_ROOT, exist_ok=True)
@@ -330,31 +330,20 @@ def restore_written_files(applied_files, staged_writes):
     return restored, broken
 
 # ==========================================
-# 指标记录器（JSONL）
+# 任务结束复位（指标由客户端 run_benchmark.py 记录）
 # ==========================================
-def record_metric(status: str):
+def reset_task_state(status: str):
+    """一次任务走到终点（测试通过 / 超时 / 达到最大尝试次数）后复位状态锁。
+
+    基准指标（含 token 用量、轮次、耗时）由 run_benchmark.py 汇总后写入
+    logs/benchmark_metrics.jsonl；服务端只留一条耗时日志，方便对照 mcp_server.log 排查。
+    """
     global START_TIME, IS_TASK_INITIALIZED
-    if START_TIME is None:
-        return
+    if START_TIME is not None:
+        logging.info(f"⏱ 任务结束（{status}）：{CURRENT_BUG} 耗时 {round(time.time() - START_TIME, 2)}s，"
+                     f"第 {CURRENT_ROUND} 轮，累计 {TOTAL_ATTEMPTS} 次修改")
     
-    end_time = time.time()
-    elapsed = round(time.time() - START_TIME, 2) if START_TIME is not None else 0.0
-    
-    metric_data = {
-        "timestamp": datetime.datetime.now().isoformat(),
-        "bug_id": CURRENT_BUG,
-        "status": status,
-        "total_time_seconds": elapsed,
-        "current_round": CURRENT_ROUND,      # 最终停留在第几轮
-        "total_attempts": TOTAL_ATTEMPTS     # 真实的 API 调用/修改次数
-    }
-    
-    with open(METRICS_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(metric_data, ensure_ascii=False) + "\n")
-    
-    logging.info(f"📊 记录基准数据: {metric_data}")
-    
-    # 记录完毕，重置计时器和锁状态，准备好下一个 Bug
+    # 复位计时器和锁状态，准备好下一个 Bug
     START_TIME = None
     IS_TASK_INITIALIZED = False
 
@@ -641,7 +630,7 @@ async def call_tool(name: str, arguments: dict):
             except subprocess.TimeoutExpired:
                 current_process.kill()
                 save_test_result("Timeout", None, f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。")
-                record_metric("Timeout")
+                reset_task_state("Timeout")
                 return [types.TextContent(type="text", text=f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。", isError=True)]
 
             logging.info("测试进程结束，正在解析日志...")
@@ -663,7 +652,7 @@ async def call_tool(name: str, arguments: dict):
             # 【可配置判定】通过/失败规则来自 config.json 的 target.passed_pattern / failed_pattern
             if PASS_RE.search(content):
                 save_test_result("Passed", 0, "【测试全部通过】命中 passed_pattern")
-                record_metric("Fixed")
+                reset_task_state("Fixed")
                 return [types.TextContent(type="text", text=f"【测试全部通过】该 Bug 已成功修复！请结束任务并输出 [FIXED]。")]
 
             fail_match = FAIL_RE.search(content)
@@ -795,7 +784,7 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_defects4j_test 初始化当前 Bug 的测试环境。", isError=True)]
         
         if TOTAL_ATTEMPTS >= MAX_ATTEMPTS:
-            record_metric("Failed") # 直接记为失败
+            reset_task_state("Failed") # 直接记为失败
             return [types.TextContent(type="text", text=f"【任务失败】已达最大尝试次数 ({MAX_ATTEMPTS} 次)。请立刻停止修复，并输出 [FAILED]。", isError=True)]
         
         round_num = arguments.get("round")

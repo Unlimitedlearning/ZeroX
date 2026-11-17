@@ -28,6 +28,19 @@ Tested on the first 4 bugs from the `Lang` project. **Total API cost: < $0.20** 
 > **Total Repair Rate: 4/4 (100.0%)** 
 > *(Note: The remaining 3 failing tests in Lang_2 are JDK environment noise (timezone/reflection) and unrelated to the core bug.)*
 
+### 📈 Metrics File
+
+`logs/benchmark_metrics.jsonl` — one JSON line per finished bug, appended by `run_benchmark.py` after every run (including crashes and timeouts). The server cannot record this itself: token usage is only visible to the side that calls the LLM.
+
+| Field | Meaning |
+| :--- | :--- |
+| `bug_id` | Bug name as resolved by the server (e.g. `Lang_2b`), with `bug_id_requested` holding your raw input (`Lang_2`) |
+| `status` | `Fixed` / `Failed` / `Error` — `Fixed` means `run_test` reported all tests passing and the agent stopped |
+| `total_time_seconds` | Wall-clock time for the whole bug |
+| `prompt_tokens` / `completion_tokens` / `total_tokens` | Token usage summed over every LLM call of that bug |
+| `api_calls` / `turns` | Number of LLM requests / conversation turns consumed |
+| `current_round` / `total_attempts` | Highest `patch_and_log` round and number of applied patches, read from that bug's `work_log.jsonl` |
+
 ## 📁 Directory Structure
 
 ```text
@@ -38,7 +51,7 @@ ZeroX/
 ├── config.example.json     # Template for configuration
 ├── zerox_server.py         # MCP Server source code
 ├── run_benchmark.py        # Automated batch testing script
-├── logs/                   # Runtime logs, work logs, and benchmark metrics
+├── logs/                   # Runtime logs, work logs, and benchmark metrics (written by run_benchmark.py)
 └── backups/                # Automatic code backups per bug
 ```
 
