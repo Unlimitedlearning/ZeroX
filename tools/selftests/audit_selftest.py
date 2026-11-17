@@ -8,7 +8,7 @@
   5. 前缀命中多个目录    -> 报错而不是猜
   6. 没有日志            -> unknown（不能算成 clean）
 
-跑法：python tools/audit_selftest.py
+跑法：python tools/selftests/audit_selftest.py
 期望输出最后一行：audit selftest: OK
 """
 import json
@@ -17,7 +17,11 @@ import shutil
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# tools/selftests/ 比 tools/ 深一层，所以要比原来多剥一次 dirname 才能拿到项目根目录；
+# 代码在 src/ 下面，两个路径都要在 sys.path 里
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "src"))
 
 import audit  # noqa: E402
 

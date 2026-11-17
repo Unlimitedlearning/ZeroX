@@ -13,12 +13,12 @@ from mcp.server.stdio import stdio_server
 from mcp import types
 
 # 项目内模块（解耦第一步：配置与工具 schema 已外迁）
-from zerox import config as config_mod
-from zerox import schemas
-from zerox.config import compile_or_fail
-from zerox.config import resolve_bug as _resolve_bug
+from zerox_core import config as config_mod
+from zerox_core import schemas
+from zerox_core.config import compile_or_fail
+from zerox_core.config import resolve_bug as _resolve_bug
 # 命令执行器已外迁：事后审计（audit.py）要用同一条 test_cmd 复跑，不能各写一份 WSL 转发逻辑
-from zerox.exec_env import IS_WINDOWS, execute_in_target, popen_in_target, win_path_to_wsl
+from zerox_core.exec_env import IS_WINDOWS, execute_in_target, popen_in_target, win_path_to_wsl
 # 外置版本库：work_log 事件流 / blob 快照 / 回滚（独立模块，不依赖本文件任何东西）
 import worklog
 
@@ -44,15 +44,17 @@ TOTAL_TESTS = 0
 READ_CODE_COUNT = 0
 
 # ==========================================
-# [跨平台] 运行环境检测（IS_WINDOWS 跟随执行器一起外迁到 zerox/exec_env.py）
+# [跨平台] 运行环境检测（IS_WINDOWS 跟随执行器一起外迁到 src/zerox_core/exec_env.py）
 # ==========================================
+# 代码在 src/，而 config.json / logs/ 在项目根目录：BASE_DIR 是本文件目录，PROJECT_ROOT 是项目根
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_DIR = os.path.join(BASE_DIR, "logs")
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "mcp_server.log")
-# 配置文件：run_benchmark.py 会通过 ZEROX_CONFIG 传进来，保证客户端/服务端读同一份
-CONFIG_FILE = os.getenv("ZEROX_CONFIG") or os.path.join(BASE_DIR, "config.json")
+# 配置文件：Agent（src/zerox.py）会通过 ZEROX_CONFIG 传进来，保证客户端/服务端读同一份
+CONFIG_FILE = os.getenv("ZEROX_CONFIG") or os.path.join(PROJECT_ROOT, "config.json")
 
-# 基准测试指标（logs/benchmark_metrics.jsonl）由 run_benchmark.py 负责写入：
+# 基准测试指标（logs/benchmark_metrics.jsonl）由 Agent（src/zerox.py）负责写入：
 # token 用量只有调用 LLM 的客户端才知道，服务端这一侧只留耗时日志
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -71,7 +73,7 @@ logging.basicConfig(
 
 
 # ==========================================
-# 配置加载：默认值 / 校验 / 正则编译都在 zerox/config.py
+# 配置加载：默认值 / 校验 / 正则编译都在 src/zerox_core/config.py
 # ==========================================
 CONFIG = config_mod.load_config(CONFIG_FILE)
 TARGET = config_mod.load_target_config(CONFIG, CONFIG_FILE)
@@ -83,7 +85,7 @@ WORKSPACE_ROOT = (TARGET["workspace_root"] or "").rstrip("/")
 MAX_TESTS = AGENT_CONFIG.get("max_tests", 12)
 TEST_TIMEOUT = CONFIG["timeouts"]["test_execution"]
 
-# 判定规则来自 config.json（换测试集不用改代码）；bug_id 的解析在 zerox/config.py
+# 判定规则来自 config.json（换测试集不用改代码）；bug_id 的解析在 src/zerox_core/config.py
 PASS_RE = compile_or_fail(TARGET["passed_pattern"], "target.passed_pattern")
 FAIL_RE = compile_or_fail(TARGET["failed_pattern"], "target.failed_pattern")
 
@@ -99,7 +101,7 @@ logging.info(
 def resolve_bug(bug_id: str):
     """把 bug_id 解析成「工作区 + 命令」一整套配置；不符合 target.bug_id_pattern 就返回 None。
 
-    实现已外迁到 zerox/config.py（纯函数）：事后审计 audit.py 要用同一套解析，
+    实现已外迁到 src/zerox_core/config.py（纯函数）：事后审计 audit.py 要用同一套解析，
     才能拿到同一个工作区路径和同一条 test_cmd。
     """
     return _resolve_bug(TARGET, bug_id)
@@ -222,12 +224,12 @@ def write_target_file(target_path: str, content: str):
 
 
 # ==========================================
-# 任务结束复位（指标由客户端 run_benchmark.py 记录）
+# 任务结束复位（指标由 Agent src/zerox.py 记录）
 # ==========================================
 def reset_task_state(status: str):
     """一次任务走到终点（测试通过 / 超时 / 达到最大尝试次数）后复位状态锁。
 
-    基准指标（含 token 用量、轮次、耗时）由 run_benchmark.py 汇总后写入
+    基准指标（含 token 用量、轮次、耗时）由 src/zerox.py 汇总后写入
     logs/benchmark_metrics.jsonl；服务端只留一条耗时日志，方便对照 mcp_server.log 排查。
     """
     global START_TIME, IS_TASK_INITIALIZED
@@ -321,7 +323,7 @@ server = Server("zerox-server")
 
 @server.list_tools()
 async def list_tools():
-    # schema 是纯数据，已外迁到 zerox/schemas.py
+    # schema 是纯数据，已外迁到 src/zerox_core/schemas.py
     return schemas.build_tools()
 
 @server.call_tool()
@@ -346,6 +348,19 @@ async def call_tool(name: str, arguments: dict):
         workspace = bug_ctx["workspace"]
         setup_cmd = bug_ctx["setup_cmd"]
         test_cmd = bug_ctx["test_cmd"]
+
+        # 【预算闸门】一次测试 3-6 分钟，跑满就结束 —— 这是唯一会真正拖住任务的地方。
+        # 放在 checkout 之前有两个理由：
+        #   1. 预算已经用尽时，没必要再花 2-3 分钟准备一个不会跑测试的工作区；
+        #   2. 只有「换了 bug」才算新任务并复位 TOTAL_TESTS。否则 agent 自己传一个
+        #      force_checkout=true 就能把 12 次预算重置成满额，这道闸门就形同虚设。
+        is_new_bug = CURRENT_BUG != new_bug_id
+        if not is_new_bug and TOTAL_TESTS >= MAX_TESTS:
+            reset_task_state("MaxTests")
+            return [types.TextContent(type="text", text=(
+                f"【任务失败】已达到最大测试次数（{MAX_TESTS} 次）。请立刻停止修复并输出 [FAILED]。\n"
+                f"本任务共提交 {TOTAL_ATTEMPTS} 个补丁。"
+            ), isError=True)]
         
         # ---- 是否需要重新 checkout ----
         # 唯一的原则：run_test 只在「明确要求」或「确实是新任务」时重置工作区，
@@ -393,7 +408,9 @@ async def call_tool(name: str, arguments: dict):
             START_TIME = time.time()
             CURRENT_ROUND = 0
             TOTAL_ATTEMPTS = 0
-            TOTAL_TESTS = 0
+            # 只有新 bug 才复位测试预算：同一个 bug 上的 force_checkout 不能当「续命」用
+            if is_new_bug:
+                TOTAL_TESTS = 0
             READ_CODE_COUNT = 0
             
             logging.info(f"切换当前 Bug 为 {CURRENT_BUG} | 执行全量 Checkout")
@@ -427,14 +444,6 @@ async def call_tool(name: str, arguments: dict):
             else:
                 full_cmd = test_cmd
 
-
-        # 【预算闸门】唯一会真正拖住任务的地方：一次测试 3-6 分钟，跑满就结束
-        if TOTAL_TESTS >= MAX_TESTS:
-            reset_task_state("MaxTests")
-            return [types.TextContent(type="text", text=(
-                f"【任务失败】已达到最大测试次数（{MAX_TESTS} 次）。请立刻停止修复并输出 [FAILED]。\n"
-                f"本任务共提交 {TOTAL_ATTEMPTS} 个补丁。"
-            ), isError=True)]
 
         TOTAL_TESTS += 1
 

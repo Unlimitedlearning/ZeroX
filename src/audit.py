@@ -10,10 +10,10 @@
   audit    clean | invalid   —— invalid = 某一轮 patch 动过测试代码
   verified true | false      —— 把测试文件还原成原始状态后重跑仍然通过（只有 --verify 才算）
 
-用法：
-  python audit.py                  # 审计 logs/ 下所有 bug（只读 work_log，不跑测试）
-  python audit.py --bug Lang_1     # 只审计一个（前缀匹配 Lang_1 -> Lang_1b）
-  python audit.py --verify         # 额外把测试文件还原后重跑，每个 bug 3-6 分钟
+用法（代码在 src/，日志和配置在项目根目录）：
+  python src/audit.py                  # 审计 logs/ 下所有 bug（只读 work_log，不跑测试）
+  python src/audit.py --bug Lang_1     # 只审计一个（前缀匹配 Lang_1 -> Lang_1b）
+  python src/audit.py --verify         # 额外把测试文件还原后重跑，每个 bug 3-6 分钟
 
 审计结论追加到 logs/audit.jsonl，一行一个 bug，可以和历史 run 对账。
 """
@@ -27,7 +27,7 @@ import subprocess
 import sys
 from datetime import datetime
 
-# 与 run_benchmark.py 的 metrics 行对齐：审计版本变了，旧结论就不要混着用
+# 与 src/zerox.py 的 metrics 行对齐：审计版本变了，旧结论就不要混着用
 AUDIT_VERSION = 1
 
 # 没有配置时的兜底：Defects4J / Maven / Gradle 的常见测试目录
@@ -193,7 +193,7 @@ def verify_fixed(bug_dir, workspace, test_cmd, passed_pattern,
     用来挡掉 flaky pass —— 「一次通过」不等于「修好了」。
     还原规则：work_log 里 before 为空的是新建文件（rm -f），其余走 git checkout --。
     """
-    from zerox.exec_env import execute_in_target, popen_in_target  # 只有验证才需要起进程
+    from zerox_core.exec_env import execute_in_target, popen_in_target  # 只有验证才需要起进程
 
     if not str(passed_pattern or "").strip():
         return {"verified": False, "reason": "config 没有 passed_pattern，无法判定",
@@ -307,8 +307,8 @@ def _print_verdict(row):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="ZeroX 事后审计（读 work_log，判定 Fixed / Verified Fixed）")
-    parser.add_argument("--config", default=None, help="配置文件，默认 ZEROX_CONFIG 或 ./config.json")
-    parser.add_argument("--logs", default=None, help="日志根目录，默认 ./logs")
+    parser.add_argument("--config", default=None, help="配置文件，默认 ZEROX_CONFIG 或 <项目根>/config.json")
+    parser.add_argument("--logs", default=None, help="日志根目录，默认 <项目根>/logs")
     parser.add_argument("--bug", nargs="*", default=None, help="要审计的 bug 名；省略 = logs/ 下全部")
     parser.add_argument("--verify", action="store_true", help="还原测试文件后重跑（每个 bug 3-6 分钟）")
     parser.add_argument("--json", action="store_true", help="输出 JSON 行而不是表格")
@@ -316,13 +316,15 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    logs_dir = args.logs or os.path.join(base_dir, "logs")
-    config_file = args.config or os.getenv("ZEROX_CONFIG") or os.path.join(base_dir, "config.json")
+    # src/ 只放代码：默认的 logs/ 和 config.json 都在项目根目录
+    project_root = os.path.dirname(base_dir)
+    logs_dir = args.logs or os.path.join(project_root, "logs")
+    config_file = args.config or os.getenv("ZEROX_CONFIG") or os.path.join(project_root, "config.json")
 
     target = None
     config = None
     if os.path.exists(config_file):
-        from zerox import config as config_mod
+        from zerox_core import config as config_mod
         config = config_mod.load_config(config_file)
         target = config_mod.load_target_config(config, config_file)
 

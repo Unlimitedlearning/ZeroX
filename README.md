@@ -9,7 +9,7 @@ By combining a minimalist toolchain, stateful external logging, and search-augme
 
 ## 💡 Core Innovations (The "Agentless" Philosophy)
 
-1. **Minimalist Toolchain & Stateful Logging**: By discarding massive native tool libraries, ZeroX keeps only 6 core MCP tools. The agent's reasoning process is forced into an external `work_log.jsonl`, achieving extreme context compression, and this stateful log lets the LLM seamlessly resume a task. The log is an **append-only event stream** (`patch` / `test` / `note`) owned by a standalone `worklog.py`: test outcomes are never overwritten, so `get_work_log` can hand back a compact digest — what each round changed and whether the failure count is converging (`上轮 5 个 → 2 个`) — instead of replaying full `old/new` diffs. After a context compaction the agent recovers its diagnosis from that digest instead of wasting a turn on a meaningless test run.
+1. **Minimalist Toolchain & Stateful Logging**: By discarding massive native tool libraries, ZeroX keeps only 7 core MCP tools. The agent's reasoning process is forced into an external `work_log.jsonl`, achieving extreme context compression, and this stateful log lets the LLM seamlessly resume a task. The log is an **append-only event stream** (`patch` / `test` / `note`) owned by a standalone `worklog.py` (the single rewrite is `rollback()`, which archives the dropped events to `human_audit.jsonl` first): test outcomes are never overwritten, so `get_work_log` can hand back a compact digest — what each round changed and whether the failure count is converging (`上轮 5 个 → 2 个`) — instead of replaying full `old/new` diffs. After a context compaction the agent recovers its diagnosis from that digest instead of wasting a turn on a meaningless test run.
 2. **Atomic Patch Operations & Blocking Verification**: Through `patch_and_log`, the LLM is strictly forced to output `old/new` diffs rather than full code. Every write goes through `worklog.py`, which stores the before/after content as content-addressed blobs and applies a round atomically — if any file fails, all of them are restored. The `run_test` tool acts as a blocking function that automatically waits for execution to finish and returns parsed logs, eliminating useless polling.
 3. **Emergent Self-Healing under Minimalist Tools**: Facing missing static metadata, the agent spontaneously exhibits advanced debugging behavior: autonomously injecting diagnostic probes into test/production code, writing runtime variables to temporary files, and cleaning them up. This proves that under a non-polluted context, a lightweight LLM possesses powerful emergent abilities. (Solidified into SOP in `AGENTS.md`).
 4. **Nudge Theory & Asymmetric Memory Architecture**: Rollback means a clean slate for the AI (Preventing Context Poisoning), while all discarded patches and failed trajectories are strictly preserved in `human_audit.jsonl` for human researchers. This provides an untainted exploration space for the LLM while offering invaluable data for Error Analysis.
@@ -30,17 +30,18 @@ Tested on the first 4 bugs from the `Lang` project. **Total API cost: < $0.20** 
 
 ### 📈 Metrics File
 
-`logs/benchmark_metrics.jsonl` — one JSON line per finished bug, appended by `run_benchmark.py` after every run (including crashes and timeouts). The server cannot record this itself: token usage is only visible to the side that calls the LLM.
+`logs/benchmark_metrics.jsonl` — one JSON line per finished bug, appended by `src/zerox.py` (the agent) after every run (including crashes and timeouts). The server cannot record this itself: token usage is only visible to the side that calls the LLM.
 
 | Field | Meaning |
 | :--- | :--- |
-| `bug_id` | Bug name as resolved by the server (e.g. `Lang_2b`), with `bug_id_requested` holding your raw input (`Lang_2`) |
+| `bug_id` / `bug_id_requested` | Both hold the id you put in `benchmark_bugs` (e.g. `Lang_1`). The log directory on disk uses the canonical name (`Lang_1b`), so `audit.py` maps `Lang_1` → `Lang_1b` itself |
 | `status` | One of `Fixed` / `Failed` / `Error` / `MaxTurns` — `Fixed` means `run_test` reported all tests passing and the agent stopped; `MaxTurns` means it ran out of `agent.max_turns` without converging |
 | `total_time_seconds` | Wall-clock time for the whole bug |
 | `prompt_tokens` / `completion_tokens` / `total_tokens` | Token usage summed over every LLM call of that bug |
 | `api_calls` / `turns` | Number of LLM requests / conversation turns consumed |
 | `tests` / `total_attempts` / `current_round` | Test executions (the budget unit), patches applied, highest round reached |
 | `audit` / `audit_violations` | Post-hoc verdict from `audit.py`: `clean` or `invalid`, plus the paths that make it invalid |
+| `audit_version` | Version of the audit rules that produced that verdict (`audit.AUDIT_VERSION`) — bump it when the rules change, so older rows stay identifiable in the same file |
 | `current_round` / `total_attempts` / `tests` | Highest round, applied patches and test executions, counted by the client inside its own tool loop |
 
 ## 📦 Benchmark Suite (BENCH30)
@@ -52,10 +53,10 @@ Tested on the first 4 bugs from the `Lang` project. **Total API cost: < $0.20** 
 ```bash
 cp config.example.json config.json   # then set target.tool_path + target.workspace_root
 export DEEPSEEK_API_KEY=...
-python run_benchmark.py
+python src/zerox.py
 ```
 
-Everything machine-specific lives in `config.json` (`tool_path`, `workspace_root`, credentials) and is git-ignored; nothing else needs editing. `run_benchmark.py` calls the model with `temperature=0`, so runs are near-deterministic — residual variation comes from provider-side batching, which is why the reporting section below still asks for repeats.
+Everything machine-specific lives in `config.json` (`tool_path`, `workspace_root`, credentials) and is git-ignored; nothing else needs editing. `src/zerox.py` calls the model with `temperature=0`, so runs are near-deterministic — residual variation comes from provider-side batching, which is why the reporting section below still asks for repeats.
 
 Built and verified against **Defects4J 1.5.0**, whose bug-id ranges are Lang 1–65, Math 1–106, Chart 1–26, Time 1–27, Compress 1–47, Codec 1–18, Csv 1–16, Cli 1–40. Lang 18/25/48, Time 21 and Cli 6 do not exist upstream and are never referenced.
 
@@ -81,11 +82,11 @@ Closure, JacksonDatabind, Mockito and Gson. Single-bug test time (Closure runs 5
 ### What to report
 
 1. `logs/benchmark_metrics.jsonl` — one line per finished bug (`status`, tokens, rounds, wall time).
-2. **plausible vs correct** — "all tests pass" is a plausible patch, not a correct one. Cross-check against the developer patch (`revision.id.fixed` in `defects4j/framework/projects/<Project>/active-bugs.csv`), and run `python audit.py --verify` to replay every finished bug with its test files restored: that re-run is what `Verified Fixed` means.
+2. **plausible vs correct** — "all tests pass" is a plausible patch, not a correct one. Cross-check against the developer patch (`revision.id.fixed` in `defects4j/framework/projects/<Project>/active-bugs.csv`), and run `python src/audit.py --verify` to replay every finished bug with its test files restored: that re-run is what `Verified Fixed` means.
 3. **variance** — LLMs are non-deterministic; repeat each bug ≥3 times and report mean ± std.
 4. **per-tier and per-project rates** — one aggregate number hides everything interesting.
 
-`logs/benchmark_metrics.jsonl`, `logs/audit.jsonl` and `logs/<bug>/human_audit.jsonl` are the only files under `logs/` that git tracks, so published numbers stay auditable without committing every scratch log. If tier C suddenly scores far above the literature, run `python audit.py` and read the `invalid` rows before celebrating.
+`logs/benchmark_metrics.jsonl`, `logs/audit.jsonl` and `logs/<bug>/human_audit.jsonl` are the only files under `logs/` that git tracks, so published numbers stay auditable without committing every scratch log. If tier C suddenly scores far above the literature, run `python src/audit.py` and read the `invalid` rows before celebrating.
 
 ## 📁 Directory Structure
 
@@ -95,13 +96,15 @@ ZeroX/
 ├── README.md               # Project documentation
 ├── AGENTS.md               # System prompt: tools, budget, workflow (Core Asset)
 ├── config.example.json     # Template for configuration
-├── zerox_server.py         # MCP Server source code
-├── worklog.py              # Standalone version-control module (blobs + append-only events + rollback)
-├── audit.py                # Post-hoc audit: Fixed vs Verified Fixed, no runtime edit restrictions
-├── run_benchmark.py        # Automated batch testing script
-├── case/                   # Single-file practice case (List_999.java + pristine copy)
-├── config.list999.json     # Alternate config for the bundled Java case
-├── tools/                  # Offline selftests (worklog, audit) + new_run.py (archive last batch)
+├── src/                    # All ZeroX code
+├── src/zerox.py            # Agent entry point: LLM loop, budget accounting, metrics (the only writer)
+├── src/zerox_server.py     # MCP Server: the 7 tools that touch the workspace
+├── src/zerox_core/         # Package: config defaults + validation, tool schemas, command executor
+├── src/worklog.py          # Standalone version-control module (blobs + append-only events + rollback)
+├── src/audit.py            # Post-hoc audit: Fixed vs Verified Fixed, no runtime edit restrictions
+├── case/                   # Defects4J-free Java case: config.json + pristine/ + work/ (git-ignored)
+├── tools/                  # new_run.py — archive the previous batch before a sweep
+├── tools/selftests/        # Offline selftests (worklog, audit): no WSL, no Defects4J
 ├── logs/                   # Runtime logs, work logs, blob store, and benchmark metrics
 ```
 
@@ -122,29 +125,38 @@ cp config.example.json config.json
 
 **3. Run the MCP Server**
 ```bash
-python zerox_server.py
+python src/zerox_server.py
 ```
 
 **4. Automated Benchmark Testing**
 To run the batch testing script (which spawns the MCP client and interacts with the LLM automatically):
 ```bash
-python run_benchmark.py
+python src/zerox.py
 ```
-To benchmark the bundled single-file case instead of Defects4J, point the script at its config (`--config` is forwarded to the server via `ZEROX_CONFIG`, so both sides read the same file):
+To run the bundled single-file case instead of Defects4J, point the script at its config (`--config` is forwarded to the server via `ZEROX_CONFIG`, so both sides read the same file; relative paths are resolved against the project root, next to this README):
 ```bash
-python run_benchmark.py --config config.list999.json
+python src/zerox.py --config case/config.json
+python src/audit.py --config case/config.json
 ```
 
-Before each new batch, archive the previous batch instead of letting the numbers mix — `python tools/new_run.py` moves everything under `logs/` into `logs/archive/<timestamp>/` (keeping a `manifest.json`), clears `__pycache__`, and prints the bug list it is about to run. The archived batch stays auditable: `python audit.py --logs logs/archive/<timestamp>`.
+Before each new batch, archive the previous batch instead of letting the numbers mix — `python tools/new_run.py` moves everything under `logs/` into `logs/archive/<timestamp>/` (keeping a `manifest.json`), clears `__pycache__`, and prints the bug list it is about to run. The archived batch stays auditable: `python src/audit.py --logs logs/archive/<timestamp>`.
 
-**5. Bundled Single-File Case (`case/List_999.java`)**
-A self-testing Java program that exercises the same toolchain without Defects4J:
+**5. Bundled Single-File Case (`case/`)**
+A self-testing Java program that exercises the same toolchain without Defects4J — one test run takes seconds instead of 3-6 minutes, so it is the fastest regression check for any change to the tools:
 
-- `case/List_999.java` — a `SortedInts` container (binary-search bounds, counting, ranged copy, bulk removal, sorted insert, nearest lookup) plus a harness in `main`. It prints one `[PASS]` / `[FAIL]` line per case and ends with `All tests passed` or `FAILED (n)`.
+```text
+case/
+├── config.json               # target.workspace_root = "work" (relative, no absolute paths in the repo)
+├── pristine/List_999.java    # the baseline; the agent never sees this directory
+└── work/List_999/            # the workspace: recreated by setup_cmd, git-ignored
+```
+
+- `pristine/List_999.java` — a `SortedInts` container (binary-search bounds, counting, ranged copy, bulk removal, sorted insert, nearest lookup) plus a harness in `main`. It prints one `[PASS]` / `[FAIL]` line per case and ends with `All tests passed` or `FAILED (n)`.
 - Baseline is `7/10`: the three duplicate-related cases (`count duplicates`, `last index of duplicates`, `remove all duplicates`) fail, everything else passes — one root cause, several delegated symptoms.
 - No comments anywhere, so the only ground truth is the test output.
 - Each case runs on a daemon thread with a 3s join timeout, so an exception or an infinite loop only fails that case.
-- `case/List_999.pristine.bak` — untouched snapshot; `target.setup_cmd` copies it back before every run. Keep the two files identical: `cp case/List_999.java case/List_999.pristine.bak`.
+- The baseline lives **outside** the workspace: the agent cannot see or edit it, so there is no `pristine.bak` to keep in sync by hand, and `patch_deny_globs` is unnecessary. To change the case on purpose, edit `case/pristine/<name>.java` yourself, then `rm -rf case/work`.
+- Adding another single-file Java case: drop `case/pristine/<Name>.java`, add `<Name>` to `benchmark_bugs` in `case/config.json`. `setup_cmd` / `test_cmd` use `{bug_id}`, so nothing else changes. See `case/README.md` for the full recipe (including multi-file / Maven projects).
 
 ## 🧩 Configuration Reference (Swap Test Suites Without Touching Code)
 
@@ -162,7 +174,7 @@ Everything environment-specific lives in `config.json`; the code only reads it. 
 | Field | Meaning |
 | :--- | :--- |
 | `tool_path` | Test framework / build tool entry point, exposed as `{tool}` |
-| `workspace_root` | Root directory holding all bug workspaces, exposed as `{workspace_root}` |
+| `workspace_root` | Root directory holding all bug workspaces, exposed as `{workspace_root}`. Three forms: `/mnt/d/work` (used as-is), `D:/work` (converted to `/mnt/d/work`), or `work` / `./work` (**relative to the config file's directory** — this is how `case/config.json` stays machine-independent) |
 | `workspace_template` | Per-bug directory template, exposed as `{workspace}` |
 | `setup_cmd` | Run once per new bug (checkout/unzip/switch branch). Empty = nothing to set up. A fresh checkout also clears that bug's `work_log.jsonl`, because the workspace is back to its initial state and old rounds no longer apply |
 | `test_cmd` | Run on every verification |
@@ -223,7 +235,7 @@ The judgement moved to `audit.py`, which reads the finished `work_log.jsonl` and
 | Label | Meaning |
 | :--- | :--- |
 | `audit: clean` / `invalid` | `invalid` = at least one round patched a file matching `target.audit_test_globs` |
-| `verified: true` / `false` | `python audit.py --verify` restores those test files (`git checkout --`, or `rm -f` for files the agent created), re-runs `test_cmd`, and checks `passed_pattern` again — passing with the suite restored means the fix does not lean on the edited tests |
+| `verified: true` / `false` | `python src/audit.py --verify` restores those test files (`git checkout --`, or `rm -f` for files the agent created), re-runs `test_cmd`, and checks `passed_pattern` again — passing with the suite restored means the fix does not lean on the edited tests |
 
 Because the verdict is derived from the append-only log, it can be replayed over historical runs months later, without touching the workspace or spending a single test. Publish both numbers: **Fixed** and **Verified Fixed**.
 
@@ -231,7 +243,7 @@ Because the verdict is derived from the append-only log, it can be replayed over
 
 **`run_test` never resets the workspace on its own.** A checkout happens only when the caller explicitly passes `force_checkout: true` (the benchmark client does this on the first call of each bug) or when the bug id changes with no patches pending. Switching bugs while patches are pending is refused rather than silently wiping them — the old rule (`reset_task_state` flipping `IS_TASK_INITIALIZED` triggered a re-checkout) was what made the agent look *stuck at `run_test`*: every retry re-ran on freshly checked-out, still-buggy code.
 
-> **Known blind spot:** the single-file case (`config.list999.json`) keeps the code under test and the harness in the same file, so `audit_test_globs` cannot tell them apart — it is set to `[]` there, every patch audits as `clean`, and the prompt is the only constraint.
+> **Known blind spot:** the single-file case (`case/config.json`) keeps the code under test and the harness in the same file, so `audit_test_globs` cannot tell them apart — it is set to `[]` there, every patch audits as `clean`, and the prompt is the only constraint.
 
 ### `agent` — behaviour and prompts
 

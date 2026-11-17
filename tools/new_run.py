@@ -2,7 +2,7 @@
 
 为什么是「归档」而不是「删除」：
   * logs/benchmark_metrics.jsonl 和 logs/audit.jsonl 是唯一的实验记录，删了就没法对账；
-  * 归档后 `python audit.py --logs logs/archive/<时间戳>` 还能重审上一批（只读 work_log，不跑测试）；
+  * 归档后 `python src/audit.py --logs logs/archive/<时间戳>` 还能重审上一批（只读 work_log，不跑测试）；
   * 真要彻底删，用 --delete（会二次确认）。
 
 做什么：
@@ -15,7 +15,7 @@
 因为整轮数据都被移走了，不需要再单独备份 metrics：新一轮会重新建文件。
 
 不做的事（故意的）：
-  * 不删工作区 d4j_<project>_<version>：run_benchmark.py 对每个 bug 的第一次 run_test
+  * 不删工作区 d4j_<project>_<version>：src/zerox.py 对每个 bug 的第一次 run_test
     会传 force_checkout=true，服务器自己会重新 checkout；提前删只是白等 2-3 分钟。
 
 用法：
@@ -135,7 +135,7 @@ def main(argv=None):
             try:
                 shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
             except OSError as err:
-                print(f"  ⚠️ 删不掉 {path}: {err}（有进程在用？先停掉 run_benchmark.py / 残留 java）")
+                print(f"  ⚠️ 删不掉 {path}: {err}（有进程在用？先停掉 src/zerox.py / 残留 java）")
         print(f"\n已删除 {len(items)} 项。")
     else:
         if not args.yes:
@@ -151,7 +151,7 @@ def main(argv=None):
                 shutil.move(path, dest)
                 moved.append({"name": os.path.basename(path), "bytes": path_size(dest)})
             except OSError as err:
-                print(f"  ⚠️ 移动失败 {path}: {err}（有进程在用？先停掉 run_benchmark.py / 残留 java）")
+                print(f"  ⚠️ 移动失败 {path}: {err}（有进程在用？先停掉 src/zerox.py / 残留 java）")
         manifest = {
             "archived_at": stamp,
             "items": moved,
@@ -160,7 +160,7 @@ def main(argv=None):
         with open(os.path.join(archive_dir, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
         print(f"\n已归档 {len(moved)} 项 → {os.path.relpath(archive_dir, BASE_DIR)}")
-        print(f"以后要重审这一批：python audit.py --logs {os.path.relpath(archive_dir, BASE_DIR)}")
+        print(f"以后要重审这一批：python src/audit.py --logs {os.path.relpath(archive_dir, BASE_DIR)}")
 
     if not args.keep_pycache:
         removed = clear_pycache()
@@ -170,10 +170,10 @@ def main(argv=None):
     bugs = configured_bugs()
     if bugs:
         print(f"\n这一轮 config.json 的 bug 列表（{len(bugs)} 个）：{' '.join(bugs)}")
-        print("logs/ 现在是空的，run_benchmark.py 会重新建 benchmark_metrics.jsonl。")
+        print("logs/ 现在是空的，src/zerox.py 会重新建 benchmark_metrics.jsonl。")
     else:
         print("\n⚠️ config.json 里没有 benchmark_bugs，先配上再跑。")
-    print("\n接下来：\n  python run_benchmark.py\n  python audit.py            # 汇总 clean / invalid\n  python audit.py --verify   # 每个 Fixed 多 3-6 分钟，换 Verified Fixed")
+    print("\n接下来：\n  python src/zerox.py\n  python src/audit.py            # 汇总 clean / invalid\n  python src/audit.py --verify   # 每个 Fixed 多 3-6 分钟，换 Verified Fixed")
     return 0
 
 

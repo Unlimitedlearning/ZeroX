@@ -10,6 +10,9 @@ import shlex
 import sys
 import re
 
+# 同包内的纯函数模块（不反向依赖 config）：路径标准化只写一份，别在两个地方各转一次
+from zerox_core.exec_env import win_path_to_wsl
+
 
 # ==========================================
 # 目标环境默认配置：换测试集只改 config.json，代码不用动
@@ -20,6 +23,7 @@ DEFAULT_TARGET = {
     # 测试框架/构建工具入口，命令模版里的 {tool}
     "tool_path": "",
     # 所有 bug 工作区的根目录，模版里的 {workspace_root}
+    # 支持三种写法（见 resolve_workspace_root）：/mnt/d/... 原样用、D:/... 自动转换、"work" 相对配置文件目录
     "workspace_root": "",
     # 单个 bug 的工作区目录模版，模版里的 {workspace}
     "workspace_template": "{workspace_root}/d4j_{project}_{version}",
@@ -57,6 +61,13 @@ DEFAULT_TARGET = {
 DEFAULT_AGENT = {
     # 单个 bug 允许的 run_test 次数上限：一次测试 3-6 分钟，这是本任务唯一真实的成本
     "max_tests": 12,
+    # ---- 以下是客户端（src/zerox.py）的开关，服务端不读 ----
+    # 都是「要经常微调」的默认值：真正生效的值请写在 config.json 的 agent 段落里，这里只是兑底
+    "max_turns": 100,                        # 客户端单个 bug 的最大对话轮数
+    "system_prompt_file": "AGENTS.md",       # 相对项目根目录（src/ 的上一层），也可以写绝对路径
+    "user_prompt_template": "Please fix the bug for {bug_id}. Begin by calling run_test with bug_id='{bug_id}'.",
+    "fixed_marker": "[FIXED]",               # agent 输出这个标记就算修复成功
+    "failed_marker": "[FAILED]",
 }
 
 
@@ -91,6 +102,30 @@ def load_config(config_file):
     return config
 
 
+def resolve_workspace_root(value, base_dir):
+    """把 target.workspace_root 解析成【目标环境（WSL / 原生 bash）里的绝对路径】。
+
+    三种写法都支持，这样仓库里不必出现本机绝对路径：
+      /mnt/d/work          → 已经是目标环境路径，原样返回（Defects4J 的旧配置不受影响）
+      D:\\work  或  D:/work  → 转成 /mnt/d/work
+      work  /  ./work      → 相对【配置文件所在目录】拼接，再转成目标环境路径
+
+    为什么必须在这里做：命令都是 bash 跑的，相对路径在 bash 里的 cwd 不可控；
+    而把绝对路径写进 config.json，仓库就只在本机能用了（case/config.json 也因此不能用硬编码路径）。
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    # 已经是目标环境路径（注意：Windows 上 os.path.abspath("/mnt/d/x") 会变成 D:\\mnt\\d\\x，不能动它）
+    if raw.startswith("/"):
+        return raw.rstrip("/") or "/"
+    # Windows 盘符路径
+    if re.match(r"^[A-Za-z]:[\\/]", raw):
+        return win_path_to_wsl(raw).rstrip("/")
+    # 相对路径：按配置文件所在目录拼
+    return win_path_to_wsl(os.path.join(base_dir, raw)).rstrip("/")
+
+
 def load_target_config(config, config_file):
     """把 config.json 的 target 段落合并到默认值上；缺字段就用默认值。"""
     target = dict(DEFAULT_TARGET)
@@ -101,6 +136,9 @@ def load_target_config(config, config_file):
     for key, value in user_target.items():
         if value is not None:
             target[key] = value
+    # 解析完默认值就必须统一 workspace_root，否则 server / audit / 客户端三边会各自猜一遍
+    base_dir = os.path.dirname(os.path.abspath(config_file))
+    target["workspace_root"] = resolve_workspace_root(target.get("workspace_root"), base_dir)
     return target
 
 

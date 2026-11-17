@@ -1,7 +1,14 @@
+"""ZeroX Agent 入口：驱动 LLM 与 MCP Server 对话，直到测试报「全部通过」或预算用尽。
+
+    python src/zerox.py                       # 跑 config.json 里的 benchmark_bugs
+    python src/zerox.py --config case/config.json
+
+本文件原来叫 run_benchmark.py。它不是「基准测试脚本」，而是 Agent 本体：
+循环、预算外账、指标都在这层（服务端看不到 token，也看不到终态）。
+"""
 import asyncio
 import json
 import os
-import re
 import sys
 import time
 from datetime import datetime
@@ -11,18 +18,22 @@ from mcp.client.stdio import stdio_client
 
 # 同目录模块：事后审计（运行时不做编辑限制，跑完再判定 clean / invalid）
 import audit
-from zerox import config as config_mod
+# 内部包在 src/zerox_core/：包名不能叫 zerox，否则会盖住本文件（src/zerox.py）
+from zerox_core import config as config_mod
 
 CONFIG_FILE = "config.json"
 
-# 无论从哪个目录启动，配置 / 提示词 / 服务端脚本都按本文件所在目录定位
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 代码在 src/，而 config.json / logs/ / AGENTS.md 仍在项目根目录：
+#   SRC_DIR      本文件所在目录（server 脚本在这里）
+#   PROJECT_ROOT 项目根（配置、日志、提示词都在这里）
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SRC_DIR)
 
 
 def resolve_config_file():
     """选取配置文件：--config 优先，其次 ZEROX_CONFIG 环境变量，最后默认 config.json。
 
-    相对路径按本文件所在目录解析；选中的文件通过 ZEROX_CONFIG 传给 MCP Server，
+    相对路径按【项目根目录】解析（在哪个目录下敲 python 都一样）；选中的文件通过 ZEROX_CONFIG 传给 MCP Server，
     保证客户端和服务端读的是同一份配置。
     """
     chosen = None
@@ -35,48 +46,29 @@ def resolve_config_file():
             chosen = arg.split("=", 1)[1]
             break
     chosen = chosen or os.getenv("ZEROX_CONFIG") or CONFIG_FILE
-    return chosen if os.path.isabs(chosen) else os.path.join(BASE_DIR, chosen)
+    return chosen if os.path.isabs(chosen) else os.path.join(PROJECT_ROOT, chosen)
 
 
 CONFIG_FILE = resolve_config_file()
 # Server 子进程会继承这个变量，否则它会读回默认的 config.json
 os.environ["ZEROX_CONFIG"] = CONFIG_FILE
-SERVER_SCRIPT = os.path.join(BASE_DIR, "zerox_server.py")
+SERVER_SCRIPT = os.path.join(SRC_DIR, "zerox_server.py")
 
-LOG_DIR = os.path.join(BASE_DIR, "logs")
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 # 基准指标由客户端写：token 用量只有调用 LLM 的这一端拿得到，服务端无法记录
 METRICS_FILE = os.path.join(LOG_DIR, "benchmark_metrics.jsonl")
 
 # 上下文压缩时保留的工具输出尾部长度（防止单条输出又把上下文撑爆）
 COMPACT_TOOL_TAIL_CHARS = 6000
 
-# agent 段落默认值：与 zerox_server.py 的 DEFAULT_AGENT 保持一致
-DEFAULT_AGENT = {
-    "max_tests": 12,                      # 服务端每个 bug 的 run_test 次数上限（客户端不使用，仅与 config 对齐）
-    "max_turns": 100,                        # 客户端单个 bug 的最大对话轮数
-    "system_prompt_file": "AGENTS.md",       # 相对本文件所在目录，也可以写绝对路径
-    "user_prompt_template": "Please fix the bug for {bug_id}. Begin by calling run_test with bug_id='{bug_id}'.",
-    "fixed_marker": "[FIXED]",               # agent 输出这个标记就算修复成功
-    "failed_marker": "[FAILED]",
-}
-
-
-def load_agent_config(config):
-    """把 config.json 的 agent 段落合并到默认值上；prompt 这类要经常微调的都在这里。"""
-    agent_cfg = dict(DEFAULT_AGENT)
-    user_agent = config.get("agent") or {}
-    if not isinstance(user_agent, dict):
-        print("❌ config.json 里的 'agent' 必须是一个对象")
-        sys.exit(1)
-    for key, value in user_agent.items():
-        if value is not None:
-            agent_cfg[key] = value
-    return agent_cfg
+# agent 段落的默认值已经合并到 src/zerox_core/config.py 的 DEFAULT_AGENT，与 zerox_server.py 共用同一份，
+# 不再在这里维护第二份（两份默认值迟早会漏改一份）。
+# 注意：服务端只读 max_tests，客户端读剩下那几个；要改默认行为请改 config.json 的 agent 段落。
 
 
 def resolve_path(path: str) -> str:
-    """相对路径按项目根目录解析，绝对路径原样返回。"""
-    return path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
+    """相对路径按项目根目录解析（配置/日志/提示词都在根目录），绝对路径原样返回。"""
+    return path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
 
 
 def load_config():
@@ -88,7 +80,7 @@ def load_config():
 
 CONFIG = load_config()
 LLM_CONF = CONFIG["llm_config"]
-AGENT_CONF = load_agent_config(CONFIG)
+AGENT_CONF = config_mod.load_agent_config(CONFIG, CONFIG_FILE)
 # 审计用的字段（test_globs）从 target 段落读，与 MCP Server 同一套默认值
 TARGET_CONF = config_mod.load_target_config(CONFIG, CONFIG_FILE)
 AUDIT_TEST_GLOBS = TARGET_CONF.get("audit_test_globs")
@@ -364,6 +356,9 @@ async def main():
                     "total_attempts": patches,
                     "tests": counters["tests"],
                     "audit": verdict.get("audit"),
+                    # 判定规则是会调的东西：审计版本号写进每行指标，否则改了标准以后
+                    # 同一份 benchmark_metrics.jsonl 里新旧结论分不清（audit.jsonl 里本来就有）
+                    "audit_version": getattr(audit, "AUDIT_VERSION", None),
                     "audit_violations": [v["path"] for v in verdict.get("violations") or []],
                 })
                 results[bug] = {
@@ -402,7 +397,7 @@ async def main():
             print("="*55)
             
             print("\n💡 提示: 每个 Bug 的 token / 轮次 / 耗时详情已写入 logs/benchmark_metrics.jsonl")
-            print("💡 事后审计: python audit.py（只读 work_log）/ python audit.py --verify（还原测试文件后复跑）")
+            print("💡 事后审计: python src/audit.py（只读 work_log）/ python src/audit.py --verify（还原测试文件后复跑）")
 
 if __name__ == "__main__":
     asyncio.run(main())

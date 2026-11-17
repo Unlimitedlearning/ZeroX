@@ -1,6 +1,6 @@
 """worklog 自检：不开 WSL、不碰 Defects4J，只在临时目录里跑一遍完整生命周期。
 
-    python tools/worklog_selftest.py
+    python tools/selftests/worklog_selftest.py
 
 覆盖：apply（含新建文件）→ test 事件累加 → digest 渲染「好转/变差」→
       rollback 到第 1 轮（该轮新建的文件应被删除，改过的文件应回到 pristine）→
@@ -10,7 +10,11 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# tools/selftests/ 比 tools/ 深一层，所以要比原来多剥一次 dirname 才能拿到项目根目录；
+# 代码在 src/ 下面，两个路径都要在 sys.path 里
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "src"))
 import worklog  # noqa: E402
 
 

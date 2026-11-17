@@ -14,7 +14,8 @@
   3. patch 事件自带 before/after 的 blob 引用。旧实现靠「路径扁平化成 .bak 文件名」
      恢复，既会撞名，也表达不了「新建文件」；现在 before=null 就是新建，回滚即删除。
 
-日志格式（work_log.jsonl，一行一条，永不改成「覆盖写」）：
+日志格式（work_log.jsonl，一行一条）。正常路径只追加、永不覆盖写；唯一的例外是
+rollback()：它先把被撤销的事件抄进 human_audit.jsonl，再重写 work_log.jsonl（见下方 rollback）：
   {"t":"patch","ts":"2026-11-17T14:12:05","round":3,"status":"PATCH_GENERATED",
    "reasoning":"...","summary":"...",
    "files":[{"path":"/ws/src/Foo.java","before":"<sha1>"|null,"after":"<sha1>",
