@@ -217,6 +217,67 @@ def record_metric(status: str):
     START_TIME = None
     IS_TASK_INITIALIZED = False
 
+
+# ==========================================
+# 【run_test 结果回写】work_log 里只保留最新一次测试结果
+# 目的：上下文被压缩后，agent 调 get_work_log 就能看到上一次测试结果，
+#       不必再白跑一次 run_test
+# 约束：不新增任何记录行、不删除任何记录行，只往【最新一条工作记录】上挂 test_result 字段，
+#       因此 rollback 按 round 截断日志 / 按 changes 回滚文件的逻辑完全不受影响。
+# ==========================================
+TEST_RECORD_TAIL_CHARS = 2000   # 落盘只保留尾部，防止 work_log.jsonl 被超长堆栈撑爆
+
+
+def save_test_result(test_status: str, fail_count=None, detail: str = ""):
+    """把最近一次 run_test 的结果挂到 work_log.jsonl 里【最新的一条工作记录】上。
+
+    - 全文件只保留最新一次测试结果：先清掉所有历史 test_result 字段，再写本次的；
+    - 没有任何工作记录就什么都不存；
+    - 只改字段，不增删记录行；坏行原样保留，因此 rollback 的功能不受影响；
+    - 任何写盘异常只记日志，绝不打断 run_test 的返回。
+    """
+    if WORK_JSON_FILE is None or not os.path.exists(WORK_JSON_FILE):
+        return
+    try:
+        with open(WORK_JSON_FILE, "r", encoding="utf-8") as f:
+            lines = [ln for ln in f if ln.strip()]
+
+        # (原始文本, 解析后的 dict)；解析失败的行 raw 非 None，原样保留
+        records = []
+        for line in lines:
+            try:
+                records.append((None, json.loads(line)))
+            except json.JSONDecodeError:
+                records.append((line if line.endswith("\n") else line + "\n", None))
+
+        # 倒序找到最后一条可解析的工作记录作为挂载点
+        target_idx = None
+        for idx in range(len(records) - 1, -1, -1):
+            if records[idx][1] is not None:
+                target_idx = idx
+                break
+        if target_idx is None:
+            return  # 没有工作记录可以挂，那就不保存
+
+        for idx, (raw, data) in enumerate(records):
+            if data is None:
+                continue
+            data.pop("test_result", None)   # 历史结果一律丢弃，只留最新一次
+            if idx == target_idx:
+                data["test_result"] = {
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "test_status": test_status,   # Passed / Failed / CompileError / Timeout / EmptyLog / Error / Unknown
+                    "fail_count": fail_count,
+                    "detail": (detail or "")[-TEST_RECORD_TAIL_CHARS:]
+                }
+
+        with open(WORK_JSON_FILE, "w", encoding="utf-8") as f:
+            for raw, data in records:
+                f.write(raw if data is None else json.dumps(data, ensure_ascii=False) + "\n")
+    except Exception as err:
+        logging.error(f"写入 run_test 结果失败: {str(err)}")
+
+
 def wait_for_previous_process():
     """统一阻塞等待函数：如果有测试在跑，最多等TEST_TIMEOUT秒。"""
     global current_process
@@ -351,7 +412,7 @@ async def call_tool(name: str, arguments: dict):
     if name == "run_test":
         bug_id = arguments.get("bug_id", "Lang_1")
         force_checkout = arguments.get("force_checkout", False)
-        
+
         # 校验格式
         match = re.match(r"^([A-Za-z]+)_(\d+)([bf]?)$", bug_id)
         if not match:
@@ -366,7 +427,7 @@ async def call_tool(name: str, arguments: dict):
         need_checkout = force_checkout or (not IS_TASK_INITIALIZED) or (CURRENT_BUG != new_bug_id)
 
         if not need_checkout and not CODE_MODIFIED:
-            return [types.TextContent(type="text", text="【系统强制拒绝】代码没有被修改过，重复运行测试没有任何意义！请先调用 `patch_and_log` 提交你的修改猜想！", isError=True)]
+            return [types.TextContent(type="text", text="【系统强制拒绝】代码没有被修改过，重复运行测试没有任何意义！请先调用 `patch_and_log` 提交你的修改猜想！（上一次 run_test 的结果已经写在 work_log.jsonl 里，可直接调用 `get_work_log` 查看，无需再跑一次测试。）", isError=True)]
 
         workdir = build_workdir(project, version)
         d4j = shlex.quote(D4J_PATH)
@@ -414,6 +475,7 @@ async def call_tool(name: str, arguments: dict):
                 current_process.wait(timeout=TEST_TIMEOUT)
             except subprocess.TimeoutExpired:
                 current_process.kill()
+                save_test_result("Timeout", None, f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。")
                 record_metric("Timeout")
                 return [types.TextContent(type="text", text=f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。", isError=True)]
 
@@ -421,22 +483,27 @@ async def call_tool(name: str, arguments: dict):
             
             # 读取并解析日志
             if not os.path.exists(TEST_LOG_FILE):
+                save_test_result("Unknown", None, "测试完成，但日志文件不存在。")
                 return [types.TextContent(type="text", text="测试完成，但日志文件不存在。", isError=True)]
             
             with open(TEST_LOG_FILE, "r", encoding="utf-8", errors="replace") as log_f:
                 content = log_f.read()
 
             if not content.strip():
+                save_test_result("EmptyLog", None, "【日志为空】测试没有任何输出。")
                 return [types.TextContent(type="text", text="【日志为空】测试没有任何输出。")]
 
             exit_code = current_process.returncode
 
             if "Failing tests: 0" in content:
+                save_test_result("Passed", 0, "【测试全部通过】Failing tests: 0")
                 record_metric("Fixed")
                 return [types.TextContent(type="text", text=f"【测试全部通过】该 Bug 已成功修复！请结束任务并输出 [FIXED]。")]
 
             if exit_code not in (None, 0) and "Failing tests:" not in content:
-                return [types.TextContent(type="text", text=f"【编译失败】退出码 {exit_code}。请根据日志修复语法/类型错误：\n{content[-2500:]}")]
+                compile_msg = f"【编译失败】退出码 {exit_code}。请根据日志修复错误：\n{content[-2500:]}"
+                save_test_result("CompileError", None, compile_msg)
+                return [types.TextContent(type="text", text=compile_msg)]
 
             if "Failing tests:" in content:
                 match_log = re.search(r"Failing tests:\s*([1-9]\d*)([\s\S]*)", content, re.DOTALL)
@@ -447,12 +514,17 @@ async def call_tool(name: str, arguments: dict):
                         combined = "\n".join(lines[:15]) + "\n... [省略] ...\n" + failing_info[-2500:]
                     else:
                         combined = failing_info
-                    return [types.TextContent(type="text", text=f"【测试失败】共 {match_log.group(1)} 个用例失败。\n以下是报错信息：\n{combined}\n\n请分析并修复。")]
+                    fail_msg = f"【测试失败】共 {match_log.group(1)} 个用例失败。\n以下是报错信息：\n{combined}\n\n请分析并修复。"
+                    save_test_result("Failed", int(match_log.group(1)), fail_msg)
+                    return [types.TextContent(type="text", text=fail_msg)]
 
-            return [types.TextContent(type="text", text=f"最新日志如下（退出码 {exit_code}）:\n{content[-2000:]}")]
+            tail_msg = f"最新日志如下（退出码 {exit_code}）:\n{content[-2000:]}"
+            save_test_result("Unknown", None, tail_msg)
+            return [types.TextContent(type="text", text=tail_msg)]
 
         except Exception as e:
             logging.error(f"启动失败: {str(e)}")
+            save_test_result("Error", None, f"测试执行异常: {str(e)}")
             return [types.TextContent(type="text", text=f"测试执行异常: {str(e)}", isError=True)]
 
     elif name == "search_code":
@@ -649,7 +721,23 @@ async def call_tool(name: str, arguments: dict):
             "changes": changes
         }
 
-        with open(WORK_JSON_FILE, "a", encoding="utf-8") as f:
+        # 【只保留最新一次测试结果】写新一轮补丁记录前，先把历史记录里的 test_result 清掉：
+        history_lines = []
+        if os.path.exists(WORK_JSON_FILE):
+            with open(WORK_JSON_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        old_data = json.loads(line)
+                    except json.JSONDecodeError:
+                        history_lines.append(line if line.endswith("\n") else line + "\n")  # 坏行原样保留
+                        continue
+                    old_data.pop("test_result", None)
+                    history_lines.append(json.dumps(old_data, ensure_ascii=False) + "\n")
+
+        with open(WORK_JSON_FILE, "w", encoding="utf-8") as f:
+            f.writelines(history_lines)
             f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
 
         # 更新全局轮次变量，供指标记录使用
