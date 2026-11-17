@@ -9,6 +9,10 @@ from openai import AsyncOpenAI
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# 同目录模块：事后审计（运行时不做编辑限制，跑完再判定 clean / invalid）
+import audit
+from zerox import config as config_mod
+
 CONFIG_FILE = "config.json"
 
 # 无论从哪个目录启动，配置 / 提示词 / 服务端脚本都按本文件所在目录定位
@@ -48,7 +52,7 @@ COMPACT_TOOL_TAIL_CHARS = 6000
 
 # agent 段落默认值：与 zerox_server.py 的 DEFAULT_AGENT 保持一致
 DEFAULT_AGENT = {
-    "max_attempts": 10,                      # 服务端每个 bug 的 patch 次数上限
+    "max_tests": 12,                      # 服务端每个 bug 的 run_test 次数上限（客户端不使用，仅与 config 对齐）
     "max_turns": 100,                        # 客户端单个 bug 的最大对话轮数
     "system_prompt_file": "AGENTS.md",       # 相对本文件所在目录，也可以写绝对路径
     "user_prompt_template": "Please fix the bug for {bug_id}. Begin by calling run_test with bug_id='{bug_id}'.",
@@ -85,6 +89,9 @@ def load_config():
 CONFIG = load_config()
 LLM_CONF = CONFIG["llm_config"]
 AGENT_CONF = load_agent_config(CONFIG)
+# 审计用的字段（test_globs）从 target 段落读，与 MCP Server 同一套默认值
+TARGET_CONF = config_mod.load_target_config(CONFIG, CONFIG_FILE)
+AUDIT_TEST_GLOBS = TARGET_CONF.get("audit_test_globs")
 
 # 读取客户端超时
 CLIENT_TIMEOUT = CONFIG.get("timeouts", {}).get("llm_client", 360.0)
@@ -122,44 +129,6 @@ def usage_to_counts(usage):
     return prompt, completion, total
 
 
-def parse_work_log(text: str):
-    """从 get_work_log 的返回文本里解析出 (轮次, 补丁数, 服务端解析出的 bug 名)。"""
-    rounds = 0
-    patches = 0
-    resolved_bug = None
-
-    match = re.match(r"\s*当前 Bug（(.+?)）", text)
-    if match:
-        resolved_bug = match.group(1)
-
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, dict):
-            continue
-        patches += 1
-        try:
-            rounds = max(rounds, int(record.get("round") or 0))
-        except (TypeError, ValueError):
-            continue
-    return rounds, patches, resolved_bug
-
-
-async def fetch_work_log_stats(session, bug_id):
-    """向服务端要一次工作日志，用它的轮次/补丁数填充指标；失败就退化成 0。"""
-    try:
-        result = await session.call_tool("get_work_log", arguments={"limit": 500})
-        text = "".join([c.text for c in result.content if c.type == "text"])
-    except Exception as e:
-        print(f"  ⚠️ [{bug_id}] 读取工作日志失败，指标的轮次记为 0: {e}")
-        return 0, 0, None
-    return parse_work_log(text)
-
 
 def append_metric(metric: dict):
     """把一条指标追加到 logs/benchmark_metrics.jsonl；写盘失败不影响批量测试。"""
@@ -194,13 +163,16 @@ async def run_single_bug(bug_id: str, session: ClientSession):
 
     start_time = time.time()
     usage_totals = {"prompt": 0, "completion": 0, "total": 0, "calls": 0, "turns": 0}
+    # 服务端不再把自己的日志再吐一遍让客户端用正则解析：补丁数/轮次/测试次数
+    # 由客户端在循环里自己数（它就在现场），token 也只有它知道
+    counters = {"patches": 0, "tests": 0, "round": 0}
     # 终态只有四种：Fixed / Failed / Error / MaxTurns。
     # 跑到 max_turns 仍未收敛就是 MaxTurns，不再和超时、失败混用同一个字符串。
     final_status = "MaxTurns"
     # 【指标完整性】只在服务端真的报过「测试全部通过」后，才承认 agent 的 [FIXED]
     saw_passing_test = False
-    # 【去重】上一轮的 run_test 结果；打新补丁后作废，避免同一状态重复跑测试
-    last_test_result = None
+    # 本 bug 的第一次 run_test 显式声明全量 checkout（任务边界由客户端决定，见下方注入）
+    fresh_task = True
 
     for turn in range(MAX_TURNS):
 
@@ -297,31 +269,32 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                     continue # 直接进入下一轮对话，放弃执行本次工具
                 
                 try:
-                    # 【P0 去重】同一 patch 状态下重复调 run_test：直接复用上次结果，
-                    # 不再打服务端（否则会多跑一次全量 checkout + 全套测试，白烧几分钟和一堆 token）
-                    if fn_name == "run_test" and last_test_result is not None:
-                        print(f"  ⏭️ [{bug_id}] 重复的 run_test，复用上次结果，未产生新的测试执行。")
-                        result_text = last_test_result
-                    else:
-                        result = await session.call_tool(fn_name, arguments=fn_args)
-                        result_text = "".join([c.text for c in result.content if c.type == "text"])
+                    # 【单一策略源】服务端只负责执行与记账，不再做任何调用去重 / 免费重跑判定；
+                    # 客户端也不缓存结果——两边各持一套策略必然打架。
+                    # 新任务的第一跑由客户端显式传 force_checkout：服务端从不自己决定「重置工作区」，
+                    # 所以也不会在任务中途把已经打好的补丁冲掉。
+                    if fn_name == "run_test" and fresh_task:
+                        fn_args["force_checkout"] = True
 
-                        # 补丁真的落盘了才作废缓存；被 guard 拒绝的 patch 不改变工作区状态
-                        if fn_name == "patch_and_log" and "Patch applied successfully" in result_text:
-                            last_test_result = None
-                        elif fn_name == "rollback" and "回滚成功" in result_text:
-                            last_test_result = None
-                        elif fn_name == "run_test":
-                            last_test_result = result_text
-                            # 超时不作数：允许重跑，别把一次 flaky 超时锁死
-                            if "【测试超时】" in result_text:
-                                last_test_result = None
-                            # 服务端只在 passed_pattern 命中后才会回这句话，是唯一的正样本信号
-                            if PASSED_RESULT_MARKER in result_text:
-                                saw_passing_test = True
+                    result = await session.call_tool(fn_name, arguments=fn_args)
+                    if fn_name == "run_test":
+                        fresh_task = False
+                    result_text = "".join([c.text for c in result.content if c.type == "text"])
 
-                    if "【任务失败】" in result_text or "【系统强制熔断】" in result_text:
-                        print(f"  💀 [{bug_id}] Server 端触发最大尝试次数上限。")
+                    if fn_name == "patch_and_log":
+                        counters["patches"] += 1
+                        called_round = fn_args.get("round")
+                        if isinstance(called_round, int):
+                            counters["round"] = max(counters["round"], called_round)
+                    elif fn_name == "run_test":
+                        counters["tests"] += 1
+
+                    # 服务端只在 passed_pattern 命中后才会回这句话，是唯一的正样本信号
+                    if fn_name == "run_test" and PASSED_RESULT_MARKER in result_text:
+                        saw_passing_test = True
+
+                    if "【任务失败】" in result_text:
+                        print(f"  💀 [{bug_id}] Server 端测试预算用尽，任务结束。")
                         final_status = "Failed"
                         break
                 except Exception as e:
@@ -347,7 +320,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     elapsed = time.time() - start_time
     print(f"  ⏱️ [{bug_id}] 结束。状态: {final_status}, 耗时: {elapsed:.2f}s, "
           f"Tokens: {usage_totals['total']} (prompt {usage_totals['prompt']} / completion {usage_totals['completion']})")
-    return final_status, elapsed, usage_totals
+    return final_status, elapsed, usage_totals, counters
 
 async def main():
     server_params = StdioServerParameters(
@@ -368,12 +341,17 @@ async def main():
             
             for bug in BUGS_TO_TEST:
                 # 【修复 Bug 2】接收 3 个返回值
-                status, elapsed, usage = await run_single_bug(bug, session)
-                # 轮次/补丁数来自服务端 work_log（服务端唯一知道的状态），token 来自本轮统计
-                rounds, patches, resolved_bug = await fetch_work_log_stats(session, bug)
+                status, elapsed, usage, counters = await run_single_bug(bug, session)
+                # 轮次/补丁数/测试次数由客户端在循环里自己数（它就在现场），token 也只有它知道
+                rounds, patches = counters["round"], counters["patches"]
+                # 事后审计：只读本地 work_log，几毫秒，不碰工作区也不跑测试
+                try:
+                    verdict = audit.audit_bug(LOG_DIR, bug, test_globs=AUDIT_TEST_GLOBS)
+                except Exception as err:
+                    verdict = {"audit": "unknown", "violations": [str(err)]}
                 append_metric({
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "bug_id": resolved_bug or bug,
+                    "bug_id": bug,
                     "bug_id_requested": bug,
                     "status": status,
                     "total_time_seconds": round(elapsed, 2),
@@ -383,14 +361,18 @@ async def main():
                     "api_calls": usage["calls"],
                     "turns": usage["turns"],
                     "current_round": rounds,
-                    "total_attempts": patches
+                    "total_attempts": patches,
+                    "tests": counters["tests"],
+                    "audit": verdict.get("audit"),
+                    "audit_violations": [v["path"] for v in verdict.get("violations") or []],
                 })
                 results[bug] = {
                     "status": status, 
                     "time": round(elapsed, 2),
                     "tokens": usage["total"],
                     "turns": usage["turns"],
-                    "rounds": rounds
+                    "rounds": rounds,
+                    "audit": verdict.get("audit"),
                 }
                 await asyncio.sleep(2)
                 
@@ -399,19 +381,19 @@ async def main():
             print("\n" + "="*55)
             print("📊 批量测试最终报告")
             print("="*55)
-            print(f"{'Bug ID':<12} | {'Status':<10} | {'Time (s)':<10} | {'Tokens':<10} | {'Turns':<6} | {'Rounds':<6}")
-            print("-" * 72)
+            print(f"{'Bug ID':<12} | {'Status':<10} | {'Time (s)':<10} | {'Tokens':<10} | {'Turns':<6} | {'Rounds':<6} | {'Audit':<8}")
+            print("-" * 84)
             
             success_count = 0
             total_tokens = 0
             for bug, res in results.items():
                 icon = "✅" if res["status"] == "Fixed" else "❌"
-                print(f"{icon} {bug:<10} | {res['status']:<10} | {res['time']:<10} | {res['tokens']:<10} | {res['turns']:<6} | {res['rounds']:<6}")
+                print(f"{icon} {bug:<10} | {res['status']:<10} | {res['time']:<10} | {res['tokens']:<10} | {res['turns']:<6} | {res['rounds']:<6} | {res.get('audit') or '-':<8}")
                 if res["status"] == "Fixed":
                     success_count += 1
                 total_tokens += res["tokens"]
             
-            print("-" * 72)
+            print("-" * 84)
             total_bugs = len(BUGS_TO_TEST)
             if total_bugs > 0:
                 print(f"总修复率: {success_count}/{total_bugs} ({(success_count/total_bugs)*100:.1f}%)")
@@ -420,6 +402,7 @@ async def main():
             print("="*55)
             
             print("\n💡 提示: 每个 Bug 的 token / 轮次 / 耗时详情已写入 logs/benchmark_metrics.jsonl")
+            print("💡 事后审计: python audit.py（只读 work_log）/ python audit.py --verify（还原测试文件后复跑）")
 
 if __name__ == "__main__":
     asyncio.run(main())

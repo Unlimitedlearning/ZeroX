@@ -12,15 +12,13 @@
     "default_version_suffix": "b",
     "passed_pattern": "Failing tests:\\s*0",
     "failed_pattern": "Failing tests:\\s*(?P<count>[1-9]\\d*)(?P<detail>[\\s\\S]*)",
-    "patch_allow_globs": ["*/src/main/java/*", "*/src/java/*", "*/source/*"],
-    "patch_deny_globs": ["*/src/test/*", "*/tests/*", "*/test/*"],
+    "patch_allow_globs": [],
+    "patch_deny_globs": [],
     "patch_must_be_under_workspace": true,
-    "test_guard_enabled": true,
-    "test_guard_globs": ["*/src/test/*", "*/tests/*", "*/test/*"],
-    "test_guard_autorestore": true
+    "audit_test_globs": ["*/src/test/*", "*/tests/*", "*/test/*"]
   },
   "agent": {
-    "max_attempts": 10,
+    "max_tests": 12,
     "max_turns": 100,
     "system_prompt_file": "AGENTS.md",
     "user_prompt_template": "Please fix the Defects4J bug {bug_id}. Begin by calling run_test with bug_id='{bug_id}'.",

@@ -9,8 +9,8 @@ By combining a minimalist toolchain, stateful external logging, and search-augme
 
 ## 💡 Core Innovations (The "Agentless" Philosophy)
 
-1. **Minimalist Toolchain & Stateful Logging**: By discarding massive native tool libraries, ZeroX keeps only 6 core MCP tools. The agent's reasoning process is forced into an external `work_log.json`, achieving extreme context compression. This stateful log also allows the LLM to seamlessly resume tasks. Moreover, every `run_test` call writes its outcome as a `test_result` field onto the latest work entry in `work_log.jsonl` (only the newest test result is kept, and `patch_and_log` clears it whenever a new round starts), so after a context compaction the agent can recover the most recent test result from `get_work_log` instead of wasting a turn on a meaningless test run.
-2. **Atomic Patch Operations & Blocking Verification**: Through `patch_and_log`, the LLM is strictly forced to output `old/new` diffs rather than full code, guaranteeing atomicity with automatic backups. The `run_test` tool acts as a blocking function that automatically waits for execution to finish and returns parsed logs, eliminating useless polling.
+1. **Minimalist Toolchain & Stateful Logging**: By discarding massive native tool libraries, ZeroX keeps only 6 core MCP tools. The agent's reasoning process is forced into an external `work_log.jsonl`, achieving extreme context compression, and this stateful log lets the LLM seamlessly resume a task. The log is an **append-only event stream** (`patch` / `test` / `note`) owned by a standalone `worklog.py`: test outcomes are never overwritten, so `get_work_log` can hand back a compact digest — what each round changed and whether the failure count is converging (`上轮 5 个 → 2 个`) — instead of replaying full `old/new` diffs. After a context compaction the agent recovers its diagnosis from that digest instead of wasting a turn on a meaningless test run.
+2. **Atomic Patch Operations & Blocking Verification**: Through `patch_and_log`, the LLM is strictly forced to output `old/new` diffs rather than full code. Every write goes through `worklog.py`, which stores the before/after content as content-addressed blobs and applies a round atomically — if any file fails, all of them are restored. The `run_test` tool acts as a blocking function that automatically waits for execution to finish and returns parsed logs, eliminating useless polling.
 3. **Emergent Self-Healing under Minimalist Tools**: Facing missing static metadata, the agent spontaneously exhibits advanced debugging behavior: autonomously injecting diagnostic probes into test/production code, writing runtime variables to temporary files, and cleaning them up. This proves that under a non-polluted context, a lightweight LLM possesses powerful emergent abilities. (Solidified into SOP in `AGENTS.md`).
 4. **Nudge Theory & Asymmetric Memory Architecture**: Rollback means a clean slate for the AI (Preventing Context Poisoning), while all discarded patches and failed trajectories are strictly preserved in `human_audit.jsonl` for human researchers. This provides an untainted exploration space for the LLM while offering invaluable data for Error Analysis.
 
@@ -39,7 +39,9 @@ Tested on the first 4 bugs from the `Lang` project. **Total API cost: < $0.20** 
 | `total_time_seconds` | Wall-clock time for the whole bug |
 | `prompt_tokens` / `completion_tokens` / `total_tokens` | Token usage summed over every LLM call of that bug |
 | `api_calls` / `turns` | Number of LLM requests / conversation turns consumed |
-| `current_round` / `total_attempts` | Highest `patch_and_log` round and number of applied patches, read from that bug's `work_log.jsonl` |
+| `tests` / `total_attempts` / `current_round` | Test executions (the budget unit), patches applied, highest round reached |
+| `audit` / `audit_violations` | Post-hoc verdict from `audit.py`: `clean` or `invalid`, plus the paths that make it invalid |
+| `current_round` / `total_attempts` / `tests` | Highest round, applied patches and test executions, counted by the client inside its own tool loop |
 
 ## 📦 Benchmark Suite (BENCH30)
 
@@ -79,26 +81,28 @@ Closure, JacksonDatabind, Mockito and Gson. Single-bug test time (Closure runs 5
 ### What to report
 
 1. `logs/benchmark_metrics.jsonl` — one line per finished bug (`status`, tokens, rounds, wall time).
-2. **plausible vs correct** — "all tests pass" is a plausible patch, not a correct one. Cross-check against the developer patch (`revision.id.fixed` in `defects4j/framework/projects/<Project>/active-bugs.csv`).
+2. **plausible vs correct** — "all tests pass" is a plausible patch, not a correct one. Cross-check against the developer patch (`revision.id.fixed` in `defects4j/framework/projects/<Project>/active-bugs.csv`), and run `python audit.py --verify` to replay every finished bug with its test files restored: that re-run is what `Verified Fixed` means.
 3. **variance** — LLMs are non-deterministic; repeat each bug ≥3 times and report mean ± std.
 4. **per-tier and per-project rates** — one aggregate number hides everything interesting.
 
-`logs/benchmark_metrics.jsonl` and `logs/<bug>/human_audit.jsonl` are the only files under `logs/` that git tracks, so published numbers stay auditable without committing every scratch log. If tier C suddenly scores far above the literature, read the `[guard]` lines in `logs/mcp_server.log` before celebrating.
+`logs/benchmark_metrics.jsonl`, `logs/audit.jsonl` and `logs/<bug>/human_audit.jsonl` are the only files under `logs/` that git tracks, so published numbers stay auditable without committing every scratch log. If tier C suddenly scores far above the literature, run `python audit.py` and read the `invalid` rows before celebrating.
 
 ## 📁 Directory Structure
 
 ```text
 ZeroX/
-├── .gitignore              # Ignore venv, __pycache__, logs, backups, and real config
+├── .gitignore              # Ignore venv, __pycache__, logs and real config
 ├── README.md               # Project documentation
-├── AGENTS.md               # System prompts & Red Lines for the Agent (Core Asset)
+├── AGENTS.md               # System prompt: tools, budget, workflow (Core Asset)
 ├── config.example.json     # Template for configuration
 ├── zerox_server.py         # MCP Server source code
+├── worklog.py              # Standalone version-control module (blobs + append-only events + rollback)
+├── audit.py                # Post-hoc audit: Fixed vs Verified Fixed, no runtime edit restrictions
 ├── run_benchmark.py        # Automated batch testing script
 ├── case/                   # Single-file practice case (List_999.java + pristine copy)
 ├── config.list999.json     # Alternate config for the bundled Java case
-├── logs/                   # Runtime logs, work logs, and benchmark metrics (written by run_benchmark.py)
-└── backups/                # Automatic code backups per bug
+├── tools/                  # Offline selftests (worklog, audit) + new_run.py (archive last batch)
+├── logs/                   # Runtime logs, work logs, blob store, and benchmark metrics
 ```
 
 ## 🚀 Quick Start
@@ -130,6 +134,8 @@ To benchmark the bundled single-file case instead of Defects4J, point the script
 ```bash
 python run_benchmark.py --config config.list999.json
 ```
+
+Before each new batch, archive the previous batch instead of letting the numbers mix — `python tools/new_run.py` moves everything under `logs/` into `logs/archive/<timestamp>/` (keeping a `manifest.json`), clears `__pycache__`, and prints the bug list it is about to run. The archived batch stays auditable: `python audit.py --logs logs/archive/<timestamp>`.
 
 **5. Bundled Single-File Case (`case/List_999.java`)**
 A self-testing Java program that exercises the same toolchain without Defects4J:
@@ -163,16 +169,14 @@ Everything environment-specific lives in `config.json`; the code only reads it. 
 | `require_workspace` | Whether the incremental run checks that `{workspace}` exists first |
 | `source_glob` | Default file pattern used by `search_code` |
 | `bug_id_pattern` | Regex used to parse `bug_id`; **every named group becomes a placeholder** |
-| `bug_id_template` | Canonical bug name (used for logs, backups and `work_log.jsonl`) |
+| `bug_id_template` | Canonical bug name (used for logs and `work_log.jsonl`) |
 | `default_version_suffix` | Appended to `{number}` when the pattern has no `suffix` group |
 | `passed_pattern` | Regex hit ⇒ all tests pass ⇒ bug fixed |
 | `failed_pattern` | Regex hit ⇒ tests fail; optional named groups `count` (int) and `detail` (stack trace) |
-| `patch_allow_globs` | Patch whitelist (`fnmatch`). A path must match one entry to be patchable; empty list = no restriction. Default `["*/src/main/java/*", "*/src/java/*", "*/source/*"]` |
-| `patch_deny_globs` | Patch blacklist. Hit ⇒ rejected, takes priority over the whitelist. Default blocks `src/test/`, `tests/`, `test/` |
-| `patch_must_be_under_workspace` | Reject any patch whose path is outside `{workspace}` (default `true`) |
-| `test_guard_enabled` | Turn the test-file hash guard on/off (default `true`) |
-| `test_guard_globs` | Files protected by the hash guard. Hashed right after `setup_cmd`, re-checked before every test run |
-| `test_guard_autorestore` | On mismatch, auto-restore with `git checkout --` / `rm -f` before refusing the run (default `true`) |
+| `patch_allow_globs` | Optional whitelist (`fnmatch`). **Empty by default** = any path inside the workspace is patchable |
+| `patch_deny_globs` | Optional blacklist. Hit ⇒ rejected, takes priority over the whitelist. Empty by default |
+| `patch_must_be_under_workspace` | Reject any patch whose path is outside `{workspace}` (default `true`). Relative paths are resolved against `{workspace}` before the check |
+| `audit_test_globs` | Which paths count as test code — **read only by `audit.py`, after the run** |
 
 Available placeholders: `{tool}`, `{workspace_root}`, `{workspace}`, `{bug_id}`, plus every named group of `bug_id_pattern` (e.g. `{project}`, `{number}`, `{version}`, `{suffix}`). Workspace paths are shell-quoted automatically in `setup_cmd` / `test_cmd`.
 
@@ -205,31 +209,35 @@ Available placeholders: `{tool}`, `{workspace_root}`, `{workspace}`, `{bug_id}`,
 "failed_pattern": "FAILED \\((?P<count>\\d+)"
 ```
 
-### Anti-cheat: patch whitelist + test-file hash guard
+### No runtime edit restrictions — audit after the fact
 
-Two layers that block the "edit the tests until they pass" shortcut:
+ZeroX deliberately does **not** police which files the agent edits while it works. The single runtime rule is "stay inside `{workspace}`": `patch_and_log` rejects `..` traversal and paths outside the workspace, and resolves relative paths against it first (`src/main/java/...` works).
 
-1. **Patch whitelist** (`patch_allow_globs` / `patch_deny_globs` / `patch_must_be_under_workspace`).
-   `patch_and_log` validates every `file_path` before touching the disk. A path that hits the deny list, misses the allow list, contains `..` traversal, or escapes `{workspace}` rejects the whole batch — not a byte is written — and the reason is handed back to the agent.
-2. **Test-file hash guard** (`test_guard_*`).
-   On first entry to a bug, `run_test` executes `setup_cmd` (checkout) on its own, then takes an `md5` baseline of every file matching `test_guard_globs`. Before each test run it rescans and compares. Any difference (modified, deleted, added) blocks the run, so no `Passed` can ever come from a tampered suite; the guard then restores with `git checkout --` / `rm -f` and the agent has to re-run on the clean tree.
+Earlier versions had two guards — a `src/main/java` whitelist plus an `md5` baseline of the test tree re-checked before every run. Both were removed on purpose:
 
-That is why `setup_cmd` and `test_cmd` are executed as two separate steps. Rejections are logged with a `[guard]` prefix in `logs/mcp_server.log`, and a blocked run is recorded as `TestTampered` in `work_log.jsonl`.
+- the whitelist rejected legitimate patches. Models routinely pass `src/main/java/...` instead of an absolute path, and every rejection pushed the agent into firing a random patch to regain permission — at 3-6 minutes a test;
+- the baseline needed four extra config fields (`test_guard_suffixes`, `test_guard_ignore_dirs`, ...) just to avoid flagging Defects4J build output.
 
-Two follow-ups keep the guard from being either circumvented or farmed:
+The judgement moved to `audit.py`, which reads the finished `work_log.jsonl` and reports two separate labels:
 
-- **Fuse** — three violations in one bug abort the task immediately (`【系统强制熔断】`), so an agent cannot burn all 100 turns probing the boundary.
-- **Fail-fast on an empty baseline** — if `test_guard_globs` matches zero files the guard would be a no-op, so `run_test` refuses to run instead of silently producing unauditable passes. Either fix the globs or set `test_guard_enabled: false` deliberately.
+| Label | Meaning |
+| :--- | :--- |
+| `audit: clean` / `invalid` | `invalid` = at least one round patched a file matching `target.audit_test_globs` |
+| `verified: true` / `false` | `python audit.py --verify` restores those test files (`git checkout --`, or `rm -f` for files the agent created), re-runs `test_cmd`, and checks `passed_pattern` again — passing with the suite restored means the fix does not lean on the edited tests |
 
-`run_test` is also state-deduplicated on both sides: the server rejects a repeat *before* checkout (otherwise `reset_task_state` would re-checkout and wipe a fixed workspace), and the client reuses the previous result. One patch therefore means exactly one test execution; a timeout is the only case that may legitimately be retried.
+Because the verdict is derived from the append-only log, it can be replayed over historical runs months later, without touching the workspace or spending a single test. Publish both numbers: **Fixed** and **Verified Fixed**.
 
-> **Known blind spot:** the single-file case (`config.list999.json`) keeps the code under test and the harness in the same file, so neither check can tell them apart — there the guard is explicitly disabled and the prompt is the only constraint.
+**No call arbitration, no free-rerun accounting.** Both used to live in the server and both were removed deliberately: they policed the cheapest actions (a few seconds of reading, one test) while pushing the agent into random patches just to regain permission to read — and a random patch costs a whole 3-6 minute test. What is left is a single hard budget, **test executions per bug** (`agent.max_tests`, default 12), plus one line of `[预算]` bookkeeping appended to every `run_test` / `patch_and_log` reply. Patches are unlimited and free; reading is unlimited and free.
+
+**`run_test` never resets the workspace on its own.** A checkout happens only when the caller explicitly passes `force_checkout: true` (the benchmark client does this on the first call of each bug) or when the bug id changes with no patches pending. Switching bugs while patches are pending is refused rather than silently wiping them — the old rule (`reset_task_state` flipping `IS_TASK_INITIALIZED` triggered a re-checkout) was what made the agent look *stuck at `run_test`*: every retry re-ran on freshly checked-out, still-buggy code.
+
+> **Known blind spot:** the single-file case (`config.list999.json`) keeps the code under test and the harness in the same file, so `audit_test_globs` cannot tell them apart — it is set to `[]` there, every patch audits as `clean`, and the prompt is the only constraint.
 
 ### `agent` — behaviour and prompts
 
 | Key | Meaning |
 | :--- | :--- |
-| `max_attempts` | Max `patch_and_log` calls per bug (server side) |
+| `max_tests` | Max `run_test` executions per bug (server side); the only hard budget |
 | `max_turns` | Max LLM turns per bug (client side) |
 | `system_prompt_file` | Prompt file, relative to the project root (absolute also works) |
 | `user_prompt_template` | First user message; `{bug_id}` is substituted |

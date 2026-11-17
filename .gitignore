@@ -12,10 +12,12 @@ dist/
 # ZeroX specific
 # logs/ is scratch space, except the audit trail we publish:
 #   logs/benchmark_metrics.jsonl  one line per finished bug
+#   logs/audit.jsonl              post-hoc verdict (clean / invalid, Verified Fixed)
 #   logs/<bug>/human_audit.jsonl  discarded patches + rollback history
 logs/**
 !logs/**/
 !logs/benchmark_metrics.jsonl
+!logs/audit.jsonl
 !logs/*/human_audit.jsonl
 backups/
 config.json
