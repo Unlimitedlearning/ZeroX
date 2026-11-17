@@ -34,7 +34,8 @@ CURRENT_BUG = None
 CURRENT_WORKDIR = None
 
 # 新增：状态锁与计时器变量
-IS_TASK_INITIALIZED = False
+# 锁与计时器合并成一个：START_TIME 非 None ⇔ 工作区已检出、且当前任务正在计时。
+# （原来是 IS_TASK_INITIALIZED + START_TIME 两个变量描述同一件事，setup 失败时只改一个就会不同步）
 START_TIME = None
 CURRENT_ROUND = 0
 # 累计补丁数：只用于指标与预算读数，不再作为任务终止条件
@@ -232,14 +233,13 @@ def reset_task_state(status: str):
     基准指标（含 token 用量、轮次、耗时）由 src/zerox.py 汇总后写入
     logs/benchmark_metrics.jsonl；服务端只留一条耗时日志，方便对照 mcp_server.log 排查。
     """
-    global START_TIME, IS_TASK_INITIALIZED
+    global START_TIME
     if START_TIME is not None:
         logging.info(f"⏱ 任务结束（{status}）：{CURRENT_BUG} 耗时 {round(time.time() - START_TIME, 2)}s，"
                      f"第 {CURRENT_ROUND} 轮，累计 {TOTAL_ATTEMPTS} 次修改")
     
-    # 复位计时器和锁状态，准备好下一个 Bug
+    # 复位计时器和锁状态，准备好下一个 Bug（锁就是 START_TIME：置空即「未就绪」）
     START_TIME = None
-    IS_TASK_INITIALIZED = False
 
 
 # ==========================================
@@ -329,7 +329,7 @@ async def list_tools():
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
     global current_log_handle, current_process, WORK_JSON_FILE, TEST_LOG_FILE, CURRENT_BUG
-    global IS_TASK_INITIALIZED, START_TIME, CURRENT_ROUND, TOTAL_ATTEMPTS, TOTAL_TESTS
+    global START_TIME, CURRENT_ROUND, TOTAL_ATTEMPTS, TOTAL_TESTS
     global READ_CODE_COUNT, CURRENT_WORKDIR
 
     # 🚨 绝杀：每次调用任何工具前，强制等待上一次的测试进程跑完（防并发冲突）
@@ -379,7 +379,7 @@ async def call_tool(name: str, arguments: dict):
                         f"要继续 {new_bug_id}，请显式传 force_checkout=true；要留在 {CURRENT_BUG}，请传正确的 bug_id。"
                     ), isError=True)]
                 need_checkout = True
-            elif not IS_TASK_INITIALIZED and TOTAL_ATTEMPTS == 0:
+            elif START_TIME is None and TOTAL_ATTEMPTS == 0:
                 # 例如服务重启 / 上一轮被中断：工作区状态不可信，但还没有任何补丁，重新准备是安全的
                 need_checkout = True
 
@@ -403,8 +403,7 @@ async def call_tool(name: str, arguments: dict):
                 except OSError as err:
                     logging.error(f"清空 work_log 失败: {str(err)}")
             
-            # 重置锁和计时器
-            IS_TASK_INITIALIZED = True
+            # 重置锁和计时器（锁已并入 START_TIME：非 None = 工作区已检出且有计时在跑）
             START_TIME = time.time()
             CURRENT_ROUND = 0
             TOTAL_ATTEMPTS = 0
@@ -424,14 +423,14 @@ async def call_tool(name: str, arguments: dict):
                     msg = f"【环境准备超时】setup_cmd 超过 {TEST_TIMEOUT}s 未结束，已放弃本轮。"
                     save_test_result("SetupFailed", None, msg)
                     # 工作区可能是半成品：标回未初始化，下次 run_test 重新 checkout
-                    IS_TASK_INITIALIZED = False
+                    START_TIME = None
                     return [types.TextContent(type="text", text=msg, isError=True)]
                 if setup_res.returncode != 0:
                     setup_out = ((setup_res.stdout or "") + (setup_res.stderr or "")).strip()
                     msg = f"【环境准备失败】setup_cmd 退出码 {setup_res.returncode}：\n{setup_out[-2000:]}"
                     save_test_result("SetupFailed", None, msg)
                     # 同上：别拿一个损坏的工作区继续跑增量测试
-                    IS_TASK_INITIALIZED = False
+                    START_TIME = None
                     return [types.TextContent(type="text", text=msg, isError=True)]
 
             full_cmd = test_cmd
@@ -467,7 +466,8 @@ async def call_tool(name: str, arguments: dict):
                 save_test_result("Timeout", None, f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。")
                 reset_task_state("Timeout")
                 # 超时不能把补丁一起丢掉：保持「已检出 + 已修改」，下一次 run_test 走增量而不是重新 checkout
-                IS_TASK_INITIALIZED = True
+                # （START_TIME 兼做就绪标志：重新起算即可，等价于旧代码里把标志置回 True）
+                START_TIME = time.time()
                 return [types.TextContent(type="text", text=f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。" + budget_line(), isError=True)]
 
             logging.info("测试进程结束，正在解析日志...")

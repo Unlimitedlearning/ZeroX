@@ -30,9 +30,6 @@ from datetime import datetime
 # 与 src/zerox.py 的 metrics 行对齐：审计版本变了，旧结论就不要混着用
 AUDIT_VERSION = 1
 
-# 没有配置时的兜底：Defects4J / Maven / Gradle 的常见测试目录
-DEFAULT_TEST_GLOBS = ["*/src/test/*", "*/tests/*", "*/test/*"]
-
 AUDIT_LOG_NAME = "audit.jsonl"
 
 
@@ -79,10 +76,10 @@ def audit_events(events, test_globs=None):
       * test 事件的数量与最后一条的状态（用于报告复现成本）
     不给 events 也能跑（返回 clean + 0 补丁），方便历史 run 缺日志时对账。
     空列表（config 里写 `"audit_test_globs": []`）表示「本项目分不出测试代码」，
-    那就什么都不断定；只有完全没配（None）时才用 Defects4J 风格的兜底值。
+    那就什么都不断定。默认值只有一份，在 zerox_core/config.py 的 DEFAULT_TARGET 里 ——
+    这里不再留第二份兜底副本：两份默认值迟早会不一致，而审计标准不一致比没有标准更糟。
     """
-    source = DEFAULT_TEST_GLOBS if test_globs is None else test_globs
-    globs = [str(g).strip() for g in source if str(g).strip()]
+    globs = [str(g).strip() for g in (test_globs or []) if str(g).strip()]
 
     patches = []
     test_events = []
@@ -329,6 +326,11 @@ def main(argv=None):
         target = config_mod.load_target_config(config, config_file)
 
     test_globs = (target or {}).get("audit_test_globs")
+    if test_globs is None:
+        # 配置文件缺失 / 没写这一项：审计就分不出测试代码，只能数补丁和测试次数。
+        # 这种情况必须说出来 —— 否则一份「全 clean」的报告会被当成「全部没动测试」。
+        print(f"⚠️ 未读到 audit_test_globs（配置文件：{config_file}），本次审计不判定测试文件改动。")
+        test_globs = []
     test_timeout = ((config or {}).get("timeouts") or {}).get("test_execution") or 1800
 
     if args.bug:
@@ -346,7 +348,7 @@ def main(argv=None):
         print(f"没有找到可审计的 work_log（目录：{logs_dir}）")
         return 1
 
-    print(f"审计 {len(bug_names)} 个 bug（test_globs={test_globs if test_globs is not None else DEFAULT_TEST_GLOBS}）")
+    print(f"审计 {len(bug_names)} 个 bug（test_globs={test_globs}）")
     rows = []
     for name in bug_names:
         verdict = audit_bug(logs_dir, name, test_globs=test_globs)

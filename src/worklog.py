@@ -85,43 +85,6 @@ def _round_reached(round_value, target):
         return False
 
 
-def _normalize(record):
-    """把一条日志记录统一成事件列表；兼容没有 t 字段的旧格式（一轮 = 一条记录）。"""
-    if not isinstance(record, dict):
-        return [{"t": "note", "ts": "", "text": str(record)}]
-
-    if record.get("t") in ("patch", "test", "note"):
-        return [record]
-
-    files = []
-    for change in record.get("changes") or []:
-        if isinstance(change, dict) and change.get("file_path"):
-            # 老格式没有 blob 引用：能渲染，但不能用来自动回滚（rollback 会跳过）
-            files.append({"path": change["file_path"], "before": None, "after": None,
-                          "added": 0, "removed": 0})
-
-    events = [{
-        "t": "patch",
-        "ts": record.get("timestamp", ""),
-        "round": record.get("round"),
-        "status": record.get("status"),
-        "reasoning": record.get("reasoning"),
-        "summary": record.get("fix_summary"),
-        "files": files,
-    }]
-    old_test = record.get("test_result")
-    if isinstance(old_test, dict):
-        events.append({
-            "t": "test",
-            "ts": old_test.get("timestamp", ""),
-            "round": record.get("round"),
-            "status": old_test.get("test_status"),
-            "fail_count": old_test.get("fail_count"),
-            "detail": old_test.get("detail", ""),
-        })
-    return events
-
-
 def _stamp(ts):
     """ISO 时间 → HH:MM:SS，digest 里只需要这个精度。"""
     return ts[11:19] if isinstance(ts, str) and len(ts) >= 19 else (ts or "")
@@ -232,8 +195,6 @@ class WorkLog:
                 path = item.get("path")
                 if not path:
                     continue
-                if item.get("after") is None:
-                    continue  # 老格式（没有 blob）：只能渲染，不能回滚
                 try:
                     if item.get("before"):
                         self.io.write(path, self._get(item["before"]))
@@ -266,7 +227,7 @@ class WorkLog:
     # ---------------- 读 ----------------
 
     def events(self):
-        """按写入顺序读出全部事件；坏行跳过，老格式自动升级。"""
+        """按写入顺序读出全部事件；坏行跳过。"""
         if not os.path.exists(self.log_path):
             return []
         result = []
@@ -276,10 +237,11 @@ class WorkLog:
                 if not line:
                     continue
                 try:
-                    record = json.loads(line)
+                    event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                result.extend(_normalize(record))
+                if isinstance(event, dict) and event.get("t"):
+                    result.append(event)
         return result
 
     def digest(self, limit=5, title=None, detail_chars=1200):
