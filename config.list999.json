@@ -1,0 +1,39 @@
+{
+  "target": {
+    "tool_path": "javac",
+    "workspace_root": "/mnt/d/GithubProgram/Test/ZeroX/case",
+    "workspace_template": "{workspace_root}",
+    "setup_cmd": "cp {workspace}/List_999.pristine.bak {workspace}/List_999.java",
+    "test_cmd": "cd {workspace} && rm -rf /tmp/zerox_list999 && mkdir -p /tmp/zerox_list999 && {tool} -d /tmp/zerox_list999 List_999.java && java -cp /tmp/zerox_list999 List_999",
+    "require_workspace": true,
+    "source_glob": "List_999.java",
+    "bug_id_pattern": "^(?P<bug_id>[A-Za-z0-9_]+)$",
+    "bug_id_template": "{bug_id}",
+    "passed_pattern": "All tests passed",
+    "failed_pattern": "(?P<detail>\\[FAIL\\][\\s\\S]*?)FAILED \\((?P<count>\\d+)\\)",
+    "patch_allow_globs": ["*/case/List_999.java"],
+    "patch_deny_globs": ["*/case/List_999.pristine.bak"],
+    "patch_must_be_under_workspace": true,
+    "test_guard_enabled": false,
+    "test_guard_globs": [],
+    "test_guard_autorestore": true
+  },
+  "agent": {
+    "max_attempts": 10,
+    "max_turns": 40,
+    "system_prompt_file": "AGENTS.md",
+    "user_prompt_template": "Please fix the bug in {bug_id}. Only the nested class SortedInts may be edited: never change main, the test helpers or the expected values. Begin by calling run_test with bug_id='{bug_id}'.",
+    "fixed_marker": "[FIXED]",
+    "failed_marker": "[FAILED]"
+  },
+  "timeouts": {
+    "test_execution": 180,
+    "llm_client": 300
+  },
+  "llm_config": {
+    "api_key": "${DEEPSEEK_API_KEY}",
+    "base_url": "https://api.deepseek.com/v1",
+    "model_name": "deepseek-flash"
+  },
+  "benchmark_bugs": ["List_999"]
+}

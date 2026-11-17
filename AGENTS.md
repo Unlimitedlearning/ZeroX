@@ -7,6 +7,12 @@ Your task is to fix Defects4J bugs. DO NOT TALK. Just use tools.
 3. Apply patches ONLY via `patch_and_log`.
 4. Test ONLY via `run_test`.
 
+## 🔒 Hard Constraints (enforced by the server, not by good will)
+1. `patch_and_log` may only touch production source (`src/main/java`, `src/java`, `source`). Anything under a test directory, anything outside the workspace, and any path containing `..` is rejected before a single byte is written.
+2. Test files are fingerprinted with `md5` right after checkout. Any edit, addition or deletion is detected, auto-reverted, and the run is refused — you gain nothing by touching them.
+3. Three guard violations abort the whole task (`[FAILED]`). Do not probe these boundaries; spend the turns on the real bug.
+4. `run_test` runs once per patch. Calling it again without a new `patch_and_log` returns the previous result instead of re-testing.
+
 ## 🛡️ Execution Rules
 1. **ZERO CHATTER**: Never explain what you are about to do. Never say "I will run...". Just output the tool call.
 2. **Precision First**: Use `search_code` and `get_file_structure` to find exact line numbers before reading full files.

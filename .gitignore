@@ -4,14 +4,30 @@ __pycache__/
 venv/
 .venv/
 env/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
 
 # ZeroX specific
-logs/
+# logs/ is scratch space, except the audit trail we publish:
+#   logs/benchmark_metrics.jsonl  one line per finished bug
+#   logs/<bug>/human_audit.jsonl  discarded patches + rollback history
+logs/**
+!logs/**/
+!logs/benchmark_metrics.jsonl
+!logs/*/human_audit.jsonl
 backups/
 config.json
 temp_code_*.txt
+*.log
+
+# Secrets
+.env
+.env.*
 
 # IDE / OS
 .idea/
 .vscode/
 .DS_Store
+Thumbs.db

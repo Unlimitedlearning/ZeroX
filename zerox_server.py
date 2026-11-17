@@ -6,6 +6,8 @@ import os
 import json
 import re
 import shlex
+import fnmatch
+import posixpath
 import time
 import datetime
 from logging.handlers import RotatingFileHandler
@@ -31,6 +33,15 @@ CURRENT_ROUND = 0
 TOTAL_ATTEMPTS = 0
 READ_CODE_COUNT = 0 
 CODE_MODIFIED = False
+# 【防作弊】测试文件哈希基线：{受保护文件路径: md5}；None = 还没建立
+TEST_GUARD_BASELINE = None
+# 基线为空（globs 没匹配到任何文件）：视为配置错误，直接拒绝跑测试
+TEST_GUARD_EMPTY = False
+# 防作弊违规累计次数，到上限直接熔断
+GUARD_VIOLATIONS = 0
+GUARD_VIOLATION_LIMIT = 3
+# 本次任务是否已经修复完成（用于拦住修复后的重复 run_test，避免二次 checkout 把补丁冲掉）
+TASK_FINISHED = False
 
 # ==========================================
 # [跨平台] 运行环境检测
@@ -41,7 +52,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 BACKUP_ROOT = os.path.join(BASE_DIR, "backups")
 LOG_FILE = os.path.join(LOG_DIR, "mcp_server.log")
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+# 配置文件：run_benchmark.py 会通过 ZEROX_CONFIG 传进来，保证客户端/服务端读同一份
+CONFIG_FILE = os.getenv("ZEROX_CONFIG") or os.path.join(BASE_DIR, "config.json")
 
 # 基准测试指标（logs/benchmark_metrics.jsonl）由 run_benchmark.py 负责写入：
 # token 用量只有调用 LLM 的客户端才知道，服务端这一侧只留耗时日志
@@ -88,6 +100,17 @@ DEFAULT_TARGET = {
     "passed_pattern": r"Failing tests:\s*0",
     # 判定「测试失败」的规则：count = 失败数，detail = 详细堆栈（两个命名分组都可以省略）
     "failed_pattern": r"Failing tests:\s*(?P<count>[1-9]\d*)(?P<detail>[\s\S]*)",
+    # ---- 防作弊 P0-1：patch 路径白名单（fnmatch 语法，空 = 不限制）----
+    "patch_allow_globs": ["*/src/main/java/*", "*/src/java/*", "*/source/*"],
+    # 测试代码/受保护文件：命中即拒绝，优先级高于白名单
+    "patch_deny_globs": ["*/src/test/*", "*/tests/*", "*/test/*"],
+    # patch 是否必须落在当前工作区内
+    "patch_must_be_under_workspace": True,
+    # ---- 防作弊 P0-2：测试文件哈希校验（checkout 后拍基线，跑测试前比对）----
+    "test_guard_enabled": True,
+    "test_guard_globs": ["*/src/test/*", "*/tests/*", "*/test/*"],
+    # 被改动时是否自动 git checkout / rm 还原（还原后本轮测试仍然被拒绝）
+    "test_guard_autorestore": True,
 }
 
 DEFAULT_AGENT = {
@@ -287,6 +310,193 @@ def current_backup_dir():
     未初始化时落到 backups/None，保证 patch 与 rollback 两侧算出来的目录完全一致。
     """
     return os.path.join(BACKUP_ROOT, str(CURRENT_BUG))
+
+
+# ==========================================
+# 【防作弊 P0-1】patch 路径白名单
+# ==========================================
+def _glob_list(value):
+    """把配置里的白名单/黑名单统一成 list[str]；空值 = 不限制。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
+def match_any_glob(path: str, globs) -> bool:
+    """fnmatch 逐个比对（支持 */src/test/* 这类中间段通配）。
+
+    必须用 fnmatchcase 而不能用 fnmatch：Windows 上 fnmatch 会先 normcase 转小写，
+    于是 D:\\...\\Test\\ 里的 “Test” 会命中 */test/*，把整个工作区误判成测试目录。
+    """
+    return any(fnmatch.fnmatchcase(path, g) for g in globs)
+
+
+def check_patch_path(wsl_path: str):
+    """判断这个路径能否被 patch，返回 (ok, 拒绝原因)。
+
+    三层判定，任一不通过就拒绝：
+      1. 命中 patch_deny_globs（测试代码）→ 拒绝
+      2. 有白名单但没命中 patch_allow_globs → 拒绝
+      3. patch_must_be_under_workspace 为真时，路径必须落在当前工作区内
+    """
+    path = str(wsl_path or "").replace("\\", "/")
+    if not path:
+        return False, "file_path 为空"
+    # 先杀掉路径穿越：/ws/src/main/java/../../test/X.java 能命中白名单，实际写到测试目录
+    if ".." in path.split("/"):
+        return False, f"{path} 含 '..'（路径穿越），已拒绝"
+    path = posixpath.normpath(path)
+
+    allow = _glob_list(TARGET.get("patch_allow_globs"))
+    deny = _glob_list(TARGET.get("patch_deny_globs"))
+
+    if deny and match_any_glob(path, deny):
+        return False, f"{path} 命中 patch_deny_globs（测试代码/受保护文件禁止修改）"
+    if allow and not match_any_glob(path, allow):
+        return False, f"{path} 不在 patch_allow_globs 白名单内（允许：{', '.join(allow)}）"
+
+    workdir = (CURRENT_WORKDIR or "").rstrip("/")
+    if workdir and TARGET.get("patch_must_be_under_workspace", True):
+        if not (path == workdir or path.startswith(workdir + "/")):
+            return False, f"{path} 不在当前工作区 {workdir} 内"
+    return True, ""
+
+
+# ==========================================
+# 【防作弊 P0-2】测试文件哈希校验
+# ==========================================
+def _guard_globs():
+    """当前生效的受保护文件通配符；返回空列表表示本 Bug 不校验。"""
+    if not TARGET.get("test_guard_enabled", True):
+        return []
+    return _glob_list(TARGET.get("test_guard_globs"))
+
+
+def guard_scan(workspace: str):
+    """扫出受保护文件的 {路径: md5}；未启用或工作区不可读时返回 None。"""
+    globs = _guard_globs()
+    if not globs or not workspace:
+        return None
+
+    preds = " -o ".join(f"-path {shlex.quote(g)}" for g in globs)
+    cmd = (
+        f"test -d {shlex.quote(workspace)} || exit 3; "
+        f"find {shlex.quote(workspace)} -type f \\( {preds} \\) -print0 2>/dev/null "
+        f"| sort -z | xargs -0 -r md5sum"
+    )
+    res = execute_in_target(cmd)
+    if res.returncode != 0:
+        return None
+
+    table = {}
+    for line in (res.stdout or "").splitlines():
+        digest, sep, path = line.partition("  ")
+        if sep and digest.strip() and path.strip():
+            table[path.strip()] = digest.strip()
+    return table
+
+
+def init_test_guard(workspace: str):
+    """checkout 之后立刻给测试文件拍基线（此后的任何改动都算作弊）。"""
+    global TEST_GUARD_BASELINE, TEST_GUARD_EMPTY
+    table = guard_scan(workspace)
+    if table is None:
+        TEST_GUARD_BASELINE = None
+        TEST_GUARD_EMPTY = False
+        logging.info("[guard] 测试文件哈希校验未启用（test_guard_globs 为空或工作区不可读）")
+        return
+
+    TEST_GUARD_BASELINE = table
+    TEST_GUARD_EMPTY = not table
+    logging.info(f"[guard] {CURRENT_BUG} 测试文件基线已建立：{len(table)} 个文件")
+    if not table:
+        logging.error("[guard] 基线为空：项目布局与 test_guard_globs 不匹配，本 Bug 将拒绝运行测试（fail-fast）")
+
+
+def verify_test_guard():
+    """跑测试前比对测试文件哈希，返回 (ok, 说明)；不通过时按需自动还原。"""
+    if not _guard_globs():
+        return True, ""
+    if TEST_GUARD_EMPTY:
+        # fail-fast：基线为空等于 guard 全程空转，宁可不跑，也别产出无法审计的 Passed
+        return False, (
+            "【配置错误】test_guard_globs 没有匹配到任何文件，测试文件哈希校验无法生效，已拒绝运行测试。\n"
+            "请修正 config.json 的 target.test_guard_globs，或显式设置 test_guard_enabled=false。"
+        )
+    if TEST_GUARD_BASELINE is None:
+        # 服务重启 / 断点续跑会丢基线，这里补拍一张，避免误报
+        init_test_guard(CURRENT_WORKDIR)
+        if TEST_GUARD_BASELINE is None:
+            return True, ""
+
+    current = guard_scan(CURRENT_WORKDIR)
+    if current is None:
+        return True, ""
+
+    changed = [p for p in TEST_GUARD_BASELINE if current.get(p) != TEST_GUARD_BASELINE[p]]
+    added = [p for p in current if p not in TEST_GUARD_BASELINE]
+    if not changed and not added:
+        return True, ""
+
+    detail = "\n".join(
+        [f"  - 修改/删除：{p}" for p in sorted(changed)]
+        + [f"  - 新增：{p}" for p in sorted(added)[:20]]
+    )
+    logging.warning(f"[guard] {CURRENT_BUG} 测试文件被改动：改/删 {len(changed)} 个，新增 {len(added)} 个")
+
+    if not TARGET.get("test_guard_autorestore", True):
+        return False, (
+            "【防作弊拦截】测试文件哈希与基线不一致，已拒绝运行测试：\n"
+            f"{detail}\n修复只能通过修改被测源码完成。"
+        )
+
+    steps = []
+    if changed:
+        steps.append("git checkout -- " + " ".join(shlex.quote(p) for p in changed))
+    if added:
+        steps.append("rm -f " + " ".join(shlex.quote(p) for p in added))
+    restore_cmd = f"cd {shlex.quote(CURRENT_WORKDIR or '')} && " + " && ".join(steps)
+    try:
+        restore_res = execute_in_target(restore_cmd)
+    except Exception as err:
+        return False, (
+            "【防作弊拦截】测试文件哈希与基线不一致，自动还原时异常，已拒绝运行测试：\n"
+            f"{detail}\n异常：{err}"
+        )
+
+    if guard_scan(CURRENT_WORKDIR) == TEST_GUARD_BASELINE:
+        logging.warning("[guard] 测试文件已被自动还原")
+        return False, (
+            "【防作弊拦截】检测到测试代码被修改，系统已自动还原到基线，本轮测试被拒绝运行。\n"
+            f"{detail}\n"
+            "请重新调用 run_test（还原后的代码需要重新验证），之后只改被测源码。"
+        )
+
+    return False, (
+        "【防作弊拦截】测试文件哈希与基线不一致，且自动还原失败（git 退出码 "
+        f"{restore_res.returncode}），已拒绝运行测试：\n{detail}\n"
+        f"还原输出：{((restore_res.stdout or '') + (restore_res.stderr or ''))[-800:]}"
+    )
+
+
+def guard_strike(reason_text: str):
+    """防作弊违规计数：同一 Bug 累计到上限就熔断，别让 agent 把 100 轮全花在试探边界上。"""
+    global GUARD_VIOLATIONS
+    GUARD_VIOLATIONS += 1
+    logging.warning(f"[guard] {CURRENT_BUG} 违规第 {GUARD_VIOLATIONS} 次（上限 {GUARD_VIOLATION_LIMIT}）")
+
+    if GUARD_VIOLATIONS >= GUARD_VIOLATION_LIMIT:
+        fused_text = (
+            reason_text
+            + f"\n\n【系统强制熔断】已累计 {GUARD_VIOLATIONS} 次防作弊违规，本 Bug 记为失败。请立刻停止修复并输出 [FAILED]。"
+        )
+        logging.error(f"[guard] {CURRENT_BUG} 熔断：累计 {GUARD_VIOLATIONS} 次违规")
+        reset_task_state("Failed")
+        return True, fused_text
+
+    return False, reason_text + f"\n（防作弊违规 {GUARD_VIOLATIONS}/{GUARD_VIOLATION_LIMIT} 次，达上限将直接熔断本任务。）"
 
 
 def write_target_file(target_path: str, content: str):
@@ -553,7 +763,7 @@ async def list_tools():
 async def call_tool(name: str, arguments: dict):
     global current_log_handle, current_process, WORK_JSON_FILE, TEST_LOG_FILE, CURRENT_BUG
     global IS_TASK_INITIALIZED, START_TIME, CURRENT_ROUND, TOTAL_ATTEMPTS, READ_CODE_COUNT
-    global CODE_MODIFIED, CURRENT_WORKDIR
+    global CODE_MODIFIED, CURRENT_WORKDIR, TEST_GUARD_BASELINE, TASK_FINISHED, GUARD_VIOLATIONS
 
     # 🚨 绝杀：每次调用任何工具前，强制等待上一次的测试进程跑完（防并发冲突）
     wait_for_previous_process()
@@ -576,8 +786,14 @@ async def call_tool(name: str, arguments: dict):
         # 条件：强制，或没初始化，或换了另一个 Bug
         need_checkout = force_checkout or (not IS_TASK_INITIALIZED) or (CURRENT_BUG != new_bug_id)
 
-        if not need_checkout and not CODE_MODIFIED:
-            return [types.TextContent(type="text", text="【系统强制拒绝】代码没有被修改过，重复运行测试没有任何意义！请先调用 `patch_and_log` 提交你的修改猜想！（上一次 run_test 的结果已经写在 work_log.jsonl 里，可直接调用 `get_work_log` 查看，无需再跑一次测试。）", isError=True)]
+        if not force_checkout and CURRENT_BUG is not None and CURRENT_BUG == new_bug_id:
+            # 【P0 去重】重复调用必须在 checkout 之前拦住：
+            # reset_task_state() 会把 IS_TASK_INITIALIZED 置 False，不加这层就会再跑一次全量 checkout，
+            # 把已经修好的工作区打回 buggy 状态（现象就是 run_test 被连续调用两次，第二次白跑一遍）。
+            if TASK_FINISHED:
+                return [types.TextContent(type="text", text="【无需重复测试】该 Bug 上一次 run_test 已经全部通过，工作区仍是修复后的状态。请直接输出 [FIXED] 结束任务；如果后来又改了代码，请先调用 `patch_and_log` 记录新一轮，再跑测试。", isError=True)]
+            if not CODE_MODIFIED:
+                return [types.TextContent(type="text", text="【系统强制拒绝】代码没有被修改过，重复运行测试没有任何意义！请先调用 `patch_and_log` 提交你的修改猜想！（上一次 run_test 的结果已经写在 work_log.jsonl 里，可直接调用 `get_work_log` 查看，无需再跑一次测试。）", isError=True)]
 
         wsl_workdir = shlex.quote(workspace)
 
@@ -590,16 +806,49 @@ async def call_tool(name: str, arguments: dict):
             TEST_LOG_FILE = os.path.join(CURRENT_BUG_DIR, "test.log")
             WORK_JSON_FILE = os.path.join(CURRENT_BUG_DIR, "work_log.jsonl")
             
+            # 【新一轮任务】工作区刚被重置，旧的 work_log 里的轮次/补丁已经对不上当前代码，
+            # 留着只会误导 agent（和指标里的 current_round），直接清掉
+            if os.path.exists(WORK_JSON_FILE):
+                try:
+                    os.remove(WORK_JSON_FILE)
+                    logging.info(f"已清空 {CURRENT_BUG} 的历史 work_log（工作区被重新检出）")
+                except OSError as err:
+                    logging.error(f"清空 work_log 失败: {str(err)}")
+            
             # 重置锁和计时器
             IS_TASK_INITIALIZED = True
             START_TIME = time.time()
             CURRENT_ROUND = 0
             TOTAL_ATTEMPTS = 0
             CODE_MODIFIED = False
+            TASK_FINISHED = False
+            GUARD_VIOLATIONS = 0
             
             logging.info(f"切换当前 Bug 为 {CURRENT_BUG} | 执行全量 Checkout")
-            # setup_cmd 可以为空（工作区已存在、不需要检出/重置），那就直接跑测试
-            full_cmd = f"{setup_cmd} && {test_cmd}" if setup_cmd else test_cmd
+
+            # 【防作弊 P0-2】checkout 与测试必须分两步跑：中间要拍一张测试文件基线哈希。
+            # setup_cmd 为空（工作区已存在、无需重置）时直接跳过准备阶段。
+            if setup_cmd:
+                try:
+                    setup_res = execute_in_target(setup_cmd, timeout=TEST_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    msg = f"【环境准备超时】setup_cmd 超过 {TEST_TIMEOUT}s 未结束，已放弃本轮。"
+                    save_test_result("SetupFailed", None, msg)
+                    # 工作区可能是半成品：标回未初始化，下次 run_test 重新 checkout
+                    IS_TASK_INITIALIZED = False
+                    TEST_GUARD_BASELINE = None
+                    return [types.TextContent(type="text", text=msg, isError=True)]
+                if setup_res.returncode != 0:
+                    setup_out = ((setup_res.stdout or "") + (setup_res.stderr or "")).strip()
+                    msg = f"【环境准备失败】setup_cmd 退出码 {setup_res.returncode}：\n{setup_out[-2000:]}"
+                    save_test_result("SetupFailed", None, msg)
+                    # 同上：别拿一个损坏的工作区继续跑增量测试
+                    IS_TASK_INITIALIZED = False
+                    TEST_GUARD_BASELINE = None
+                    return [types.TextContent(type="text", text=msg, isError=True)]
+
+            init_test_guard(workspace)
+            full_cmd = test_cmd
 
         else:
             logging.info(f"当前 Bug {CURRENT_BUG} | 执行增量测试")
@@ -609,6 +858,17 @@ async def call_tool(name: str, arguments: dict):
             else:
                 full_cmd = test_cmd
 
+
+        # 【防作弊 P0-2】跑测试前确认测试代码没被动过，被动过就拒绝运行（不产出分数）
+        guard_ok, guard_msg = verify_test_guard()
+        if not guard_ok:
+            if "【配置错误】" in guard_msg:
+                # 配置问题不是 agent 的错，不计入违规次数，也不熔断
+                save_test_result("GuardMisconfigured", None, guard_msg)
+                return [types.TextContent(type="text", text=guard_msg, isError=True)]
+            _fused, guard_msg = guard_strike(guard_msg)
+            save_test_result("TestTampered", None, guard_msg)
+            return [types.TextContent(type="text", text=guard_msg, isError=True)]
 
         try:
             if current_log_handle is not None:
@@ -629,8 +889,12 @@ async def call_tool(name: str, arguments: dict):
                 current_process.wait(timeout=TEST_TIMEOUT)
             except subprocess.TimeoutExpired:
                 current_process.kill()
+                # 超时没有结论，补丁仍处于「已改未验证」状态：允许重跑一次（否则会被去重逻辑拦住）
+                CODE_MODIFIED = True
                 save_test_result("Timeout", None, f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。")
                 reset_task_state("Timeout")
+                # 超时不能把补丁一起丢掉：保持「已检出 + 已修改」，下一次 run_test 走增量而不是重新 checkout
+                IS_TASK_INITIALIZED = True
                 return [types.TextContent(type="text", text=f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。", isError=True)]
 
             logging.info("测试进程结束，正在解析日志...")
@@ -652,6 +916,7 @@ async def call_tool(name: str, arguments: dict):
             # 【可配置判定】通过/失败规则来自 config.json 的 target.passed_pattern / failed_pattern
             if PASS_RE.search(content):
                 save_test_result("Passed", 0, "【测试全部通过】命中 passed_pattern")
+                TASK_FINISHED = True
                 reset_task_state("Fixed")
                 return [types.TextContent(type="text", text=f"【测试全部通过】该 Bug 已成功修复！请结束任务并输出 [FIXED]。")]
 
@@ -793,9 +1058,27 @@ async def call_tool(name: str, arguments: dict):
         fix_summary = arguments.get("fix_summary")
         changes = arguments.get("changes", [])
 
+        if not changes:
+            return [types.TextContent(type="text", text="参数错误：changes 不能为空（空 patch 会在 work_log 里留下一轮无效记录）。", isError=True)]
+
         # 第一阶段：全部在内存中校验和替换，order 用来保持落盘顺序。
         staged_writes = {}
         order = []
+
+        # 【防作弊 P0-1】落盘前先做路径白名单校验：测试代码 / 工作区外的文件一律拒绝
+        blocked = []
+        for change in changes:
+            _ok, _why = check_patch_path(change.get("file_path"))
+            if not _ok:
+                blocked.append(_why)
+        if blocked:
+            logging.warning(f"[guard] {CURRENT_BUG} 拒绝越界 patch：{blocked}")
+            _fused, reject_text = guard_strike(
+                "【系统拒绝】patch 白名单校验未通过，以下路径不允许修改：\n- "
+                + "\n- ".join(blocked)
+                + "\n只允许修改被测源码（见 config.json 的 target.patch_allow_globs / patch_deny_globs）。本轮修改未落盘。"
+            )
+            return [types.TextContent(type="text", text=reject_text, isError=True)]
 
         for change in changes:
             wsl_path = change.get("file_path")
@@ -901,6 +1184,8 @@ async def call_tool(name: str, arguments: dict):
         TOTAL_ATTEMPTS += 1
         READ_CODE_COUNT = 0
         CODE_MODIFIED = True
+        # 修复后又打了新补丁：把任务重新打开，否则下一轮 run_test 会被「已修复」拦住
+        TASK_FINISHED = False
         return [types.TextContent(type="text", text=f"Patch applied successfully. IMMEDIATELY call run_test to verify. Do NOT speak.")]
 
     elif name == "get_work_log":

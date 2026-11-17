@@ -13,7 +13,30 @@ CONFIG_FILE = "config.json"
 
 # 无论从哪个目录启动，配置 / 提示词 / 服务端脚本都按本文件所在目录定位
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, CONFIG_FILE)
+
+
+def resolve_config_file():
+    """选取配置文件：--config 优先，其次 ZEROX_CONFIG 环境变量，最后默认 config.json。
+
+    相对路径按本文件所在目录解析；选中的文件通过 ZEROX_CONFIG 传给 MCP Server，
+    保证客户端和服务端读的是同一份配置。
+    """
+    chosen = None
+    argv = sys.argv[1:]
+    for i, arg in enumerate(argv):
+        if arg == "--config" and i + 1 < len(argv):
+            chosen = argv[i + 1]
+            break
+        if arg.startswith("--config="):
+            chosen = arg.split("=", 1)[1]
+            break
+    chosen = chosen or os.getenv("ZEROX_CONFIG") or CONFIG_FILE
+    return chosen if os.path.isabs(chosen) else os.path.join(BASE_DIR, chosen)
+
+
+CONFIG_FILE = resolve_config_file()
+# Server 子进程会继承这个变量，否则它会读回默认的 config.json
+os.environ["ZEROX_CONFIG"] = CONFIG_FILE
 SERVER_SCRIPT = os.path.join(BASE_DIR, "zerox_server.py")
 
 LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -75,6 +98,9 @@ BUGS_TO_TEST = CONFIG.get("benchmark_bugs", ["Lang_1"])
 MAX_TURNS = AGENT_CONF["max_turns"]
 FIXED_MARKER = AGENT_CONF["fixed_marker"]
 FAILED_MARKER = AGENT_CONF["failed_marker"]
+# 服务端 run_test 命中 passed_pattern 时返回的第一句话。
+# 改 zerox_server.py 里那条消息时，必须同步改这里，否则所有结果都会被记成 Failed。
+PASSED_RESULT_MARKER = "【测试全部通过】"
 
 client = AsyncOpenAI(
     api_key=api_key, 
@@ -168,7 +194,13 @@ async def run_single_bug(bug_id: str, session: ClientSession):
 
     start_time = time.time()
     usage_totals = {"prompt": 0, "completion": 0, "total": 0, "calls": 0, "turns": 0}
-    final_status = "Timeout/Failed"
+    # 终态只有四种：Fixed / Failed / Error / MaxTurns。
+    # 跑到 max_turns 仍未收敛就是 MaxTurns，不再和超时、失败混用同一个字符串。
+    final_status = "MaxTurns"
+    # 【指标完整性】只在服务端真的报过「测试全部通过」后，才承认 agent 的 [FIXED]
+    saw_passing_test = False
+    # 【去重】上一轮的 run_test 结果；打新补丁后作废，避免同一状态重复跑测试
+    last_test_result = None
 
     for turn in range(MAX_TURNS):
 
@@ -228,7 +260,12 @@ async def run_single_bug(bug_id: str, session: ClientSession):
             if text:
                 print(f"  [{bug_id}] Turn {turn+1} AI: {text[:100]}...")
                 if FIXED_MARKER in text:
-                    final_status = "Fixed"
+                    # 自报 [FIXED] 不算数：得先有一次 run_test 真的返回了通过
+                    if saw_passing_test:
+                        final_status = "Fixed"
+                    else:
+                        print(f"  ⚠️ [{bug_id}] AI 自称 {FIXED_MARKER}，但从未见到通过的测试，记为 Failed。")
+                        final_status = "Failed"
                     break
                 if FAILED_MARKER in text:
                     final_status = "Failed"
@@ -260,9 +297,29 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                     continue # 直接进入下一轮对话，放弃执行本次工具
                 
                 try:
-                    result = await session.call_tool(fn_name, arguments=fn_args)
-                    result_text = "".join([c.text for c in result.content if c.type == "text"])
-                    
+                    # 【P0 去重】同一 patch 状态下重复调 run_test：直接复用上次结果，
+                    # 不再打服务端（否则会多跑一次全量 checkout + 全套测试，白烧几分钟和一堆 token）
+                    if fn_name == "run_test" and last_test_result is not None:
+                        print(f"  ⏭️ [{bug_id}] 重复的 run_test，复用上次结果，未产生新的测试执行。")
+                        result_text = last_test_result
+                    else:
+                        result = await session.call_tool(fn_name, arguments=fn_args)
+                        result_text = "".join([c.text for c in result.content if c.type == "text"])
+
+                        # 补丁真的落盘了才作废缓存；被 guard 拒绝的 patch 不改变工作区状态
+                        if fn_name == "patch_and_log" and "Patch applied successfully" in result_text:
+                            last_test_result = None
+                        elif fn_name == "rollback" and "回滚成功" in result_text:
+                            last_test_result = None
+                        elif fn_name == "run_test":
+                            last_test_result = result_text
+                            # 超时不作数：允许重跑，别把一次 flaky 超时锁死
+                            if "【测试超时】" in result_text:
+                                last_test_result = None
+                            # 服务端只在 passed_pattern 命中后才会回这句话，是唯一的正样本信号
+                            if PASSED_RESULT_MARKER in result_text:
+                                saw_passing_test = True
+
                     if "【任务失败】" in result_text or "【系统强制熔断】" in result_text:
                         print(f"  💀 [{bug_id}] Server 端触发最大尝试次数上限。")
                         final_status = "Failed"
@@ -300,6 +357,7 @@ async def main():
     )
 
     print("🔥 正在启动 ZeroX MCP Server...")
+    print(f"⚙️ 配置文件: {CONFIG_FILE}")
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
