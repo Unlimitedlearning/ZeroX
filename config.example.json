@@ -1,7 +1,26 @@
 {
-  "defects4j_path": "/path/to/defects4j/framework/bin/defects4j",
-  "work_root": "/path/to/your/workdir",
-  "max_attempts": 10,
+  "target": {
+    "tool_path": "/path/to/defects4j/framework/bin/defects4j",
+    "workspace_root": "/path/to/your/workdir",
+    "workspace_template": "{workspace_root}/d4j_{project}_{version}",
+    "setup_cmd": "rm -rf {workspace} && {tool} checkout -p {project} -v {version} -w {workspace}",
+    "test_cmd": "{tool} test -w {workspace}",
+    "require_workspace": true,
+    "source_glob": "*.java",
+    "bug_id_pattern": "^(?P<project>[A-Za-z]+)_(?P<number>\\d+)(?P<suffix>[bf]?)$",
+    "bug_id_template": "{project}_{version}",
+    "default_version_suffix": "b",
+    "passed_pattern": "Failing tests:\\s*0",
+    "failed_pattern": "Failing tests:\\s*(?P<count>[1-9]\\d*)(?P<detail>[\\s\\S]*)"
+  },
+  "agent": {
+    "max_attempts": 10,
+    "max_turns": 100,
+    "system_prompt_file": "AGENTS.md",
+    "user_prompt_template": "Please fix the bug for {bug_id}. Begin by calling run_test with bug_id='{bug_id}'.",
+    "fixed_marker": "[FIXED]",
+    "failed_marker": "[FAILED]"
+  },
   "timeouts": {
     "test_execution": 300,
     "llm_client": 360

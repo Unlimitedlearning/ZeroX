@@ -9,6 +9,40 @@ from mcp.client.stdio import stdio_client
 
 CONFIG_FILE = "config.json"
 
+# 无论从哪个目录启动，配置 / 提示词 / 服务端脚本都按本文件所在目录定位
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, CONFIG_FILE)
+SERVER_SCRIPT = os.path.join(BASE_DIR, "zerox_server.py")
+
+# agent 段落默认值：与 zerox_server.py 的 DEFAULT_AGENT 保持一致
+DEFAULT_AGENT = {
+    "max_attempts": 10,                      # 服务端每个 bug 的 patch 次数上限
+    "max_turns": 100,                        # 客户端单个 bug 的最大对话轮数
+    "system_prompt_file": "AGENTS.md",       # 相对本文件所在目录，也可以写绝对路径
+    "user_prompt_template": "Please fix the bug for {bug_id}. Begin by calling run_test with bug_id='{bug_id}'.",
+    "fixed_marker": "[FIXED]",               # agent 输出这个标记就算修复成功
+    "failed_marker": "[FAILED]",
+}
+
+
+def load_agent_config(config):
+    """把 config.json 的 agent 段落合并到默认值上；prompt 这类要经常微调的都在这里。"""
+    agent_cfg = dict(DEFAULT_AGENT)
+    user_agent = config.get("agent") or {}
+    if not isinstance(user_agent, dict):
+        print("❌ config.json 里的 'agent' 必须是一个对象")
+        sys.exit(1)
+    for key, value in user_agent.items():
+        if value is not None:
+            agent_cfg[key] = value
+    return agent_cfg
+
+
+def resolve_path(path: str) -> str:
+    """相对路径按项目根目录解析，绝对路径原样返回。"""
+    return path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
+
+
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         print(f"❌ 找不到配置文件 {CONFIG_FILE}")
@@ -18,6 +52,7 @@ def load_config():
 
 CONFIG = load_config()
 LLM_CONF = CONFIG["llm_config"]
+AGENT_CONF = load_agent_config(CONFIG)
 
 # 读取客户端超时
 CLIENT_TIMEOUT = CONFIG.get("timeouts", {}).get("llm_client", 360.0)
@@ -28,7 +63,9 @@ if api_key.startswith("${") and api_key.endswith("}"):
     api_key = os.getenv(api_key[2:-1])
 
 BUGS_TO_TEST = CONFIG.get("benchmark_bugs", ["Lang_1"])
-MAX_TURNS = 100
+MAX_TURNS = AGENT_CONF["max_turns"]
+FIXED_MARKER = AGENT_CONF["fixed_marker"]
+FAILED_MARKER = AGENT_CONF["failed_marker"]
 
 client = AsyncOpenAI(
     api_key=api_key, 
@@ -36,7 +73,7 @@ client = AsyncOpenAI(
     timeout=CLIENT_TIMEOUT  
 )
 
-with open("AGENTS.md", "r", encoding="utf-8") as f:
+with open(resolve_path(AGENT_CONF["system_prompt_file"]), "r", encoding="utf-8") as f:
     SYSTEM_PROMPT = f.read()
 
 async def run_single_bug(bug_id: str, session: ClientSession):
@@ -46,7 +83,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Please fix the bug for {bug_id}. Begin by calling run_test with bug_id='{bug_id}'."}
+        {"role": "user", "content": AGENT_CONF["user_prompt_template"].replace("{bug_id}", bug_id)}
     ]
     
     mcp_tools = await session.list_tools()
@@ -76,8 +113,10 @@ async def run_single_bug(bug_id: str, session: ClientSession):
             # 找到最近一次的工具返回（比如最后的报错信息）
             recent_tool_outputs = []
             for msg in reversed(messages):
+                # 兼容 dict 和 SDK 对象两种消息形态，否则永远匹配不到 tool 消息
+                role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
                 # 只保留最近的 tool 消息，最多保留 1 条
-                if getattr(msg, "role", "") == "tool":
+                if role == "tool":
                     recent_tool_outputs.append(msg)
                     break
             
@@ -110,10 +149,10 @@ async def run_single_bug(bug_id: str, session: ClientSession):
             # 如果 AI 输出了文本，简单打印并检查是否通关
             if text:
                 print(f"  [{bug_id}] Turn {turn+1} AI: {text[:100]}...")
-                if "[FIXED]" in text:
+                if FIXED_MARKER in text:
                     final_status = "Fixed"
                     break
-                if "[FAILED]" in text:
+                if FAILED_MARKER in text:
                     final_status = "Failed"
                     break
 
@@ -177,7 +216,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
 async def main():
     server_params = StdioServerParameters(
         command=sys.executable,
-        args=["zerox_server.py"],
+        args=[SERVER_SCRIPT],
         env=os.environ.copy()
     )
 

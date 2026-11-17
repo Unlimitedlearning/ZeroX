@@ -21,6 +21,8 @@ current_process = None
 TEST_LOG_FILE = None
 WORK_JSON_FILE = None
 CURRENT_BUG = None
+# 当前 bug 的工作区（由 config.json 的 target.workspace_template 解析而来）
+CURRENT_WORKDIR = None
 
 # 新增：状态锁与计时器变量
 IS_TASK_INITIALIZED = False
@@ -57,6 +59,44 @@ logging.basicConfig(
 )
 
 # ==========================================
+# 目标环境默认配置：换测试集只改 config.json，代码不用动
+# 下面这些默认值与原 Defects4J 行为等价；config.json 里 target / agent 段落的同名字段会覆盖它们。
+# 可用占位符：{bug_id} {project} {number} {version} {suffix} {tool} {workspace_root} {workspace}
+# ==========================================
+DEFAULT_TARGET = {
+    # 测试框架/构建工具入口，命令模版里的 {tool}
+    "tool_path": "",
+    # 所有 bug 工作区的根目录，模版里的 {workspace_root}
+    "workspace_root": "",
+    # 单个 bug 的工作区目录模版，模版里的 {workspace}
+    "workspace_template": "{workspace_root}/d4j_{project}_{version}",
+    # 首次进入某个 bug 时的准备命令；留空 = 工作区已存在、无需重置
+    "setup_cmd": "rm -rf {workspace} && {tool} checkout -p {project} -v {version} -w {workspace}",
+    # 每次要验证时执行的测试命令
+    "test_cmd": "{tool} test -w {workspace}",
+    # 增量测试前是否要求工作区目录已存在
+    "require_workspace": True,
+    # search_code 的默认文件通配符
+    "source_glob": "*.java",
+    # bug_id 解析规则：命名分组会自动成为命令/目录模版里的占位符
+    "bug_id_pattern": r"^(?P<project>[A-Za-z]+)_(?P<number>\d+)(?P<suffix>[bf]?)$",
+    # 规范 bug 名（日志/备份目录/work_log 的 bug 字段用它）
+    "bug_id_template": "{project}_{version}",
+    # 解析出 number 但没有 suffix 时补的默认后缀
+    "default_version_suffix": "b",
+    # 判定「全部通过」的规则
+    "passed_pattern": r"Failing tests:\s*0",
+    # 判定「测试失败」的规则：count = 失败数，detail = 详细堆栈（两个命名分组都可以省略）
+    "failed_pattern": r"Failing tests:\s*(?P<count>[1-9]\d*)(?P<detail>[\s\S]*)",
+}
+
+DEFAULT_AGENT = {
+    # 单个 bug 允许的 patch_and_log 次数上限
+    "max_attempts": 10,
+}
+
+
+# ==========================================
 # 配置文件加载
 # ==========================================
 def load_config():
@@ -73,12 +113,13 @@ def load_config():
         logging.error(f"❌ Fatal: Failed to parse '{CONFIG_FILE}': {err}")
         sys.exit(1)
 
-    for key in ["defects4j_path", "work_root", "timeouts"]:
+    for key in ["target", "timeouts"]:
         if key not in config:
             logging.error(f"❌ Fatal: Missing '{key}' in '{CONFIG_FILE}'.")
             sys.exit(1)
 
-    if not isinstance(config["max_attempts"], int) or config["max_attempts"] <= 0:
+    max_attempts = (config.get("agent") or {}).get("max_attempts", DEFAULT_AGENT["max_attempts"])
+    if not isinstance(max_attempts, int) or max_attempts <= 0:
         logging.error(f"❌ Fatal: 'max_attempts' must be a positive integer in '{CONFIG_FILE}'.")
         sys.exit(1)
         
@@ -88,19 +129,119 @@ def load_config():
 
     return config
 
+def load_target_config(config):
+    """把 config.json 的 target 段落合并到默认值上；缺字段就用默认值。"""
+    target = dict(DEFAULT_TARGET)
+    user_target = config.get("target") or {}
+    if not isinstance(user_target, dict):
+        logging.error(f"❌ Fatal: 'target' must be an object in '{CONFIG_FILE}'.")
+        sys.exit(1)
+    for key, value in user_target.items():
+        if value is not None:
+            target[key] = value
+    return target
+
+
+def load_agent_config(config):
+    """agent 段落（行为开关）单独合并；缺字段就用默认值。"""
+    agent_cfg = dict(DEFAULT_AGENT)
+    user_agent = config.get("agent") or {}
+    if not isinstance(user_agent, dict):
+        logging.error(f"❌ Fatal: 'agent' must be an object in '{CONFIG_FILE}'.")
+        sys.exit(1)
+    for key, value in user_agent.items():
+        if value is not None:
+            agent_cfg[key] = value
+    return agent_cfg
+
+
+def compile_or_fail(pattern: str, name: str):
+    """正则写错就 Fail Fast，别等跑到一半才报错。"""
+    try:
+        return re.compile(pattern)
+    except re.error as err:
+        logging.error(f"❌ Fatal: '{name}' is not a valid regex ({pattern}): {err}")
+        sys.exit(1)
+
+
 CONFIG = load_config()
-D4J_PATH = CONFIG["defects4j_path"]
-WORK_ROOT = CONFIG["work_root"].rstrip("/")
-MAX_ATTEMPTS = CONFIG["max_attempts"]
+TARGET = load_target_config(CONFIG)
+AGENT_CONFIG = load_agent_config(CONFIG)
+TOOL_PATH = TARGET["tool_path"]
+WORKSPACE_ROOT = (TARGET["workspace_root"] or "").rstrip("/")
+MAX_ATTEMPTS = AGENT_CONFIG["max_attempts"]
 TEST_TIMEOUT = CONFIG["timeouts"]["test_execution"]
+
+# 判定规则与 bug_id 规则全部来自 config.json（换测试集不用改代码）
+BUG_ID_RE = compile_or_fail(TARGET["bug_id_pattern"], "target.bug_id_pattern")
+PASS_RE = compile_or_fail(TARGET["passed_pattern"], "target.passed_pattern")
+FAIL_RE = compile_or_fail(TARGET["failed_pattern"], "target.failed_pattern")
+
+if not str(TARGET["test_cmd"] or "").strip():
+    logging.error(f"❌ Fatal: 'target.test_cmd' cannot be empty in '{CONFIG_FILE}'.")
+    sys.exit(1)
+
+if "{tool}" in f"{TARGET['setup_cmd']} {TARGET['test_cmd']}" and not TOOL_PATH:
+    logging.error(f"❌ Fatal: 'target.tool_path' is required when commands use {{tool}} in '{CONFIG_FILE}'.")
+    sys.exit(1)
 
 logging.info(
     f"运行环境：{'Windows(WSL 转发)' if IS_WINDOWS else 'Linux(原生)'} | "
-    f"defects4j: {D4J_PATH} | work_root: {WORK_ROOT}"
+    f"tool: {TOOL_PATH or '(未配置)'} | workspace_root: {WORKSPACE_ROOT}"
 )
 
-def build_workdir(project: str, version: str) -> str:
-    return f"{WORK_ROOT}/d4j_{project}_{version}"
+
+def safe_format(template: str, values: dict) -> str:
+    """模版渲染：找不到的占位符原样留着，别让少一个键就把工具搞崩。"""
+    class _SafeDict(dict):
+        def __missing__(self, key):
+            return "{" + key + "}"
+
+    return str(template or "").format_map(_SafeDict(values))
+
+
+def resolve_bug(bug_id: str):
+    """把 bug_id 解析成「工作区 + 命令」一整套配置；不符合 target.bug_id_pattern 就返回 None。
+
+    占位符来源：bug_id_pattern 的命名分组 + {tool} / {workspace_root} / {bug_id} / {workspace}。
+    返回 dict：bug_id(规范名) / project / number / version / suffix / workspace / setup_cmd / test_cmd
+    """
+    match = BUG_ID_RE.match((bug_id or "").strip())
+    if not match:
+        return None
+
+    values = dict(match.groupdict())
+    values["bug_id"] = match.group(0)
+    values["tool"] = TOOL_PATH
+    values["workspace_root"] = WORKSPACE_ROOT
+
+    # version：分组里直接给了就用，否则 number + (suffix 或默认后缀)
+    if not values.get("version"):
+        suffix = values.get("suffix") or TARGET["default_version_suffix"] or ""
+        values["version"] = f"{values.get('number') or ''}{suffix}"
+
+    # 规范名：默认 {project}_{version}（Lang_1 -> Lang_1b）；不想改名就把 bug_id_template 设成 {bug_id}
+    canonical = safe_format(TARGET["bug_id_template"], values)
+    values["bug_id"] = match.group(0) if "{" in canonical else canonical
+
+    workspace = safe_format(TARGET["workspace_template"], values)
+
+    # 命令里的路径统一做 shell 转义，避免空格/特殊字符把命令拆坏
+    cmd_values = dict(values)
+    cmd_values["workspace"] = shlex.quote(workspace)
+    cmd_values["workspace_root"] = shlex.quote(WORKSPACE_ROOT)
+    cmd_values["tool"] = shlex.quote(TOOL_PATH) if TOOL_PATH else ""
+
+    return {
+        "bug_id": values["bug_id"],
+        "project": values.get("project") or "",
+        "number": values.get("number") or "",
+        "version": values.get("version") or "",
+        "suffix": values.get("suffix") or "",
+        "workspace": workspace,
+        "setup_cmd": safe_format(TARGET["setup_cmd"], cmd_values).strip(),
+        "test_cmd": safe_format(TARGET["test_cmd"], cmd_values).strip(),
+    }
 
 
 # ==========================================
@@ -278,6 +419,25 @@ def save_test_result(test_status: str, fail_count=None, detail: str = ""):
         logging.error(f"写入 run_test 结果失败: {str(err)}")
 
 
+def extract_fail_info(match):
+    """从失败正则里取「失败数」和「详细堆栈」。
+
+    优先用命名分组 count / detail；没有命名分组就退回 group(1) / group(2)，
+    方便随手写的正则也能用；两个分组都可以省略。
+    """
+    groups = match.groupdict()
+    count = groups.get("count")
+    detail = groups.get("detail")
+
+    if count is None and match.groups():
+        count = match.group(1)
+    if detail is None and match.lastindex and match.lastindex >= 2:
+        detail = match.group(2)
+
+    fail_count = int(count) if isinstance(count, str) and count.isdigit() else None
+    return fail_count, (detail or "").strip()
+
+
 def wait_for_previous_process():
     """统一阻塞等待函数：如果有测试在跑，最多等TEST_TIMEOUT秒。"""
     global current_process
@@ -296,11 +456,11 @@ async def list_tools():
     return [
         types.Tool(
             name="run_test",
-            description="运行 Defects4J 测试并【阻塞等待结果】。首次调用会自动下载并编译代码，后续调用跑增量测试。返回测试日志和结果。",
+            description="运行当前测试集的测试并【阻塞等待结果】（命令来自 config.json 的 target）。首次调用会先执行 target.setup_cmd 准备工作区，之后调用只跑 target.test_cmd。返回测试日志和结果。",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "bug_id": {"type": "string", "description": "必填，如 Lang_1"},
+                    "bug_id": {"type": "string", "description": "必填，需符合 config.json 中 target.bug_id_pattern 的规则（如 Lang_1）"},
                     "force_checkout": {"type": "boolean", "description": "如果你需要彻底重置代码到初始状态，传 true。"}
                 },
                 "required": ["bug_id"]
@@ -404,7 +564,7 @@ async def list_tools():
 async def call_tool(name: str, arguments: dict):
     global current_log_handle, current_process, WORK_JSON_FILE, TEST_LOG_FILE, CURRENT_BUG
     global IS_TASK_INITIALIZED, START_TIME, CURRENT_ROUND, TOTAL_ATTEMPTS, READ_CODE_COUNT
-    global CODE_MODIFIED
+    global CODE_MODIFIED, CURRENT_WORKDIR
 
     # 🚨 绝杀：每次调用任何工具前，强制等待上一次的测试进程跑完（防并发冲突）
     wait_for_previous_process()
@@ -413,14 +573,15 @@ async def call_tool(name: str, arguments: dict):
         bug_id = arguments.get("bug_id", "Lang_1")
         force_checkout = arguments.get("force_checkout", False)
 
-        # 校验格式
-        match = re.match(r"^([A-Za-z]+)_(\d+)([bf]?)$", bug_id)
-        if not match:
-            return [types.TextContent(type="text", text="bug_id 格式错误，应为 Project_Number，如 Lang_1", isError=True)]
+        # 校验格式：解析规则来自 config.json 的 target.bug_id_pattern
+        bug_ctx = resolve_bug(bug_id)
+        if bug_ctx is None:
+            return [types.TextContent(type="text", text=f"bug_id 格式错误，应符合 config.json 中 target.bug_id_pattern 的规则：{TARGET['bug_id_pattern']}", isError=True)]
 
-        project, bug_num, suffix = match.groups()
-        version = bug_num + (suffix if suffix else "b")
-        new_bug_id = f"{project}_{version}"
+        new_bug_id = bug_ctx["bug_id"]
+        workspace = bug_ctx["workspace"]
+        setup_cmd = bug_ctx["setup_cmd"]
+        test_cmd = bug_ctx["test_cmd"]
         
         # 判断是否需要重新 checkout
         # 条件：强制，或没初始化，或换了另一个 Bug
@@ -429,13 +590,12 @@ async def call_tool(name: str, arguments: dict):
         if not need_checkout and not CODE_MODIFIED:
             return [types.TextContent(type="text", text="【系统强制拒绝】代码没有被修改过，重复运行测试没有任何意义！请先调用 `patch_and_log` 提交你的修改猜想！（上一次 run_test 的结果已经写在 work_log.jsonl 里，可直接调用 `get_work_log` 查看，无需再跑一次测试。）", isError=True)]
 
-        workdir = build_workdir(project, version)
-        d4j = shlex.quote(D4J_PATH)
-        wsl_workdir = shlex.quote(workdir)
+        wsl_workdir = shlex.quote(workspace)
 
         if need_checkout:
             # 【重置多 Bug 隔离环境】
             CURRENT_BUG = new_bug_id
+            CURRENT_WORKDIR = workspace
             CURRENT_BUG_DIR = os.path.join(LOG_DIR, CURRENT_BUG)
             os.makedirs(CURRENT_BUG_DIR, exist_ok=True)
             TEST_LOG_FILE = os.path.join(CURRENT_BUG_DIR, "test.log")
@@ -449,11 +609,16 @@ async def call_tool(name: str, arguments: dict):
             CODE_MODIFIED = False
             
             logging.info(f"切换当前 Bug 为 {CURRENT_BUG} | 执行全量 Checkout")
-            full_cmd = f"rm -rf {wsl_workdir} && {d4j} checkout -p {project} -v {version} -w {wsl_workdir} && {d4j} test -w {wsl_workdir}"
+            # setup_cmd 可以为空（工作区已存在、不需要检出/重置），那就直接跑测试
+            full_cmd = f"{setup_cmd} && {test_cmd}" if setup_cmd else test_cmd
 
         else:
             logging.info(f"当前 Bug {CURRENT_BUG} | 执行增量测试")
-            full_cmd = f"test -d {wsl_workdir} || {{ echo 'WORKDIR_NOT_FOUND: 指定的目录不存在'; exit 1; }}; {d4j} test -w {wsl_workdir}"
+            # 工作区可能就在当前目录/固定目录，所以 require_workspace 做成可关的
+            if TARGET["require_workspace"]:
+                full_cmd = f"test -d {wsl_workdir} || {{ echo 'WORKDIR_NOT_FOUND: 指定的目录不存在'; exit 1; }}; {test_cmd}"
+            else:
+                full_cmd = test_cmd
 
 
         try:
@@ -495,28 +660,29 @@ async def call_tool(name: str, arguments: dict):
 
             exit_code = current_process.returncode
 
-            if "Failing tests: 0" in content:
-                save_test_result("Passed", 0, "【测试全部通过】Failing tests: 0")
+            # 【可配置判定】通过/失败规则来自 config.json 的 target.passed_pattern / failed_pattern
+            if PASS_RE.search(content):
+                save_test_result("Passed", 0, "【测试全部通过】命中 passed_pattern")
                 record_metric("Fixed")
                 return [types.TextContent(type="text", text=f"【测试全部通过】该 Bug 已成功修复！请结束任务并输出 [FIXED]。")]
 
-            if exit_code not in (None, 0) and "Failing tests:" not in content:
+            fail_match = FAIL_RE.search(content)
+            if exit_code not in (None, 0) and fail_match is None:
                 compile_msg = f"【编译失败】退出码 {exit_code}。请根据日志修复错误：\n{content[-2500:]}"
                 save_test_result("CompileError", None, compile_msg)
                 return [types.TextContent(type="text", text=compile_msg)]
 
-            if "Failing tests:" in content:
-                match_log = re.search(r"Failing tests:\s*([1-9]\d*)([\s\S]*)", content, re.DOTALL)
-                if match_log:
-                    failing_info = match_log.group(2).strip() if match_log.group(2) else "无详细堆栈"
-                    if len(failing_info) > 2500:
-                        lines = failing_info.split("\n")
-                        combined = "\n".join(lines[:15]) + "\n... [省略] ...\n" + failing_info[-2500:]
-                    else:
-                        combined = failing_info
-                    fail_msg = f"【测试失败】共 {match_log.group(1)} 个用例失败。\n以下是报错信息：\n{combined}\n\n请分析并修复。"
-                    save_test_result("Failed", int(match_log.group(1)), fail_msg)
-                    return [types.TextContent(type="text", text=fail_msg)]
+            if fail_match is not None:
+                fail_count, failing_info = extract_fail_info(fail_match)
+                if len(failing_info) > 2500:
+                    lines = failing_info.split("\n")
+                    combined = "\n".join(lines[:15]) + "\n... [省略] ...\n" + failing_info[-2500:]
+                else:
+                    combined = failing_info or "无详细堆栈"
+                count_text = fail_count if fail_count is not None else "若干"
+                fail_msg = f"【测试失败】共 {count_text} 个用例失败。\n以下是报错信息：\n{combined}\n\n请分析并修复。"
+                save_test_result("Failed", fail_count, fail_msg)
+                return [types.TextContent(type="text", text=fail_msg)]
 
             tail_msg = f"最新日志如下（退出码 {exit_code}）:\n{content[-2000:]}"
             save_test_result("Unknown", None, tail_msg)
@@ -532,12 +698,12 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_test 初始化 Bug 环境。", isError=True)]
         
         keyword = arguments.get("keyword")
-        pattern = arguments.get("file_pattern", "*.java")
+        pattern = arguments.get("file_pattern", TARGET["source_glob"])
         
-        # 🚨 修复了 build_workdir 参数缺失的 bug
-        project = CURRENT_BUG.split("_")[0]
-        version = CURRENT_BUG.split("_")[1]
-        workdir = build_workdir(project, version)
+        # 工作区不再按 Defects4J 命名推导，统一用 resolve_bug 解析出来的 CURRENT_WORKDIR
+        workdir = CURRENT_WORKDIR
+        if not workdir:
+            return [types.TextContent(type="text", text="【系统拒绝】还没解析出当前工作区，请先调用 run_test 初始化。", isError=True)]
         
         cmd = f"grep -rn --include='{pattern}' {shlex.quote(keyword)} {shlex.quote(workdir)} | head -n 20"
         res = execute_in_target(cmd)

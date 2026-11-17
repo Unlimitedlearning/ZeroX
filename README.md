@@ -68,5 +68,74 @@ To run the batch testing script (which spawns the MCP client and interacts with 
 python run_benchmark.py
 ```
 
+## 🧩 Configuration Reference (Swap Test Suites Without Touching Code)
+
+Everything environment-specific lives in `config.json`; the code only reads it. Four sections:
+
+| Section | Purpose |
+| :--- | :--- |
+| `target` | Where the code lives and how to set it up / test it |
+| `agent` | Behaviour knobs and prompts — the parts you tune often |
+| `timeouts` | `test_execution` (server side) and `llm_client` (client side) |
+| `llm_config` / `benchmark_bugs` | Model credentials and the bug list |
+
+### `target` — workspace, commands and verdicts
+
+| Field | Meaning |
+| :--- | :--- |
+| `tool_path` | Test framework / build tool entry point, exposed as `{tool}` |
+| `workspace_root` | Root directory holding all bug workspaces, exposed as `{workspace_root}` |
+| `workspace_template` | Per-bug directory template, exposed as `{workspace}` |
+| `setup_cmd` | Run once per new bug (checkout/unzip/switch branch). Empty = nothing to set up |
+| `test_cmd` | Run on every verification |
+| `require_workspace` | Whether the incremental run checks that `{workspace}` exists first |
+| `source_glob` | Default file pattern used by `search_code` |
+| `bug_id_pattern` | Regex used to parse `bug_id`; **every named group becomes a placeholder** |
+| `bug_id_template` | Canonical bug name (used for logs, backups and `work_log.jsonl`) |
+| `default_version_suffix` | Appended to `{number}` when the pattern has no `suffix` group |
+| `passed_pattern` | Regex hit ⇒ all tests pass ⇒ bug fixed |
+| `failed_pattern` | Regex hit ⇒ tests fail; optional named groups `count` (int) and `detail` (stack trace) |
+
+Available placeholders: `{tool}`, `{workspace_root}`, `{workspace}`, `{bug_id}`, plus every named group of `bug_id_pattern` (e.g. `{project}`, `{number}`, `{version}`, `{suffix}`). Workspace paths are shell-quoted automatically in `setup_cmd` / `test_cmd`.
+
+**Example — an existing project, tested with Maven, no checkout step (works with a plain Windows-disk workspace under WSL):**
+
+```json
+"target": {
+  "tool_path": "/usr/bin/mvn",
+  "workspace_root": "/mnt/d/work/myproject",
+  "workspace_template": "{workspace_root}",
+  "setup_cmd": "",
+  "test_cmd": "cd {workspace} && {tool} -B test",
+  "require_workspace": false,
+  "bug_id_pattern": "^(?P<bug_id>[A-Za-z0-9_\\-]+)$",
+  "bug_id_template": "{bug_id}",
+  "passed_pattern": "BUILD SUCCESS",
+  "failed_pattern": "Tests run:.*?Failures: (?P<count>\\d+)"
+}
+```
+
+**Example — one directory per bug, id doubles as the directory name (`quixbugs-quicksort` → `{workspace_root}/quixbugs-quicksort`):**
+
+```json
+"workspace_template": "{workspace_root}/{bug_id}",
+"bug_id_pattern": "^(?P<bug_id>[A-Za-z0-9_\\-]+)$",
+"bug_id_template": "{bug_id}",
+"setup_cmd": "",
+"test_cmd": "cd {workspace} && python run_tests.py 2>&1",
+"passed_pattern": "All tests passed",
+"failed_pattern": "FAILED \\((?P<count>\\d+)"
+```
+
+### `agent` — behaviour and prompts
+
+| Key | Meaning |
+| :--- | :--- |
+| `max_attempts` | Max `patch_and_log` calls per bug (server side) |
+| `max_turns` | Max LLM turns per bug (client side) |
+| `system_prompt_file` | Prompt file, relative to the project root (absolute also works) |
+| `user_prompt_template` | First user message; `{bug_id}` is substituted |
+| `fixed_marker` / `failed_marker` | Strings the agent must output to end the task; keep them consistent with `AGENTS.md` |
+
 ---
 *ZeroX is proudly built by a freshman at Guangdong University of Technology. (ZeroX 由广东工业大学大一新生独立开发)*
