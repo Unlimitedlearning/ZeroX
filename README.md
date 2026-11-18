@@ -16,17 +16,23 @@ By combining a minimalist toolchain, stateful external logging, and search-augme
 
 ## 📊 Experimental Results (Defects4J Benchmark)
 
-Tested on the first 4 bugs from the `Lang` project. **Total API cost: < $0.20** (Using DeepSeek API).
+Environment: **Defects4J 3.0.1** (`v3.0.1-7-g8c16da82`), Java 11, workspace on ext4, DeepSeek `deepseek-flash` at `temperature=0`. Every row comes from `benchmark_metrics.jsonl`; `Audit` is `python src/audit.py`, `Verified` is `python src/audit.py --verify`. Batch `logs/archive/20261118-133109` holds the setup-verification run, the current batch holds the rest.
 
-| Bug ID | Status | Time (s) | Tokens | Rounds | Breakthrough |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Lang_1b** | ✅ Fixed | 341.8s | 166K | 2 | Precisely located `NumberUtils` boundary condition. |
-| **Lang_2b** | ✅ Fixed | 784.5s | 1.32M | 10 | **Masterpiece**: Faced missing logs, injected probes, encountered a compile error, executed a `rollback`, and finally fixed the locale bug. |
-| **Lang_3b** | ✅ Fixed | 215.0s | 41K | 1 | Discovered unused variable and patched precision check logic. |
-| **Lang_4b** | ✅ Fixed | 213.4s | 25K | 1 | Handled JSON parsing errors gracefully and fixed the logic. |
+| Bug ID | Status | Time (s) | Tokens | In / Out | Turns | Patch calls | Tests | Audit | Verified |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Chart_1b** | ✅ Fixed | 34.75 | 46.8K | 45,365 / 1,392 | 11 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Lang_43b** | ✅ Fixed | 82.35 | 57.4K | 51,433 / 5,965 | 8 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Lang_51b** | ✅ Fixed | 34.82 | 27.0K | 25,917 / 1,103 | 7 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Lang_60b** | ✅ Fixed | 41.98 | 37.9K | 36,565 / 1,329 | 10 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Time_4b** | ✅ Fixed | 83.78 | 112.1K | 100,745 / 11,318 | 10 | 2 | 2 | `clean` | ✅ `Verified Fixed` |
 
-> **Total Repair Rate: 4/4 (100.0%)** 
-> *(Note: The remaining 3 failing tests in Lang_2 are JDK environment noise (timezone/reflection) and unrelated to the core bug.)*
+> **5/5 Fixed · 5/5 `clean` · 5/5 `Verified Fixed`.** Every bug converged in one round and two test executions — the 12-test budget was never approached, and wall time is 35–84s. `Verified Fixed` means `audit.py --verify` restored the test files, re-ran the suite and it passed again, i.e. no fix leans on an edited test.
+>
+> `Patch calls` counts `patch_and_log` **requests**, which is what the client sees. `Time_4` needed two: its first call never landed (the server logged `累计 1 次修改` and `work_log.jsonl` holds a single `patch` event), so one call was rejected and retried. The audit's own `补丁 N` is the applied count — report both if the distinction matters.
+>
+> Coverage caveat before this goes anywhere near a paper: all five bugs build with **ant** (`Lang`, `Chart`, `Time`). The maven chain (`Csv`, `Compress`) has not been exercised yet, and 5/5 at tier-B difficulty is a small sample — repeat before quoting a rate.
+>
+> The same `Chart_1` took **658s** / 30.7K tokens / 9 turns when its workspace sat on a Windows drive (`/mnt/d`), with the same `Fixed` + `clean` verdict: wall time follows the filesystem (19×), token and turn counts follow the trajectory — only `Status` and `Audit` are stable across environments.
 
 ### 📈 Metrics File
 
@@ -39,10 +45,9 @@ Tested on the first 4 bugs from the `Lang` project. **Total API cost: < $0.20** 
 | `total_time_seconds` | Wall-clock time for the whole bug |
 | `prompt_tokens` / `completion_tokens` / `total_tokens` | Token usage summed over every LLM call of that bug |
 | `api_calls` / `turns` | Number of LLM requests / conversation turns consumed |
-| `tests` / `total_attempts` / `current_round` | Test executions (the budget unit), patches applied, highest round reached |
+| `tests` / `total_attempts` / `current_round` | Test executions (the budget unit), `patch_and_log` **calls** (a rejected call still counts — see `Time_4` above), highest round reached |
 | `audit` / `audit_violations` | Post-hoc verdict from `audit.py`: `clean` or `invalid`, plus the paths that make it invalid |
 | `audit_version` | Version of the audit rules that produced that verdict (`audit.AUDIT_VERSION`) — bump it when the rules change, so older rows stay identifiable in the same file |
-| `current_round` / `total_attempts` / `tests` | Highest round, applied patches and test executions, counted by the client inside its own tool loop |
 
 ## 📦 Benchmark Suite (BENCH30)
 
@@ -58,7 +63,15 @@ python src/zerox.py
 
 Everything machine-specific lives in `config.json` (`tool_path`, `workspace_root`, credentials) and is git-ignored; nothing else needs editing. `src/zerox.py` calls the model with `temperature=0`, so runs are near-deterministic — residual variation comes from provider-side batching, which is why the reporting section below still asks for repeats.
 
-Built and verified against **Defects4J 1.5.0**, whose bug-id ranges are Lang 1–65, Math 1–106, Chart 1–26, Time 1–27, Compress 1–47, Codec 1–18, Csv 1–16, Cli 1–40. Lang 18/25/48, Time 21 and Cli 6 do not exist upstream and are never referenced.
+Built and verified against **Defects4J 3.0.1** (`v3.0.1-7-g8c16da82`, Java 11 required), whose bug-id ranges are Lang 1–65, Math 1–106, Chart 1–26, Time 1–27, Compress 1–47, Codec 1–18, Csv 1–16, Cli 1–40. Lang 18/25/48, Time 21 and Cli 6 do not exist upstream and are never referenced.
+
+Setting it up takes ~10 minutes (`init.sh` pulls a 600 MB project bundle plus the Major / EvoSuite / Randoop jars). One manual step is needed on any machine: the `commons-csv` repository inside the official bundle ships CRLF blobs, so Defects4J's own `git apply` fails on `Csv_*` checkouts unless whitespace checking is off —
+
+```bash
+git config --global apply.ignoreWhitespace change
+```
+
+ZeroX itself is unaffected (the server normalizes `\r\n` before diffing and before matching `old_str`), but Defects4J cannot check out `Csv_*` without that setting.
 
 ### The 30 bugs
 
@@ -142,7 +155,7 @@ python src/audit.py --config case/config.json
 Before each new batch, archive the previous batch instead of letting the numbers mix — `python tools/new_run.py` moves everything under `logs/` into `logs/archive/<timestamp>/` (keeping a `manifest.json`), clears `__pycache__`, and prints the bug list it is about to run. The archived batch stays auditable: `python src/audit.py --logs logs/archive/<timestamp>`.
 
 **5. Bundled Single-File Case (`case/`)**
-A self-testing Java program that exercises the same toolchain without Defects4J — one test run takes seconds instead of 3-6 minutes, so it is the fastest regression check for any change to the tools:
+A self-testing Java program that exercises the same toolchain without Defects4J — one test run takes seconds and needs no checkout at all, so it is the fastest regression check for any change to the tools:
 
 ```text
 case/
@@ -157,6 +170,21 @@ case/
 - Each case runs on a daemon thread with a 3s join timeout, so an exception or an infinite loop only fails that case.
 - The baseline lives **outside** the workspace: the agent cannot see or edit it, so there is no `pristine.bak` to keep in sync by hand, and `patch_deny_globs` is unnecessary. To change the case on purpose, edit `case/pristine/<name>.java` yourself, then `rm -rf case/work`.
 - Adding another single-file Java case: drop `case/pristine/<Name>.java`, add `<Name>` to `benchmark_bugs` in `case/config.json`. `setup_cmd` / `test_cmd` use `{bug_id}`, so nothing else changes. See `case/README.md` for the full recipe (including multi-file / Maven projects).
+
+**6. Performance (WSL): keep `workspace_root` on ext4, not `/mnt/...`**
+Same machine, same bug (`Chart_1b`), same Defects4J 3.0.1 — only the workspace location differs:
+
+| Step | Workspace under `/mnt/d/...` (drvfs) | Workspace under `/home/...` (ext4) |
+| :--- | :--- | :--- |
+| `defects4j checkout` | 218s | not measured separately — the whole ext4 run below fits in 34.75s |
+| `defects4j test` | 303s | **8s** (38×) |
+| whole bug, end to end (`Chart_1`, `Fixed` and `clean` in both cases) | 658s | **34.75s** |
+
+Nothing about Defects4J changed: a checkout is tens of thousands of small files, and the WSL bridge to a Windows drive charges per file. The ext4 total already contains the checkout, two test executions and 11 LLM turns, so the checkout itself is a few seconds of it.
+
+The 38× was measured on **one** bug (n=1), but the mechanism is per-file filesystem latency, not anything Defects4J-specific, so it generalises to any many-small-files workload. It also means the "3-6 minutes per test" figures elsewhere in this README were measuring the Windows drive, not the repair loop — on ext4, wall time is dominated by LLM turns again, and the 12-test budget is no longer expensive.
+
+Set `workspace_root` to something like `/home/<user>/zerox_workdir`. The workspace does **not** need to be visible from Windows: every read, patch and test goes through WSL commands.
 
 ## 🧩 Configuration Reference (Swap Test Suites Without Touching Code)
 
@@ -174,7 +202,7 @@ Everything environment-specific lives in `config.json`; the code only reads it. 
 | Field | Meaning |
 | :--- | :--- |
 | `tool_path` | Test framework / build tool entry point, exposed as `{tool}` |
-| `workspace_root` | Root directory holding all bug workspaces, exposed as `{workspace_root}`. Three forms: `/mnt/d/work` (used as-is), `D:/work` (converted to `/mnt/d/work`), or `work` / `./work` (**relative to the config file's directory** — this is how `case/config.json` stays machine-independent) |
+| `workspace_root` | Root directory holding all bug workspaces, exposed as `{workspace_root}`. Three forms: `/mnt/d/work` (used as-is), `D:/work` (converted to `/mnt/d/work`), or `work` / `./work` (**relative to the config file's directory** — this is how `case/config.json` stays machine-independent). Under WSL, put it on ext4 (`/home/...`), never on `/mnt/<drive>` — see the performance note in Quick Start |
 | `workspace_template` | Per-bug directory template, exposed as `{workspace}` |
 | `setup_cmd` | Run once per new bug (checkout/unzip/switch branch). Empty = nothing to set up. A fresh checkout also clears that bug's `work_log.jsonl`, because the workspace is back to its initial state and old rounds no longer apply |
 | `test_cmd` | Run on every verification |

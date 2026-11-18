@@ -23,6 +23,11 @@ logs/**
 # 只忽略【项目根目录】的 config.json（本机配置）。
 # 必须写成 /config.json：无斜杠的规则会在任意层级生效，会把 case/config.json 一起忽略掉
 /config.json
+# 本机的一次性配置（单 bug 复测、换环境验证之类）。模板除外，所以要把 config.example.json 加回来
+/config.*.json
+!/config.example.json
+# 一次性排障脚本：跑完就该删，别让它们混进来
+/tools/tmp_*.sh
 # case/ 的工作区是生成物（setup_cmd 重建），基线在 case/pristine/ 下，别把工作区提进来
 case/work/
 temp_code_*.txt

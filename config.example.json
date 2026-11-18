@@ -1,7 +1,7 @@
 {
   "target": {
     "tool_path": "/path/to/defects4j/framework/bin/defects4j",
-    "workspace_root": "/path/to/your/workdir",
+    "workspace_root": "/home/user/zerox_workdir",
     "workspace_template": "{workspace_root}/d4j_{project}_{version}",
     "setup_cmd": "rm -rf {workspace} && {tool} checkout -p {project} -v {version} -w {workspace}",
     "test_cmd": "{tool} test -w {workspace}",
