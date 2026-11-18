@@ -9,7 +9,7 @@ By combining a minimalist toolchain, stateful external logging, and search-augme
 
 ## 💡 Core Innovations (The "Agentless" Philosophy)
 
-1. **Minimalist Toolchain & Stateful Logging**: By discarding massive native tool libraries, ZeroX keeps only 7 core MCP tools. The agent's reasoning process is forced into an external `work_log.jsonl`, achieving extreme context compression, and this stateful log lets the LLM seamlessly resume a task. The log is an **append-only event stream** (`patch` / `test` / `note`) owned by a standalone `worklog.py` (the single rewrite is `rollback()`, which archives the dropped events to `human_audit.jsonl` first): test outcomes are never overwritten, so `get_work_log` can hand back a compact digest — what each round changed and whether the failure count is converging (`上轮 5 个 → 2 个`) — instead of replaying full `old/new` diffs. After a context compaction the agent recovers its diagnosis from that digest instead of wasting a turn on a meaningless test run.
+1. **Minimalist Toolchain & Stateful Logging**: By discarding massive native tool libraries, ZeroX keeps only 7 core MCP tools. The agent's reasoning process is forced into an external `work_log.jsonl`, achieving extreme context compression. The log is an **append-only event stream** (`patch` / `test` / `note`) owned by a standalone `worklog.py` (the single rewrite is `rollback()`, which archives the dropped events to `human_audit.jsonl` first): test outcomes are never overwritten, so `get_work_log` can hand back a compact digest — what each round changed and whether the failure count is converging (`上轮 5 个 → 2 个`) — instead of replaying full `old/new` diffs. After a context compaction **within one run** the agent recovers its diagnosis from that digest instead of wasting a turn on a meaningless test run. The log is *not* a cross-process checkpoint — see **Limitations** for what happens on a restart or crash.
 2. **Atomic Patch Operations & Blocking Verification**: Through `patch_and_log`, the LLM is strictly forced to output `old/new` diffs rather than full code. Every write goes through `worklog.py`, which stores the before/after content as content-addressed blobs and applies a round atomically — if any file fails, all of them are restored. The `run_test` tool acts as a blocking function that automatically waits for execution to finish and returns parsed logs, eliminating useless polling.
 3. **Emergent Self-Healing under Minimalist Tools**: Facing missing static metadata, the agent spontaneously exhibits advanced debugging behavior: autonomously injecting diagnostic probes into test/production code, writing runtime variables to temporary files, and cleaning them up. This proves that under a non-polluted context, a lightweight LLM possesses powerful emergent abilities. (Solidified into SOP in `AGENTS.md`).
 4. **Nudge Theory & Asymmetric Memory Architecture**: Rollback means a clean slate for the AI (Preventing Context Poisoning), while all discarded patches and failed trajectories are strictly preserved in `human_audit.jsonl` for human researchers. This provides an untainted exploration space for the LLM while offering invaluable data for Error Analysis.
@@ -221,7 +221,7 @@ Everything environment-specific lives in `config.json`; the code only reads it. 
 | `failed_pattern` | Regex hit ⇒ tests fail; optional named groups `count` (int) and `detail` (stack trace) |
 | `patch_allow_globs` | Optional whitelist (`fnmatch`). **Empty by default** = any path inside the workspace is patchable |
 | `patch_deny_globs` | Optional blacklist. Hit ⇒ rejected, takes priority over the whitelist. Empty by default |
-| `patch_must_be_under_workspace` | Reject any patch whose path is outside `{workspace}` (default `true`). Relative paths are resolved against `{workspace}` before the check |
+| `patch_must_be_under_workspace` | Reject any patch whose path is outside `{workspace}` (default `true`). Relative paths are resolved against `{workspace}` before the check; `..` that stays inside is allowed, escaping after normalization is rejected (read and patch share `zerox_core.paths`) |
 | `audit_test_globs` | Which paths count as test code — **read only by `audit.py`, after the run** |
 
 Available placeholders: `{tool}`, `{workspace_root}`, `{workspace}`, `{bug_id}`, plus every named group of `bug_id_pattern` (e.g. `{project}`, `{number}`, `{version}`, `{suffix}`). Workspace paths are shell-quoted automatically in `setup_cmd` / `test_cmd`.
@@ -257,7 +257,7 @@ Available placeholders: `{tool}`, `{workspace_root}`, `{workspace}`, `{bug_id}`,
 
 ### No runtime edit restrictions — audit after the fact
 
-ZeroX deliberately does **not** police which files the agent edits while it works. The single runtime rule is "stay inside `{workspace}`": `patch_and_log` rejects `..` traversal and paths outside the workspace, and resolves relative paths against it first (`src/main/java/...` works).
+ZeroX deliberately does **not** police which files the agent edits while it works. The single runtime rule is "stay inside `{workspace}`": `patch_and_log` resolves relative paths against it first (`src/main/java/...` works), normalizes `..`, and rejects only paths that escape the workspace afterwards. Read tools use the same resolver in `zerox_core.paths`, so `src/main/../main/Foo.java` is valid for both reading and patching.
 
 Earlier versions had two guards — a `src/main/java` whitelist plus an `md5` baseline of the test tree re-checked before every run. Both were removed on purpose:
 
@@ -288,6 +288,10 @@ Because the verdict is derived from the append-only log, it can be replayed over
 | `system_prompt_file` | Prompt file, relative to the project root (absolute also works) |
 | `user_prompt_template` | First user message; `{bug_id}` is substituted |
 | `fixed_marker` / `failed_marker` | Strings the agent must output to end the task; keep them consistent with `AGENTS.md` |
+
+## ⚠️ Limitations
+
+**No cross-process resume.** The `work_log.jsonl` digest recovers a lost *context* — after a compaction, the agent re-reads its own history from the log and keeps going in the same process. It is not a checkpoint: the LLM conversation, token counters and turn state live only in the `src/zerox.py` process. Restarting the script starts a fresh batch from the first entry in `benchmark_bugs`; there is no `--resume`. Concretely, on each bug the client sets `force_checkout: true` on the first `run_test` and rewrites `transcript.md`, and the server clears that bug's `work_log.jsonl` when it re-checks out the workspace — so a restarted bug loses its in-flight patch history and starts from clean buggy code. A crash mid-bug leaves only `logs/<bug>/crash.txt`; no `benchmark_metrics.jsonl` row is appended for a bug that never reached an exit status. Batch runs are therefore expected to finish in one sitting, or to be re-run from scratch.
 
 ---
 *ZeroX is proudly built by a freshman at Guangdong University of Technology. (ZeroX 由广东工业大学大一新生独立开发)*

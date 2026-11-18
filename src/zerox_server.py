@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import shlex
-import fnmatch
 import posixpath
 import time
 from logging.handlers import RotatingFileHandler
@@ -13,8 +12,11 @@ from mcp.server.stdio import stdio_server
 from mcp import types
 
 # 项目内模块（解耦第一步：配置与工具 schema 已外迁）
+from zerox_core import PASSED_RESULT_MARKER
 from zerox_core import config as config_mod
 from zerox_core import schemas
+# 读工具的工作区边界：纯解析逻辑在 zerox_core.paths，server 只传 CURRENT_WORKDIR
+from zerox_core import paths as core_paths
 from zerox_core.config import compile_or_fail
 from zerox_core.config import resolve_bug as _resolve_bug
 # 命令执行器已外迁：事后审计（audit.py）要用同一条 test_cmd 复跑，不能各写一份 WSL 转发逻辑
@@ -123,30 +125,6 @@ def _glob_list(value):
     return [str(v).strip() for v in value if str(v).strip()]
 
 
-def match_any_glob(path: str, globs) -> bool:
-    """fnmatch 逐个比对（支持 */src/test/* 这类中间段通配）。
-
-    必须用 fnmatchcase 而不能用 fnmatch：Windows 上 fnmatch 会先 normcase 转小写，
-    于是 D:\\...\\Test\\ 里的 “Test” 会命中 */test/*，把整个工作区误判成测试目录。
-    """
-    return any(fnmatch.fnmatchcase(path, g) for g in globs)
-
-
-def normalize_patch_path(raw_path: str) -> str:
-    """把模型给的路径统一成工作区内的绝对路径。
-
-    模型经常给 src/main/java/... 这种相对路径，直接拿去 cat / 与工作区前缀比对都会对不上，
-    所以先按当前工作区拼成绝对路径，再统一 normpath。
-    """
-    path = str(raw_path or "").strip().replace("\\", "/")
-    if not path:
-        return ""
-    workdir = (CURRENT_WORKDIR or "").rstrip("/")
-    if workdir and not path.startswith("/"):
-        path = f"{workdir}/{path}"
-    return posixpath.normpath(path)
-
-
 def run_grep(scope: str, include: str, keyword: str):
     """在指定目录下 grep 一次，返回 CompletedProcess。
 
@@ -160,35 +138,25 @@ def run_grep(scope: str, include: str, keyword: str):
     return execute_in_target(cmd)
 
 
-def check_patch_path(wsl_path: str):
-    """判断这个路径能否被 patch，返回 (ok, 拒绝原因)。
+def check_patch_path(raw_path: str):
+    """patch 路径统一入口：归一化 / 白黑名单 / 工作区边界都在 zerox_core.paths。
 
-    三层判定，任一不通过就拒绝（白/黑名单默认都为空，所以平时只有第 3 层生效）：
-      1. 命中 patch_deny_globs（受保护文件）→ 拒绝
-      2. 有白名单但没命中 patch_allow_globs → 拒绝
-      3. patch_must_be_under_workspace 为真时，路径必须落在当前工作区内
+    server 只注入 CURRENT_WORKDIR 和 target 配置；与读工具共用同一份解析，避免
+    「读工具允许工作区内的 ..，patch 却一刀切拒绝」这种两套规则漂移。
+    返回 (ok, path_or_reason)，成功时第二个值是归一化后的绝对路径。
     """
-    path = str(wsl_path or "").replace("\\", "/")
-    if not path:
-        return False, "file_path 为空"
-    # 先杀掉路径穿越：/ws/src/main/java/../../test/X.java 能命中白名单，实际写到测试目录
-    if ".." in path.split("/"):
-        return False, f"{path} 含 '..'（路径穿越），已拒绝"
-    path = posixpath.normpath(path)
+    return core_paths.resolve_patch_path(
+        raw_path,
+        CURRENT_WORKDIR,
+        allow=TARGET.get("patch_allow_globs"),
+        deny=TARGET.get("patch_deny_globs"),
+        must_be_under_workspace=bool(TARGET.get("patch_must_be_under_workspace", True)),
+    )
 
-    allow = _glob_list(TARGET.get("patch_allow_globs"))
-    deny = _glob_list(TARGET.get("patch_deny_globs"))
 
-    if deny and match_any_glob(path, deny):
-        return False, f"{path} 命中 patch_deny_globs（测试代码/受保护文件禁止修改）"
-    if allow and not match_any_glob(path, allow):
-        return False, f"{path} 不在 patch_allow_globs 白名单内（允许：{', '.join(allow)}）"
-
-    workdir = (CURRENT_WORKDIR or "").rstrip("/")
-    if workdir and TARGET.get("patch_must_be_under_workspace", True):
-        if not (path == workdir or path.startswith(workdir + "/")):
-            return False, f"{path} 不在当前工作区 {workdir} 内"
-    return True, ""
+def resolve_read_path(raw_path):
+    """读工具的统一入口：纯解析逻辑在 zerox_core.paths，这里只注入当前工作区。"""
+    return core_paths.resolve_read_path(raw_path, CURRENT_WORKDIR)
 
 
 # ==========================================
@@ -533,9 +501,9 @@ async def call_tool(name: str, arguments: dict):
                     save_test_result("TaintedPass", 0, msg)
                     return [types.TextContent(type="text", text=msg)]
 
-                save_test_result("Passed", 0, "【测试全部通过】命中 passed_pattern")
+                save_test_result("Passed", 0, f"{PASSED_RESULT_MARKER}命中 passed_pattern")
                 reset_task_state("Fixed")
-                return [types.TextContent(type="text", text=f"【测试全部通过】该 Bug 已成功修复！请结束任务并输出 [FIXED]。")]
+                return [types.TextContent(type="text", text=f"{PASSED_RESULT_MARKER}该 Bug 已成功修复！请结束任务并输出 [FIXED]。")]
 
             fail_match = FAIL_RE.search(content)
             if exit_code not in (None, 0) and fail_match is None:
@@ -601,6 +569,14 @@ async def call_tool(name: str, arguments: dict):
                 prefix if prefix.startswith("/") else posixpath.join(workdir, prefix)
             )
 
+        # 【只读边界】file_pattern 里带绝对路径时（如 pristine/ 里的基线），prefix 会被
+        # 直接当搜索目录用 —— 之前这是绕过工作区隔离、读到基线的第二个入口。
+        # 解析成工作区内绝对路径后再搜；越界就明确拒绝，不静默退化。
+        ok_scope, scope_or_err = resolve_read_path(scope)
+        if not ok_scope:
+            return [types.TextContent(type="text", text=scope_or_err, isError=True)]
+        scope = scope_or_err
+
         res = run_grep(scope, include, keyword)
         note = ""
         if not res.stdout.strip() and scope != workdir:
@@ -616,8 +592,11 @@ async def call_tool(name: str, arguments: dict):
         return [types.TextContent(type="text", text=f"搜索结果：\n{res.stdout}{note}")]
 
     elif name == "read_specific_code":
+        ok_path, path_or_err = resolve_read_path(arguments.get("wsl_file_path"))
+        if not ok_path:
+            return [types.TextContent(type="text", text=path_or_err, isError=True)]
+        wsl_path = path_or_err
         READ_CODE_COUNT += 1
-        wsl_path = arguments.get("wsl_file_path")
         start_line = arguments.get("start_line")
         end_line = arguments.get("end_line")
 
@@ -647,7 +626,10 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text=f"异常: {str(e)}")]
 
     elif name == "get_file_internal_structure":
-        wsl_path = arguments.get("wsl_file_path")
+        ok_path, path_or_err = resolve_read_path(arguments.get("wsl_file_path"))
+        if not ok_path:
+            return [types.TextContent(type="text", text=path_or_err, isError=True)]
+        wsl_path = path_or_err
         try:
             # 读出文件内容
             result = execute_in_target(f"cat {shlex.quote(wsl_path)}")
@@ -677,10 +659,17 @@ async def call_tool(name: str, arguments: dict):
             if not structure_info:
                 return [types.TextContent(type="text", text="未在文件中找到明显的类或方法结构，请直接使用 read_specific_code 读取全量代码（不传 start_line），自行分析。")]
             
-            # 增加强制信任的提示词
-            header = f"【权威结构索引】文件 {wsl_path} 的真实结构如下。这是系统底层解析的精准行号，请【完全信任】此结果，直接使用 read_specific_code 读取对应行，不要盲目猜行号或读取全量文件：\n"
+            # 行为约束：让模型按行读、别读全文件（schema 里的建议此前从未真正生效）
+            # 措辞刻意不说「权威/完全信任」——结构来自简单正则，会漏构造函数、泛型方法，
+            # 给出可操作的信任度即可，最终以实际代码为准。
+            header = (
+                f"【结构索引】{wsl_path} 的类/方法起始行（由源码扫描得到，"
+                "行号可作定位起点，最终以实际代码为准）：\n"
+                "请用 read_specific_code 按 start_line/end_line 只读取需要的那几段，"
+                "不要读取全文件；若这些位置没有要找的逻辑，再扩大行范围。\n"
+            )
 
-            return [types.TextContent(type="text", text=f"文件 {wsl_path} 的结构如下：\n" + "\n".join(structure_info))]
+            return [types.TextContent(type="text", text=header + "\n".join(structure_info))]
             
         except Exception as e:
             return [types.TextContent(type="text", text=f"结构解析异常: {str(e)}")]
@@ -706,13 +695,9 @@ async def call_tool(name: str, arguments: dict):
         staged_writes = {}
         order = []
 
-        # 落盘前先把相对路径补成工作区绝对路径，再做越界校验
-        target_paths = [normalize_patch_path(change.get("file_path")) for change in changes]
-        blocked = []
-        for path in target_paths:
-            _ok, _why = check_patch_path(path)
-            if not _ok:
-                blocked.append(_why)
+        # 落盘前统一校验：check_patch_path 顺带把相对路径补成工作区内绝对路径
+        checked = [check_patch_path(change.get("file_path")) for change in changes]
+        blocked = [why for ok, why in checked if not ok]
         if blocked:
             logging.warning(f"[patch] {CURRENT_BUG} 拒绝越界 patch：{blocked}")
             reject_text = (
@@ -722,6 +707,7 @@ async def call_tool(name: str, arguments: dict):
             )
             return [types.TextContent(type="text", text=reject_text, isError=True)]
 
+        target_paths = [path for _ok, path in checked]
         for idx, change in enumerate(changes):
             wsl_path = target_paths[idx]
             patch_diff = change.get("patch_diff", {})

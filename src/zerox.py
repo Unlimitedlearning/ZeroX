@@ -20,6 +20,7 @@ from mcp.client.stdio import stdio_client
 # 同目录模块：事后审计（运行时不做编辑限制，跑完再判定 clean / invalid）
 import audit
 # 内部包在 src/zerox_core/：包名不能叫 zerox，否则会盖住本文件（src/zerox.py）
+from zerox_core import PASSED_RESULT_MARKER
 from zerox_core import config as config_mod
 
 CONFIG_FILE = "config.json"
@@ -125,10 +126,6 @@ _note_every = AGENT_CONF.get("note_every_turns")
 NOTE_EVERY_TURNS = int(_note_every) if _note_every else None
 FIXED_MARKER = AGENT_CONF["fixed_marker"]
 FAILED_MARKER = AGENT_CONF["failed_marker"]
-# 服务端 run_test 命中 passed_pattern 时返回的第一句话。
-# 改 zerox_server.py 里那条消息时，必须同步改这里，否则所有结果都会被记成 Failed。
-PASSED_RESULT_MARKER = "【测试全部通过】"
-
 client = AsyncOpenAI(
     api_key=api_key, 
     base_url=LLM_CONF["base_url"],
