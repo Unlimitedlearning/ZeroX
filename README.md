@@ -90,7 +90,7 @@ defects4j bids -p Time         # bug ids that actually exist
 
 ### Deliberately excluded
 
-Closure, JacksonDatabind, Mockito and Gson. Single-bug test time (Closure runs 5–10 minutes), JDK sensitivity (Mockito) and very large suites turn a 30-bug sweep from ~3 hours into 20+, while injecting environment noise into the sample. They belong to a second phase.
+Closure, JacksonDatabind, Mockito and Gson. Single-bug test time (Closure takes minutes per test even on ext4), JDK sensitivity (Mockito) and very large suites would dominate a 30-bug sweep while injecting environment noise into the sample. They belong to a second phase.
 
 ### What to report
 
@@ -105,7 +105,7 @@ Closure, JacksonDatabind, Mockito and Gson. Single-bug test time (Closure runs 5
 
 ```text
 ZeroX/
-├── .gitignore              # Ignore venv, __pycache__, logs and real config
+├── .gitignore              # Ignore venv, __pycache__, logs, the real config and one-off tmp scripts
 ├── README.md               # Project documentation
 ├── AGENTS.md               # System prompt: tools, budget, workflow (Core Asset)
 ├── config.example.json     # Template for configuration
@@ -116,7 +116,7 @@ ZeroX/
 ├── src/worklog.py          # Standalone version-control module (blobs + append-only events + rollback)
 ├── src/audit.py            # Post-hoc audit: Fixed vs Verified Fixed, no runtime edit restrictions
 ├── case/                   # Defects4J-free Java case: config.json + pristine/ + work/ (git-ignored)
-├── tools/                  # new_run.py — archive the previous batch before a sweep
+├── tools/                  # new_run.py (archive a batch), show_setup_cmd.py (render a config's commands)
 ├── tools/selftests/        # Offline selftests (worklog, audit): no WSL, no Defects4J
 ├── logs/                   # Runtime logs, work logs, blob store, and benchmark metrics
 ```
@@ -176,11 +176,11 @@ Same machine, same bug (`Chart_1b`), same Defects4J 3.0.1 — only the workspace
 
 | Step | Workspace under `/mnt/d/...` (drvfs) | Workspace under `/home/...` (ext4) |
 | :--- | :--- | :--- |
-| `defects4j checkout` | 218s | not measured separately — the whole ext4 run below fits in 34.75s |
+| `defects4j checkout` | 218s | — |
 | `defects4j test` | 303s | **8s** (38×) |
-| whole bug, end to end (`Chart_1`, `Fixed` and `clean` in both cases) | 658s | **34.75s** |
+| whole bug, end to end | 658s | **34.75s** |
 
-Nothing about Defects4J changed: a checkout is tens of thousands of small files, and the WSL bridge to a Windows drive charges per file. The ext4 total already contains the checkout, two test executions and 11 LLM turns, so the checkout itself is a few seconds of it.
+Both runs are `Chart_1`, both ended `Fixed` + `clean`. The ext4 column has no separate checkout figure because the whole 34.75s already contains the checkout, two test executions and 11 LLM turns — the checkout itself is a few seconds of it.
 
 The 38× was measured on **one** bug (n=1), but the mechanism is per-file filesystem latency, not anything Defects4J-specific, so it generalises to any many-small-files workload. It also means the "3-6 minutes per test" figures elsewhere in this README were measuring the Windows drive, not the repair loop — on ext4, wall time is dominated by LLM turns again, and the 12-test budget is no longer expensive.
 
@@ -220,12 +220,12 @@ Everything environment-specific lives in `config.json`; the code only reads it. 
 
 Available placeholders: `{tool}`, `{workspace_root}`, `{workspace}`, `{bug_id}`, plus every named group of `bug_id_pattern` (e.g. `{project}`, `{number}`, `{version}`, `{suffix}`). Workspace paths are shell-quoted automatically in `setup_cmd` / `test_cmd`.
 
-**Example — an existing project, tested with Maven, no checkout step (works with a plain Windows-disk workspace under WSL):**
+**Example — an existing project, tested with Maven, no checkout step** (put its workspace on ext4 under WSL, see the performance note in Quick Start):
 
 ```json
 "target": {
   "tool_path": "/usr/bin/mvn",
-  "workspace_root": "/mnt/d/work/myproject",
+  "workspace_root": "/home/user/work/myproject",
   "workspace_template": "{workspace_root}",
   "setup_cmd": "",
   "test_cmd": "cd {workspace} && {tool} -B test",
