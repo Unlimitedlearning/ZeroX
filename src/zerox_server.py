@@ -33,12 +33,11 @@ CURRENT_BUG = None
 # 当前 bug 的工作区（由 config.json 的 target.workspace_template 解析而来）
 CURRENT_WORKDIR = None
 
-# 新增：状态锁与计时器变量
-# 锁与计时器合并成一个：START_TIME 非 None ⇔ 工作区已检出、且当前任务正在计时。
-# （原来是 IS_TASK_INITIALIZED + START_TIME 两个变量描述同一件事，setup 失败时只改一个就会不同步）
+# 状态锁与计时器：START_TIME 非 None ⇔ 工作区已检出、且当前任务正在计时。
+# 一个变量只描述一件事：setup 失败时就地置回 None
 START_TIME = None
 CURRENT_ROUND = 0
-# 累计补丁数：只用于指标与预算读数，不再作为任务终止条件
+# 累计补丁数：只用于指标与预算读数，不是任务终止条件
 TOTAL_ATTEMPTS = 0
 # 累计测试次数：本任务真正的成本单位（一次测试 3-6 分钟），也是唯一的硬闸门
 TOTAL_TESTS = 0
@@ -109,13 +108,9 @@ def resolve_bug(bug_id: str):
 
 
 # ==========================================
-# 【路径约束】默认只拦「写不进当前工作区」的 patch
-# 以前这里还有两层防作弊：只能改 src/main/java 的白名单，加上跑测试前比对的测试文件 md5 基线。
-# 两层都拿掉了，原因有二：白名单把 src/main/java/... 这种相对路径也拒掉了（模型经常给相对路径），
-# md5 基线换个项目布局就得额外配 4 个字段才不误判；而被拒的 agent 会转为先随便打个补丁换权限，
-# 赔进去的就是一次 3-6 分钟的测试。现在运行时只管「别写到工作区外面」，
+# 【路径约束】只拦「写不进当前工作区」的 patch
+# 运行时只管「别写到工作区外面」，patch_allow_globs / patch_deny_globs 默认空，需要时再收紧。
 # 动没动测试代码交给事后的 audit.py 判定：Fixed 和 Verified Fixed 分开报。
-# patch_allow_globs / patch_deny_globs 仍然保留（默认空），需要时再收紧。
 # ==========================================
 def _glob_list(value):
     """把配置里的白名单/黑名单统一成 list[str]；空值 = 不限制。"""
@@ -139,8 +134,7 @@ def normalize_patch_path(raw_path: str) -> str:
     """把模型给的路径统一成工作区内的绝对路径。
 
     模型经常给 src/main/java/... 这种相对路径，直接拿去 cat / 与工作区前缀比对都会对不上，
-    旧的白名单就是这么把合法 patch 拒掉的（日志里那条
-    “src/main/java/.../NumberUtils.java 不在 patch_allow_globs 白名单内”就是它）。
+    所以先按当前工作区拼成绝对路径，再统一 normpath。
     """
     path = str(raw_path or "").strip().replace("\\", "/")
     if not path:
@@ -184,10 +178,7 @@ def check_patch_path(wsl_path: str):
 
 # ==========================================
 # 【预算读数】只报不管
-# 以前这里是一整层「调用仲裁」：重复只读直接省略、连续 12 次只读直接拒绝、
-# 任务进行中强行把 force_checkout 降级。它挡掉的都是几秒钟的只读，
-# 却把 agent 逼成「为了换到读权限先随便打一个补丁」——赔进去的是一次 3-6 分钟的测试。
-# 现在改成：把事实告诉它，由它自己决定。唯一的硬闸门是测试次数（见 run_test）。
+# 把事实告诉 agent，由它自己决定；唯一的硬闸门是测试次数（见 run_test）。
 # ==========================================
 def budget_line() -> str:
     """一行预算读数，附在 run_test / patch_and_log 的返回末尾。"""
@@ -244,9 +235,8 @@ def reset_task_state(status: str):
 
 # ==========================================
 # 【run_test 结果回写】每条结论追加一条 test 事件，永不删除
-# 旧实现只保留最新一次测试结果（每次先把所有历史 test_result 清掉），等于删掉了
-# agent 最需要的那条信号：失败数是在收敛还是在发散。现在失败数、详情都留在 work_log 里，
-# get_work_log 会渲染成「上轮 5 个 → 2 个」这种对比，agent 才知道该微调还是该换方向。
+# 失败数和详情都留在 work_log 里，get_work_log 才能渲染「上轮 5 个 → 2 个」这种对比，
+# agent 才知道该微调还是该换方向。
 # ==========================================
 def save_test_result(test_status: str, fail_count=None, detail: str = ""):
     """把最近一次 run_test 的结论追加到 work_log（worklog.test）。
@@ -365,8 +355,6 @@ async def call_tool(name: str, arguments: dict):
         # ---- 是否需要重新 checkout ----
         # 唯一的原则：run_test 只在「明确要求」或「确实是新任务」时重置工作区，
         # 绝不在任务中途悄悄 checkout —— 全量 checkout 要 2-3 分钟，还会把已打好的补丁打回 buggy。
-        # （旧逻辑把 not IS_TASK_INITIALIZED 也算进去，而 reset_task_state 会把这个标志置 False，
-        #   于是超时/中断之后的下一次 run_test 就把补丁冲掉了，现象就是「卡在 run_test 永远同一个报错」。）
         need_checkout = bool(force_checkout)
 
         if not need_checkout:
@@ -421,7 +409,7 @@ async def call_tool(name: str, arguments: dict):
                     setup_res = execute_in_target(setup_cmd, timeout=TEST_TIMEOUT)
                 except subprocess.TimeoutExpired:
                     msg = f"【环境准备超时】setup_cmd 超过 {TEST_TIMEOUT}s 未结束，已放弃本轮。"
-                    # 以前这里只有 save_test_result，日志里看不到任何痕迹，排查时只能人工复现
+                    # 超时原因必须同时进 mcp_server.log 和 work_log，否则事后无法复现
                     logging.error(f"【环境准备超时】{CURRENT_BUG} setup_cmd 超过 {TEST_TIMEOUT}s 未结束")
                     save_test_result("SetupFailed", None, msg)
                     # 工作区可能是半成品：标回未初始化，下次 run_test 重新 checkout
@@ -470,7 +458,7 @@ async def call_tool(name: str, arguments: dict):
                 save_test_result("Timeout", None, f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。")
                 reset_task_state("Timeout")
                 # 超时不能把补丁一起丢掉：保持「已检出 + 已修改」，下一次 run_test 走增量而不是重新 checkout
-                # （START_TIME 兼做就绪标志：重新起算即可，等价于旧代码里把标志置回 True）
+                # （START_TIME 兼做就绪标志：重新起算即可）
                 START_TIME = time.time()
                 return [types.TextContent(type="text", text=f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。" + budget_line(), isError=True)]
 
@@ -530,7 +518,7 @@ async def call_tool(name: str, arguments: dict):
         keyword = arguments.get("keyword")
         pattern = arguments.get("file_pattern", TARGET["source_glob"])
         
-        # 工作区不再按 Defects4J 命名推导，统一用 resolve_bug 解析出来的 CURRENT_WORKDIR
+        # 工作区统一用 resolve_bug 解析出来的 CURRENT_WORKDIR，不按测试工具命名推导
         workdir = CURRENT_WORKDIR
         if not workdir:
             return [types.TextContent(type="text", text="【系统拒绝】还没解析出当前工作区，请先调用 run_test 初始化。", isError=True)]
@@ -733,18 +721,31 @@ async def call_tool(name: str, arguments: dict):
         target_round = arguments.get("target_round")
         if target_round is None:
             return [types.TextContent(type="text", text="参数错误：必须提供 target_round", isError=True)]
+        reasoning = (arguments.get("reasoning") or "").strip()
+        kind = arguments.get("kind") or "deadend"
 
         if not os.path.exists(WORK_JSON_FILE):
             return [types.TextContent(type="text", text=f"当前 Bug（{CURRENT_BUG}）没有历史日志，无需回滚。")]
 
-        restored, broken = _worklog().rollback(target_round)
+        restored, broken = _worklog().rollback(target_round, reasoning=reasoning, kind=kind)
         if not restored:
             return [types.TextContent(type="text", text=f"在第 {target_round} 轮及之后没有找到可用的备份，未改动任何代码和日志。")]
+
+        # 撤销之后轮次必须退回去：否则下一轮的 patch/test 会挂在已被撤销的轮号上，
+        # 下次回滚的 >= target 范围、digest 的「上轮 N → 好转」和 metrics 的 current_round 全会虚高。
+        try:
+            CURRENT_ROUND = max(0, int(target_round) - 1)
+        except (TypeError, ValueError):
+            pass
 
         msg = (
             f"回滚成功！已撤销当前 Bug（{CURRENT_BUG}）第 {target_round} 轮及之后的修改，"
             f"恢复了 {len(set(restored))} 个文件到修改前的状态。"
         )
+        if reasoning:
+            msg += f"\n回滚理由已写入工作日志（kind={kind}）：{reasoning}"
+        else:
+            msg += "\n下次调用 rollback 请传 reasoning，把「探针无效/方向失败」的结论留在日志里，否则被撤销的轮次会连同它的 reasoning 一起进归档，你就再也看不到了。"
         if broken:
             unique_broken = sorted(set(broken))
             msg += f"\n但 {len(unique_broken)} 个文件还原失败（{', '.join(unique_broken)}），请用 read_specific_code 手动检查。"

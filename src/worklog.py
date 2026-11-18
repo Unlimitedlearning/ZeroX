@@ -5,14 +5,11 @@
   event   一条 JSON 事件（patch / test / note），append-only
   round   一轮修复；rollback(to_round) 撤销该轮及之后的全部 patch
 
-为什么长这样（每条都是对旧实现的直接修正）：
-  1. 目标文件的读写通过 io 回调注入。旧实现把 `write_target_file`（Windows→WSL 的
-     「临时文件 + cp」）写死在备份逻辑旁边，导致这套东西只能在 ZeroX 里用；
-     注入之后，本地文件、WSL 工作区、远端容器都能跑同一份代码。
-  2. 事件只能追加。旧实现每次跑完测试就把**所有历史** test_result 清掉只留最新，
-     等于系统主动删掉了 agent 最需要的那条信号：失败数是在收敛还是在发散。
-  3. patch 事件自带 before/after 的 blob 引用。旧实现靠「路径扁平化成 .bak 文件名」
-     恢复，既会撞名，也表达不了「新建文件」；现在 before=null 就是新建，回滚即删除。
+设计取舍：
+  1. 目标文件的读写通过 io 回调注入：本地文件、WSL 工作区、远端容器跑同一份代码。
+  2. 事件只能追加：失败数是在收敛还是在发散，是 agent 真正需要的那条信号，
+     所以 test 事件永不覆盖。
+  3. patch 事件自带 before/after 的 blob 引用：before=null 表示新建文件，回滚即删除。
 
 日志格式（work_log.jsonl，一行一条）。正常路径只追加、永不覆盖写；唯一的例外是
 rollback()：它先把被撤销的事件抄进 human_audit.jsonl，再重写 work_log.jsonl（见下方 rollback）：
@@ -22,6 +19,10 @@ rollback()：它先把被撤销的事件抄进 human_audit.jsonl，再重写 wor
              "added":4,"removed":2}]}
   {"t":"test","ts":"...","round":3,"status":"Failed","fail_count":5,"detail":"..."}
   {"t":"note","ts":"...","text":"..."}
+  {"t":"rollback","ts":"...","target_round":3,"kind":"probe"|"deadend","reasoning":"..."}
+
+rollback 事件故意不带 round 字段：rollback() 重写日志时会丢弃 round >= target 的事件，
+带了 round 的回滚记录会被自己这次回滚删掉，后续更低的 target 也会连带删掉更早的记录。
 """
 import datetime
 import difflib
@@ -107,6 +108,10 @@ def _test_line(event, previous_fail):
     return text
 
 
+# 回滚原因的分类只在渲染时用；kind 本身是自由字符串，别的 agent 可以自定义
+_ROLLBACK_LABELS = {"probe": "探针", "deadend": "方向失败"}
+
+
 class WorkLog:
     """一个目录 = 一个版本库：home 下同时放 log、audit 和 blobs。"""
 
@@ -179,11 +184,15 @@ class WorkLog:
         self._append(event)
         return event
 
-    def rollback(self, to_round):
+    def rollback(self, to_round, reasoning="", kind="deadend"):
         """撤销 >= to_round 的全部 patch，并把被撤销的事件归档到 human_audit.jsonl。
 
         返回 (已恢复文件列表, 还原失败文件列表)。一个文件都没恢复就完全不动日志，
         避免把一次失败的回滚变成一次静默的数据丢失。
+
+        reasoning / kind 给这次回滚留一条「为什么退回来」的记录（探针无效 or 方向失败）：
+        被撤销的那几轮连同它们的 reasoning 一起进了 human_audit.jsonl，agent 之后看不到，
+        所以这条记录必须在重写之后写进幸存的 work_log.jsonl。
         """
         events = self.events()
         dropped = [ev for ev in events if ev["t"] == "patch" and _round_reached(ev.get("round"), to_round)]
@@ -222,6 +231,16 @@ class WorkLog:
         except OSError as err:
             self._warn(f"重写 work_log 失败: {err}")
 
+        # 必须写在重写之后：带 round 的话会被上面的 kept 过滤当成「被撤销的事件」删掉，
+        # 所以只记 target_round —— _round_reached(None, ...) 恒为 False，后续回滚也删不掉它。
+        self._append({
+            "t": "rollback",
+            "ts": _now(),
+            "target_round": to_round,
+            "kind": (kind or "deadend"),
+            "reasoning": (reasoning or "").strip(),
+        })
+
         return restored, broken
 
     # ---------------- 读 ----------------
@@ -258,6 +277,9 @@ class WorkLog:
         for event in events:
             if event["t"] == "patch":
                 groups.append({"round": event.get("round"), "patch": event, "tests": [], "notes": []})
+            elif event["t"] == "rollback":
+                # 回滚独立成组：它撤掉的轮次已经不在日志里了，挂在别的组下面会被读成那一轮的一部分
+                groups.append({"round": None, "patch": None, "tests": [], "notes": [], "rollback": event})
             elif groups:
                 groups[-1]["tests" if event["t"] == "test" else "notes"].append(event)
             else:
@@ -273,14 +295,26 @@ class WorkLog:
                 previous_map[id(event)] = previous
                 previous = event.get("fail_count")
 
+        # 「轮」只数带 patch 的组：开头的笔记和回滚都不是一轮，计进去会把表头抬得比实际高
+        round_count = len([g for g in groups if g.get("patch")])
+        rollback_count = self._count(events, "rollback")
         lines = [
-            f"{who}最近 {len(shown)} 轮记录"
-            f"（共 {len(groups)} 轮 / {self._count(events, 'patch')} 个补丁 / {self._count(events, 'test')} 次测试）"
+            f"{who}最近 {len(shown)} 条记录"
+            f"（共 {round_count} 轮 / {self._count(events, 'patch')} 个补丁 / {self._count(events, 'test')} 次测试"
+            + (f" / {rollback_count} 次回滚" if rollback_count else "")
+            + "）"
         ]
         for group in shown:
             patch = group["patch"]
-            head_event = patch or (group["tests"] or group["notes"] or [{}])[0]
-            head = f"[轮 {group.get('round')}] {_stamp(head_event.get('ts'))}"
+            rollback_event = group.get("rollback")
+            head_event = patch or rollback_event or (group["tests"] or group["notes"] or [{}])[0]
+            if rollback_event:
+                head = f"[回滚] {_stamp(head_event.get('ts'))}"
+            elif group.get("round") is None:
+                # 第一轮之前的笔记/测试没有轮号，别渲染成「轮 None」
+                head = f"[记录] {_stamp(head_event.get('ts'))}"
+            else:
+                head = f"[轮 {group.get('round')}] {_stamp(head_event.get('ts'))}"
             if patch:
                 summary = (patch.get("summary") or "").strip()
                 lines.append(f"{head} {patch.get('status') or 'PATCH'}  {summary}".rstrip())
@@ -290,6 +324,14 @@ class WorkLog:
                     if item.get("after") is not None:
                         delta = f" +{item.get('added', 0)}/-{item.get('removed', 0)}"
                     lines.append(f"        {name}{delta}")
+            elif rollback_event:
+                kind = rollback_event.get("kind") or ""
+                label = _ROLLBACK_LABELS.get(kind, kind or "回滚")
+                why = (rollback_event.get("reasoning") or "").strip()
+                lines.append(
+                    f"{head} 撤销到第 {rollback_event.get('target_round')} 轮（{label}）"
+                    + (f"：{why}" if why else "")
+                )
             else:
                 lines.append(head)
             for event in group["tests"]:
@@ -316,12 +358,14 @@ class WorkLog:
             "tests": self._count(events, "test"),
             "files": len({item.get("path") for ev in events if ev["t"] == "patch"
                           for item in ev.get("files") or []}),
+            "rollbacks": self._count(events, "rollback"),
+            "probe_rollbacks": self._count_rollbacks(events, "probe"),
         }
 
     # ---------------- 内部 ----------------
 
     def _put(self, content):
-        """内容寻址：同样的内容只存一份，路径不再参与命名。"""
+        """内容寻址：文件名只由内容决定，同样的内容只存一份，与路径无关。"""
         digest = hashlib.sha1(content.encode("utf-8")).hexdigest()
         path = os.path.join(self.blob_dir, digest)
         if not os.path.exists(path):
@@ -355,6 +399,12 @@ class WorkLog:
     @staticmethod
     def _count(events, kind):
         return sum(1 for ev in events if ev["t"] == kind)
+
+    @staticmethod
+    def _count_rollbacks(events, rollback_kind):
+        """回滚事件里指定原因的有几条（探针轮 vs 方向失败，指标要分开看）。"""
+        return sum(1 for ev in events
+                   if ev["t"] == "rollback" and ev.get("kind") == rollback_kind)
 
     @staticmethod
     def _warn(message):

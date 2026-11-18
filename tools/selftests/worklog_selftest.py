@@ -43,13 +43,14 @@ def main():
         wl.test(2, "Failed", 2, "2 failing tests ...")
 
         assert os.path.exists(extra), "新建文件应当真的写进去了"
-        assert wl.stats() == {"rounds": 2, "patches": 2, "tests": 2, "files": 2}, wl.stats()
+        assert wl.stats() == {"rounds": 2, "patches": 2, "tests": 2, "files": 2,
+                              "rollbacks": 0, "probe_rollbacks": 0}, wl.stats()
 
         digest = wl.digest(limit=5, title="Demo_1b")
         assert "上轮 5" in digest and "好转 3" in digest, digest
         assert "变差" not in digest, digest
 
-        restored, broken = wl.rollback(1)
+        restored, broken = wl.rollback(1, reasoning="探针确认 indexOfLast 返回首个匹配", kind="probe")
         assert not broken, broken
         assert len(set(restored)) == 2, restored
         with open(target, encoding="utf-8", newline="") as f:
@@ -57,8 +58,25 @@ def main():
         assert not os.path.exists(extra), "第 1 轮新建的文件应被回滚删除"
         assert wl.stats()["patches"] == 0, wl.stats()
 
-        again, _ = wl.rollback(1)
+        # 回滚记录必须活过重写：被撤销的轮次只在 human_audit.jsonl 里，agent 看不到
+        rb_events = [ev for ev in wl.events() if ev["t"] == "rollback"]
+        assert len(rb_events) == 1, rb_events
+        assert rb_events[0]["kind"] == "probe" and rb_events[0]["target_round"] == 1, rb_events[0]
+        assert wl.stats()["rollbacks"] == 1 and wl.stats()["probe_rollbacks"] == 1, wl.stats()
+        digest_after = wl.digest(limit=5, title="Demo_1b")
+        assert "[回滚]" in digest_after and "撤销到第 1 轮（探针）" in digest_after, digest_after
+
+        again, _ = wl.rollback(1, reasoning="重复调用不应再出记录", kind="deadend")
         assert again == [], "没有可回滚的内容时应什么都不做"
+        assert wl.stats()["rollbacks"] == 1, "空回滚不应往日志里添记录"
+
+        # 再回滚一次更低的 target，早先那条回滚记录必须还在（它不带 round，不会被 kept 过滤掉）
+        wl.apply(1, "PATCH_GENERATED", "换个方向", "重写查找", [
+            (target, "line1\nline2\n", "line1\nlineY\n"),
+        ])
+        wl.rollback(1, reasoning="<= 写法还是不对", kind="deadend")
+        assert wl.stats()["rollbacks"] == 2, wl.stats()
+        assert wl.stats()["probe_rollbacks"] == 1, "更早的探针回滚记录不应被第二次回滚删掉"
 
         # 归档必须还在，供人工复盘
         with open(os.path.join(tmp, "logs", "human_audit.jsonl"), encoding="utf-8") as f:

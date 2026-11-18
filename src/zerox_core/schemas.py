@@ -88,16 +88,31 @@ def build_tools():
         ),
         types.Tool(
             name="rollback",
-            description="撤销你的修改。如果发现当前的修复方向完全错误，可以调用此工具回滚。",
+            description=(
+                "撤销你的修改，并把撤销原因记进工作日志。想验证某个值就插一条 System.err.println 探针，"
+                "跑完测试后用 rollback 撤掉；确认某条修复方向错了也用它退回来。"
+                "注意 target_round 是「撤销第 N 轮及之后」，所以撤一条探针就把 N 写成探针那一轮，"
+                "写小了会把前面的真修复一起撤销。reasoning 必填：被撤销的轮次会连同它的 reasoning "
+                "一起归档，你之后看不到了，只有这条 reasoning 会留在存活日志里。"
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "target_round": {
                         "type": "integer",
                         "description": "撤销到第几轮之前。传 1 表示撤销所有修改回到初始状态；传 2 表示撤销第 2 轮及之后的修改，保留第 1 轮。"
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": "为什么撤销：探针验证到了什么、哪条假设被证伪。写清结论，不要写「没用」。"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["probe", "deadend"],
+                        "description": "probe=撤销探针（测试本身仍失败）；deadend=这条修复方向错了。默认 deadend。"
                     }
                 },
-                "required": ["target_round"]
+                "required": ["target_round", "reasoning"]
             }
         ),
         types.Tool(
