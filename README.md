@@ -51,7 +51,7 @@ Environment: **Defects4J 3.0.1** (`v3.0.1-7-g8c16da82`), Java 11, workspace on e
 
 ### 📝 Transcript File
 
-`logs/<bug>/transcript.md` — what the agent itself did, in plain text: its own messages (`AI`), the model's thinking (`think`, when the provider returns `reasoning_content` / `reasoning`), every tool call with the **arguments actually sent** (`call:run_test {…}`), every tool reply (`result:run_test`, truncated to 2000 chars with the original length noted), and a `compact` marker recording how many characters a compaction threw away. It is rewritten when a bug starts.
+`logs/<bug>/transcript.md` — what the agent itself did, in plain text (`<bug>` is the canonical name from `bug_id_template`, so `Lang_1` lands in `logs/Lang_1b/` next to its `work_log.jsonl`): its own messages (`AI`), the model's thinking (`think`, when the provider returns `reasoning_content` / `reasoning`), every tool call with the **arguments actually sent** (`call:run_test {…}`), every tool reply (`result:run_test`, truncated to 2000 chars with the original length noted), and a `compact` marker recording how many characters a compaction threw away. It is rewritten when a bug starts.
 
 It exists because compaction deletes history from the context but not from the record: after the run you can read what the agent was thinking without replaying an LLM window. It is **not** an input to any decision — context compaction is triggered by `agent.compact_context_chars` (characters in `messages`), never by this file's size, which only ever grows.
 

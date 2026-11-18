@@ -66,7 +66,16 @@ DEFAULT_AGENT = {
     # 上下文压缩阈值：整个上下文（system + 对话 + 工具输出）的字符数，到了就压缩一次。
     # 按体量比按轮数准：读代码的轮次几乎不涨上下文，一次 3MB 的测试日志却能一把撑爆窗口。
     # 字符→token 大约 ×3~4（代码/英文），中文接近 1:1，按你的模型窗口估一个就好
-    "compact_context_chars": 120000,
+    "compact_context_chars": 160000,
+    # 连续多少次只读调用（中间没有任何补丁/测试）就强制压缩一次。
+    # 为什么还需要它：读代码几乎不涨上下文，体量阈值永远抓不到「读 18 轮、
+    # 0 个补丁」这种空转（Time_11 压缩时只有 73080 字，差一点就没到）。
+    # 0 或 null = 只按体量压缩。
+    "compact_idle_reads": 20,
+    # 每 N 轮必须写一条 note（工作日志）：到点后本轮的其它调用一律在客户端被拒，
+    # 不花测试预算、只花一轮。note 是唯一「零产出的动作」，光靠 AGENTS.md 的散文规则
+    # 模型一次都不会调（全仓 transcript 实测 0 次）。0 / null = 关闭。
+    "note_every_turns": 8,
     "system_prompt_file": "AGENTS.md",       # 相对项目根目录（src/ 的上一层），也可以写绝对路径
     "user_prompt_template": "Please fix the bug for {bug_id}. Begin by calling run_test with bug_id='{bug_id}'.",
     "fixed_marker": "[FIXED]",               # agent 输出这个标记就算修复成功

@@ -283,8 +283,12 @@ class WorkLog:
             elif groups:
                 groups[-1]["tests" if event["t"] == "test" else "notes"].append(event)
             else:
+                # 头部事件既可能是测试也可能是笔记：两者都要真的写进去，
+                # 否则第一条笔记（通常就写在第一个补丁之前）会被建了空组、内容直接丢掉，
+                # 模型回看时笔记一片空白，就再也不会写第二条了。
                 groups.append({"round": event.get("round"), "patch": None,
-                               "tests": [event] if event["t"] == "test" else [], "notes": []})
+                               "tests": [event] if event["t"] == "test" else [],
+                               "notes": [event] if event["t"] == "note" else []})
 
         shown = groups[-limit:] if isinstance(limit, int) and limit > 0 else groups
 

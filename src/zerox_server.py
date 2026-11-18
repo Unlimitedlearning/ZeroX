@@ -21,6 +21,8 @@ from zerox_core.config import resolve_bug as _resolve_bug
 from zerox_core.exec_env import IS_WINDOWS, execute_in_target, popen_in_target, win_path_to_wsl
 # 外置版本库：work_log 事件流 / blob 快照 / 回滚（独立模块，不依赖本文件任何东西）
 import worklog
+# 判定逻辑只有一份：服务端的「通过前先查有没有动测试」和跑完的事后审计用同一个重放器
+import audit
 
 # ==========================================
 # [全局变量区域]
@@ -143,6 +145,19 @@ def normalize_patch_path(raw_path: str) -> str:
     if workdir and not path.startswith("/"):
         path = f"{workdir}/{path}"
     return posixpath.normpath(path)
+
+
+def run_grep(scope: str, include: str, keyword: str):
+    """在指定目录下 grep 一次，返回 CompletedProcess。
+
+    grep 的 --include 只匹配 basename，带路径的模式必须由调用方先拆开，
+    否则它会静默地一条也搜不到（既不报错也不提示）。
+    """
+    cmd = (
+        f"grep -rn --include={shlex.quote(include)} {shlex.quote(keyword)} "
+        f"{shlex.quote(scope)} 2>/dev/null | head -n 20"
+    )
+    return execute_in_target(cmd)
 
 
 def check_patch_path(wsl_path: str):
@@ -307,6 +322,31 @@ def _worklog():
     if not WORK_JSON_FILE:
         return None
     return worklog.WorkLog(os.path.dirname(WORK_JSON_FILE), io=TargetIO())
+
+
+def patches_touching_tests():
+    """当前存活补丁里动过的测试文件（按 target.audit_test_globs）；分不出测试代码时返回 []。
+
+    为什么要在「判定通过」这一刻查：改测试是伪造通过的唯一手法，而一旦通过了，
+    客户端就会把这个 pass 当成唯一正样本、metrics 也会记 Fixed
+    （Time_11 实测：测试体被换成 assertNotNull(...) 后套件就通过，主代码一个字都没改）。
+
+    判定直接调 audit.audit_events：运行时的闸门和事后审计必须是同一套标准，
+    否则会出现「跑的时候放过了、审计才报违规」这种自相矛盾的结果（且那份逻辑已被
+    tools/selftests/audit_selftest.py 覆盖，不需要在服务端再写一遍）。
+    """
+    globs = _glob_list(TARGET.get("audit_test_globs"))
+    if not globs:
+        return []
+    wl = _worklog()
+    if wl is None:
+        return []
+    try:
+        verdict = audit.audit_events(wl.events(), test_globs=globs)
+    except Exception as err:
+        logging.error(f"检查补丁是否动过测试失败: {str(err)}")
+        return []
+    return sorted(v["path"] for v in verdict.get("violations") or [])
 
 
 server = Server("zerox-server")
@@ -480,6 +520,19 @@ async def call_tool(name: str, arguments: dict):
 
             # 【可配置判定】通过/失败规则来自 config.json 的 target.passed_pattern / failed_pattern
             if PASS_RE.search(content):
+                # 【假通过闸门】通过的前置条件：这次跑的是原始测试。改测试能造出通过，但造不出修复，
+                # 所以只把「原始测试上的通过」当成正样本；被污染的那次会明确要求它先 rollback。
+                dirty = patches_touching_tests()
+                if dirty:
+                    names = "、".join(p.rsplit("/", 1)[-1] for p in dirty)
+                    msg = (
+                        f"【测试通过但不算数】这次通过是在改过的测试文件上跑出来的：{names}。\n"
+                        "改测试能造出通过，但改不出修复。请 rollback 撤销改测试的那几轮，再 run_test："
+                        "在原始测试上通过才算修复。"
+                    )
+                    save_test_result("TaintedPass", 0, msg)
+                    return [types.TextContent(type="text", text=msg)]
+
                 save_test_result("Passed", 0, "【测试全部通过】命中 passed_pattern")
                 reset_task_state("Fixed")
                 return [types.TextContent(type="text", text=f"【测试全部通过】该 Bug 已成功修复！请结束任务并输出 [FIXED]。")]
@@ -500,7 +553,19 @@ async def call_tool(name: str, arguments: dict):
                 count_text = fail_count if fail_count is not None else "若干"
                 fail_msg = f"【测试失败】共 {count_text} 个用例失败。\n以下是报错信息：\n{combined}\n\n请分析并修复。"
                 save_test_result("Failed", fail_count, fail_msg)
-                return [types.TextContent(type="text", text=fail_msg + budget_line())]
+                # L0：D4J 的 test_cmd 只回「哪些用例失败」，断言原文（expected/actual、出错行）
+                # 只在 maven 项目的 target/surefire-reports/ 里；实测 ant 项目（Lang）workspace 的
+                # build/ 下只有 classes 和 tests，没有任何报告文件，所以只给一条路径 + 一次止损。
+                # 提示只进本次返回、不写进 work_log —— 否则 digest 的 1200 字尾部窗口会被提示挤掉真实报错。
+                # 取法是 search_code + read_specific_code，两步都是免费的，不花测试预算。
+                hint = (
+                    "\n\n[提示] 需要断言原文（expected/actual、出错行）时：只有 maven 项目有 —— "
+                    "search_code(keyword='<失败测试的类名>', file_pattern='*.xml')，"
+                    "命中 target/surefire-reports/ 后用 read_specific_code 读含 <failure 的行。"
+                    "搜不到一次就别再找日志（ant 项目的 build/ 下只有 classes 和 tests，没有报告），"
+                    "直接去读失败的测试方法本身。"
+                )
+                return [types.TextContent(type="text", text=fail_msg + hint + budget_line())]
 
             tail_msg = f"最新日志如下（退出码 {exit_code}）:\n{content[-2000:]}"
             save_test_result("Unknown", None, tail_msg)
@@ -516,20 +581,39 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_test 初始化 Bug 环境。", isError=True)]
         
         keyword = arguments.get("keyword")
-        pattern = arguments.get("file_pattern", TARGET["source_glob"])
+        pattern = arguments.get("file_pattern") or TARGET["source_glob"]
         
         # 工作区统一用 resolve_bug 解析出来的 CURRENT_WORKDIR，不按测试工具命名推导
         workdir = CURRENT_WORKDIR
         if not workdir:
             return [types.TextContent(type="text", text="【系统拒绝】还没解析出当前工作区，请先调用 run_test 初始化。", isError=True)]
         
-        cmd = f"grep -rn --include='{pattern}' {shlex.quote(keyword)} {shlex.quote(workdir)} | head -n 20"
-        res = execute_in_target(cmd)
-        
+        # grep 的 --include 只匹配 basename。模型常传 "src/main/java/.../Foo.java" 或
+        # "*tz/*.java" 这种带路径的模式，直接拼进 --include 会静默返回「未找到」，
+        # 模型还会反过来怀疑是自己用错了工具（Time_11 的 turn 12/13 各撞一次）。
+        # 现在把路径拆开：basename 给 --include，不带通配的路径前缀当搜索目录；
+        # 前缀下没有命中就退回整个工作区，并在结果里说明换了范围。
+        include = pattern.rsplit("/", 1)[-1] or TARGET["source_glob"]
+        prefix = pattern.rsplit("/", 1)[0] if "/" in pattern else ""
+        scope = workdir
+        if prefix and "*" not in prefix:
+            scope = posixpath.normpath(
+                prefix if prefix.startswith("/") else posixpath.join(workdir, prefix)
+            )
+
+        res = run_grep(scope, include, keyword)
+        note = ""
+        if not res.stdout.strip() and scope != workdir:
+            res = run_grep(workdir, include, keyword)
+            note = f"\n（{scope} 下没有命中，已改为在整个工作区搜索）"
+
         if res.returncode != 0 or not res.stdout.strip():
-            return [types.TextContent(type="text", text=f"未找到关键字 '{keyword}'。请换个词或直接读取文件。")]
+            return [types.TextContent(type="text", text=(
+                f"未找到关键字 '{keyword}'（过滤条件：--include={include}）。"
+                "请换个词，或直接用 read_specific_code 读取文件。"
+            ))]
             
-        return [types.TextContent(type="text", text=f"搜索结果：\n{res.stdout}")]
+        return [types.TextContent(type="text", text=f"搜索结果：\n{res.stdout}{note}")]
 
     elif name == "read_specific_code":
         READ_CODE_COUNT += 1
@@ -692,6 +776,22 @@ async def call_tool(name: str, arguments: dict):
         TOTAL_ATTEMPTS += 1
         READ_CODE_COUNT = 0
         return [types.TextContent(type="text", text="Patch applied successfully. IMMEDIATELY call run_test to verify. Do NOT speak." + budget_line())]
+
+    elif name == "note":
+        # 只写一条结论，不改代码、不花测试预算：给 agent 一个「压缩前留下思考」的可执行动作。
+        # 它刻意【不】清零 free_streak（客户端也只把 note 当只读工具），否则连续只读就能靠写笔记无限续命。
+        if WORK_JSON_FILE is None:
+            return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_test 初始化当前 Bug 的测试环境。", isError=True)]
+
+        text = (arguments.get("text") or "").strip()
+        if not text:
+            return [types.TextContent(type="text", text="【系统拒绝】text 为空，请写一两句结论。", isError=True)]
+
+        try:
+            _worklog().note(text)
+        except Exception as err:
+            return [types.TextContent(type="text", text=f"记录失败: {str(err)}", isError=True)]
+        return [types.TextContent(type="text", text="已记入工作日志（get_work_log 可回看）。" + budget_line())]
 
     elif name == "get_work_log":
         # 【多 Bug 隔离】只读当前 Bug 的工作日志

@@ -19,7 +19,9 @@
   },
   "agent": {
     "max_tests": 12,
-    "compact_context_chars": 120000,
+    "compact_context_chars": 160000,
+    "compact_idle_reads": 20,
+    "note_every_turns": 8,
     "system_prompt_file": "AGENTS.md",
     "user_prompt_template": "Please fix the Defects4J bug {bug_id}. Begin by calling run_test with bug_id='{bug_id}'.",
     "fixed_marker": "[FIXED]",
