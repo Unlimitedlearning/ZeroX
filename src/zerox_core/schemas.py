@@ -9,7 +9,7 @@ def build_tools():
     return [
         types.Tool(
             name="run_test",
-            description="运行当前测试集的测试并【阻塞等待结果】（命令来自 config.json 的 target）。首次调用会先执行 target.setup_cmd 准备工作区，之后调用只跑 target.test_cmd。返回测试日志和结果。",
+            description="运行当前测试集的测试并【阻塞等待结果】。首次调用会先执行 target.setup_cmd 准备工作区，之后调用只跑 target.test_cmd。返回测试日志和结果。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -32,8 +32,8 @@ def build_tools():
             }
         ),
         types.Tool(
-            name="read_code_from_wsl",
-            description="读取 WSL 里的代码文件内容。支持指定行范围以节省上下文。",
+            name="read_specific_code",
+            description="读取代码文件内容。支持指定行范围。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -53,7 +53,7 @@ def build_tools():
                     "round": {"type": "integer", "description": "第几轮修复"},
                     "status": {"type": "string", "enum": ["ANALYZING", "PATCH_GENERATED", "TEST_FAILED"], "description": "当前状态"},
                     "reasoning": {"type": "string", "description": "你对报错原因的推断（越精炼越好）"},
-                    "fix_summary": {"type": "string", "description": "简明扼要说明你打算怎么改（50字以内）"},
+                    "fix_summary": {"type": "string", "description": "简明扼要说明你的改动（50字以内）"},
                     "changes": {
                         "type": "array",
                         "description": "本轮修改涉及的文件和代码差异列表",
@@ -79,7 +79,7 @@ def build_tools():
         ),
         types.Tool(
             name="get_work_log",
-            description="读取你之前轮次的修复记录，用于回忆你做过哪些修改。",
+            description="读取工作日志，用于回忆。",
             inputSchema={
                 "type": "object",
                 "properties": {"limit": {"type": "integer", "description": "读取最近几轮的日志，默认3"}},
@@ -101,7 +101,7 @@ def build_tools():
             }
         ),
         types.Tool(
-            name="get_file_structure",
+            name="get_file_internal_structure",
             description="获取 Java 文件的代码结构（包含类名和方法名及其起始行号）。在你使用 search_code 找到文件后，强烈建议先调用此工具，再精准定位需要读取的行范围。",
             inputSchema={
                 "type": "object",

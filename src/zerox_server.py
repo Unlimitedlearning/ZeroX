@@ -421,6 +421,8 @@ async def call_tool(name: str, arguments: dict):
                     setup_res = execute_in_target(setup_cmd, timeout=TEST_TIMEOUT)
                 except subprocess.TimeoutExpired:
                     msg = f"【环境准备超时】setup_cmd 超过 {TEST_TIMEOUT}s 未结束，已放弃本轮。"
+                    # 以前这里只有 save_test_result，日志里看不到任何痕迹，排查时只能人工复现
+                    logging.error(f"【环境准备超时】{CURRENT_BUG} setup_cmd 超过 {TEST_TIMEOUT}s 未结束")
                     save_test_result("SetupFailed", None, msg)
                     # 工作区可能是半成品：标回未初始化，下次 run_test 重新 checkout
                     START_TIME = None
@@ -428,6 +430,8 @@ async def call_tool(name: str, arguments: dict):
                 if setup_res.returncode != 0:
                     setup_out = ((setup_res.stdout or "") + (setup_res.stderr or "")).strip()
                     msg = f"【环境准备失败】setup_cmd 退出码 {setup_res.returncode}：\n{setup_out[-2000:]}"
+                    # 同一条道理：失败原文必须进日志，否则 mcp_server.log 里只剩「执行全量 Checkout」的空尾
+                    logging.error(f"【环境准备失败】{CURRENT_BUG} setup_cmd 退出码 {setup_res.returncode}：\n{setup_out[-2000:]}")
                     save_test_result("SetupFailed", None, msg)
                     # 同上：别拿一个损坏的工作区继续跑增量测试
                     START_TIME = None
@@ -539,7 +543,7 @@ async def call_tool(name: str, arguments: dict):
             
         return [types.TextContent(type="text", text=f"搜索结果：\n{res.stdout}")]
 
-    elif name == "read_code_from_wsl":
+    elif name == "read_specific_code":
         READ_CODE_COUNT += 1
         wsl_path = arguments.get("wsl_file_path")
         start_line = arguments.get("start_line")
@@ -570,7 +574,7 @@ async def call_tool(name: str, arguments: dict):
         except Exception as e:
             return [types.TextContent(type="text", text=f"异常: {str(e)}")]
 
-    elif name == "get_file_structure":
+    elif name == "get_file_internal_structure":
         wsl_path = arguments.get("wsl_file_path")
         try:
             # 读出文件内容
@@ -599,10 +603,10 @@ async def call_tool(name: str, arguments: dict):
                         structure_info.append(f"[第 {i+1} 行] 方法: {method_match.group(1)}")
 
             if not structure_info:
-                return [types.TextContent(type="text", text="未在文件中找到明显的类或方法结构，请直接使用 read_code_from_wsl 读取全量代码（不传 start_line），自行分析。")]
+                return [types.TextContent(type="text", text="未在文件中找到明显的类或方法结构，请直接使用 read_specific_code 读取全量代码（不传 start_line），自行分析。")]
             
             # 增加强制信任的提示词
-            header = f"【权威结构索引】文件 {wsl_path} 的真实结构如下。这是系统底层解析的精准行号，请【完全信任】此结果，直接使用 read_code_from_wsl 读取对应行，不要盲目猜行号或读取全量文件：\n"
+            header = f"【权威结构索引】文件 {wsl_path} 的真实结构如下。这是系统底层解析的精准行号，请【完全信任】此结果，直接使用 read_specific_code 读取对应行，不要盲目猜行号或读取全量文件：\n"
 
             return [types.TextContent(type="text", text=f"文件 {wsl_path} 的结构如下：\n" + "\n".join(structure_info))]
             
@@ -691,7 +695,7 @@ async def call_tool(name: str, arguments: dict):
         except worklog.WorkLogError as err:
             msg = f"写入硬盘失败：{err}。已自动还原 {len(err.restored)} 个文件"
             if err.broken:
-                msg += f"，但 {len(err.broken)} 个文件还原失败（{', '.join(err.broken)}），请用 read_code_from_wsl 手动检查"
+                msg += f"，但 {len(err.broken)} 个文件还原失败（{', '.join(err.broken)}），请用 read_specific_code 手动检查"
             msg += "。本轮修改未写入工作日志。"
             return [types.TextContent(type="text", text=msg, isError=True)]
 
@@ -743,7 +747,7 @@ async def call_tool(name: str, arguments: dict):
         )
         if broken:
             unique_broken = sorted(set(broken))
-            msg += f"\n但 {len(unique_broken)} 个文件还原失败（{', '.join(unique_broken)}），请用 read_code_from_wsl 手动检查。"
+            msg += f"\n但 {len(unique_broken)} 个文件还原失败（{', '.join(unique_broken)}），请用 read_specific_code 手动检查。"
         msg += "你可以调用 get_work_log 确认当前的历史状态。"
         return [types.TextContent(type="text", text=msg)]
 
