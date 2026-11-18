@@ -763,22 +763,6 @@ async def call_tool(name: str, arguments: dict):
         READ_CODE_COUNT = 0
         return [types.TextContent(type="text", text="Patch applied successfully. IMMEDIATELY call run_test to verify. Do NOT speak." + budget_line())]
 
-    elif name == "note":
-        # 只写一条结论，不改代码、不花测试预算：给 agent 一个「压缩前留下思考」的可执行动作。
-        # 它刻意【不】清零 free_streak（客户端也只把 note 当只读工具），否则连续只读就能靠写笔记无限续命。
-        if WORK_JSON_FILE is None:
-            return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_test 初始化当前 Bug 的测试环境。", isError=True)]
-
-        text = (arguments.get("text") or "").strip()
-        if not text:
-            return [types.TextContent(type="text", text="【系统拒绝】text 为空，请写一两句结论。", isError=True)]
-
-        try:
-            _worklog().note(text)
-        except Exception as err:
-            return [types.TextContent(type="text", text=f"记录失败: {str(err)}", isError=True)]
-        return [types.TextContent(type="text", text="已记入工作日志（get_work_log 可回看）。" + budget_line())]
-
     elif name == "get_work_log":
         # 【多 Bug 隔离】只读当前 Bug 的工作日志
         if WORK_JSON_FILE is None:

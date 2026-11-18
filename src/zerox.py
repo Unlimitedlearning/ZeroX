@@ -72,11 +72,11 @@ COMPACT_KEEP_MSG_CHARS = 4000
 # 上下文压缩的两个阈值都来自 config.json 的 agent 段落：
 #   compact_context_chars  体量触发（窗口会不会爆）
 #   compact_idle_reads     空转触发（有没有在原地读）
-# 空转触发不再往工具返回里插提醒（实测模型无视，还污染结果）：「小步推进」和
-# 「先用 note 记下结论」写在 AGENTS.md 里常驻。这里只留机制：连续 N 次只读
-# （中间没有任何补丁/测试）就预约两轮之后压缩一次，逼它醒来看 get_work_log。
+# 空转触发不再往工具返回里插提醒（实测模型无视，还污染结果）：「小步推进」写在
+# AGENTS.md 里常驻。这里只留机制：连续 N 次只读（中间没有任何补丁/测试）就预约
+# 两轮之后压缩一次，逼它醒来看 get_work_log。
 # 数值在下面和 COMPACT_CONTEXT_CHARS 一起从 AGENT_CONF 读（这里还没读配置）。
-FREE_TOOLS = {"search_code", "read_specific_code", "get_file_internal_structure", "get_work_log", "note"}
+FREE_TOOLS = {"search_code", "read_specific_code", "get_file_internal_structure", "get_work_log"}
 
 # agent 段落的默认值在 src/zerox_core/config.py 的 DEFAULT_AGENT 里，与 zerox_server.py 共用同一份，
 # 这里不留第二份（两份默认值迟早会漏改一份）。
@@ -118,12 +118,6 @@ COMPACT_CONTEXT_CHARS = int(AGENT_CONF.get("compact_context_chars") or 160000)
 # 必须放在 AGENT_CONF 之后：模块顶部那几行常量还没读配置，不能在那里取字段。
 _idle_reads = AGENT_CONF.get("compact_idle_reads")
 COMPACT_IDLE_READS = int(_idle_reads) if _idle_reads else None
-# 每 N 轮强制写一条 note（agent.note_every_turns；0 / null = 关闭）。
-# 到点那一轮除 note 以外的调用全部在客户端被拒——不是建议，是硬闸门：
-# note 不消耗测试预算也不返回任何信息，靠散文规则它一次都不会调（全仓实测 0 次），
-# 所以只能把「写笔记」变成唯一能过的动作，逼它把诊断落到磁盘上。
-_note_every = AGENT_CONF.get("note_every_turns")
-NOTE_EVERY_TURNS = int(_note_every) if _note_every else None
 FIXED_MARKER = AGENT_CONF["fixed_marker"]
 FAILED_MARKER = AGENT_CONF["failed_marker"]
 client = AsyncOpenAI(
@@ -315,10 +309,6 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     counters = {"patches": 0, "tests": 0, "round": 0}
     # 连续只读调用计数：patch_and_log / run_test / rollback 会把它清零
     free_streak = 0
-    # 距上一条 note 过了几轮：到 NOTE_EVERY_TURNS 就把下一轮锁成「只能写笔记」
-    turns_since_note = 0
-    # 服务端写不进日志的次数：连错两次就放行，否则一个服务端 bug 会把 agent 永久锁死
-    note_failures = 0
     # 「到点强制压缩」的预约（0-based 的 turn 号）：只读 streak 到 COMPACT_IDLE_READS 时
     # 记下 turn+2 —— 下一轮留一轮反应时间，再下一轮顶部执行。写补丁/跑测试会取消它：
     # 已经在推进就不必擦记忆。这样「上下文将截断」才是可兑现的承诺，而不是随轮数漂移的口头警告。
@@ -340,9 +330,6 @@ async def run_single_bug(bug_id: str, session: ClientSession):
         # 按体量触发压缩：读代码的轮次几乎不涨上下文，一次 3MB 的测试日志却能一把撑爆窗口，
         # 所以看的是上下文正文字数，不是轮数。阈值：config.json 的 agent.compact_context_chars
         ctx_chars = context_chars(messages)
-        # 到点强制写笔记：本轮除 note 以外的调用全部在下面被拒（见 NOTE_EVERY_TURNS）
-        turns_since_note += 1
-        note_due = NOTE_EVERY_TURNS is not None and turns_since_note >= NOTE_EVERY_TURNS
         # 两个触发源走同一个入口：体量超阈值，或只读 streak 到点预约（见 COMPACT_IDLE_READS）。
         forced = compact_due_turn is not None and turn >= compact_due_turn
         if turn > 0 and (forced or ctx_chars >= COMPACT_CONTEXT_CHARS):
@@ -370,7 +357,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                         recent_tool_output = content if isinstance(content, str) else str(content)
                         break
             
-            reset_content = "SYSTEM NOTICE: The conversation history has been compacted to save memory. I have kept your most recent turns below. You should immediately call `get_work_log` to review your past attempts (your notes are there too), and then continue fixing."
+            reset_content = "SYSTEM NOTICE: The conversation history has been compacted to save memory. I have kept your most recent turns below. You should immediately call `get_work_log` to review your past attempts (each patch's reasoning and the test trend are there too), and then continue fixing."
             if recent_tool_output:
                 # 只留尾部：测试报错的关键信息都在最后，也能避免单条输出再次撑爆上下文
                 reset_content += "\n\n--- Most recent tool output (tail) ---\n" + recent_tool_output[-COMPACT_TOOL_TAIL_CHARS:]
@@ -439,9 +426,6 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                 })
                 continue # 直接进入下一轮，不用打印乱七八糟的警告了
 
-            # 同一轮可能并行多个调用：只要批里带了 note，本轮就算履约，其余调用照常执行
-            batch_has_note = any(tc.function.name == "note" for tc in response_msg.tool_calls)
-
             for tool_call in response_msg.tool_calls:
                 fn_name = tool_call.function.name
                 print(f"  [{bug_id}] Turn {turn+1} Call: {fn_name}")
@@ -457,26 +441,6 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                     })
                     continue # 直接进入下一轮对话，放弃执行本次工具
 
-                # 【强制写笔记】到点那一轮只放行 note：其它调用原样退回去，不执行、不花测试预算。
-                # 必须回一条 role="tool"，否则 tool_calls 没有配对消息，API 直接 400。
-                if note_due and not batch_has_note and fn_name != "note":
-                    result_text = (
-                        f"【MUST NOTE】You have gone {turns_since_note} turns without writing a note. "
-                        "This turn is reserved for `note`: write your current conclusion in one or two "
-                        "sentences (the most likely root cause, or which path you just ruled out). "
-                        f"Your `{fn_name}` call was rejected and NOT executed — nothing was read, "
-                        "no test was spent. Call `note` now; the next turn is unrestricted."
-                    )
-                    print(f"  📝 [{bug_id}] 第 {turns_since_note} 轮未写笔记，拒绝执行 {fn_name}")
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": fn_name,
-                        "content": result_text
-                    })
-                    append_transcript(bug_id, turn + 1, f"blocked:{fn_name}", result_text)
-                    continue
-                
                 try:
                     # 【单一策略源】服务端只负责执行与记账，不做任何调用去重 / 免费重跑判定；
                     # 客户端也不缓存结果——两边各持一套策略必然打架。
@@ -492,17 +456,6 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                     if fn_name == "run_test":
                         fresh_task = False
                     result_text = "".join([c.text for c in result.content if c.type == "text"])
-
-                    # 笔记写成功了才算履约，下一轮解锁（服务端报错不算，否则一轮空写就能跳过）
-                    if fn_name == "note":
-                        if not getattr(result, "isError", False):
-                            turns_since_note = 0
-                            note_failures = 0
-                        else:
-                            note_failures += 1
-                            if note_failures >= 2:
-                                print(f"  ⚠️ [{bug_id}] note 连续 {note_failures} 次写入失败，解除强制笔记闸门。")
-                                turns_since_note = 0
 
                     if fn_name == "patch_and_log":
                         counters["patches"] += 1

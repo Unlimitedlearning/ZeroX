@@ -72,10 +72,6 @@ DEFAULT_AGENT = {
     # 0 个补丁」这种空转（Time_11 压缩时只有 73080 字，差一点就没到）。
     # 0 或 null = 只按体量压缩。
     "compact_idle_reads": 20,
-    # 每 N 轮必须写一条 note（工作日志）：到点后本轮的其它调用一律在客户端被拒，
-    # 不花测试预算、只花一轮。note 是唯一「零产出的动作」，光靠 AGENTS.md 的散文规则
-    # 模型一次都不会调（全仓 transcript 实测 0 次）。0 / null = 关闭。
-    "note_every_turns": 8,
     "system_prompt_file": "AGENTS.md",       # 相对项目根目录（src/ 的上一层），也可以写绝对路径
     "user_prompt_template": "Please fix the bug for {bug_id}. Begin by calling run_test with bug_id='{bug_id}'.",
     "fixed_marker": "[FIXED]",               # agent 输出这个标记就算修复成功

@@ -2,7 +2,7 @@
 
 三个概念：
   blob    文件内容按 sha1 存一份，和路径无关，天然去重，也不会被同名文件撞掉
-  event   一条 JSON 事件（patch / test / note），append-only
+  event   一条 JSON 事件（patch / test / rollback），append-only
   round   一轮修复；rollback(to_round) 撤销该轮及之后的全部 patch
 
 设计取舍：
@@ -18,7 +18,6 @@ rollback()：它先把被撤销的事件抄进 human_audit.jsonl，再重写 wor
    "files":[{"path":"/ws/src/Foo.java","before":"<sha1>"|null,"after":"<sha1>",
              "added":4,"removed":2}]}
   {"t":"test","ts":"...","round":3,"status":"Failed","fail_count":5,"detail":"..."}
-  {"t":"note","ts":"...","text":"..."}
   {"t":"rollback","ts":"...","target_round":3,"kind":"probe"|"deadend","reasoning":"..."}
 
 rollback 事件故意不带 round 字段：rollback() 重写日志时会丢弃 round >= target 的事件，
@@ -89,6 +88,14 @@ def _round_reached(round_value, target):
 def _stamp(ts):
     """ISO 时间 → HH:MM:SS，digest 里只需要这个精度。"""
     return ts[11:19] if isinstance(ts, str) and len(ts) >= 19 else (ts or "")
+
+
+def _clip(text, limit):
+    """单行截断，保留开头：reasoning 的前半句通常就是假设本身。"""
+    text = str(text or "").strip().replace("\n", " ")
+    if limit and len(text) > limit:
+        return text[:limit] + "…"
+    return text
 
 
 def _test_line(event, previous_fail):
@@ -178,12 +185,6 @@ class WorkLog:
         self._append(event)
         return event
 
-    def note(self, text):
-        """追加一条自由笔记，给 agent 记「为什么推翻上一轮」这类没法写进 patch 的结论。"""
-        event = {"t": "note", "ts": _now(), "text": text}
-        self._append(event)
-        return event
-
     def rollback(self, to_round, reasoning="", kind="deadend"):
         """撤销 >= to_round 的全部 patch，并把被撤销的事件归档到 human_audit.jsonl。
 
@@ -246,10 +247,11 @@ class WorkLog:
     # ---------------- 读 ----------------
 
     def events(self):
-        """按写入顺序读出全部事件；坏行跳过。"""
+        """按写入顺序读出 patch/test/rollback 事件；坏行和已废弃事件跳过。"""
         if not os.path.exists(self.log_path):
             return []
         result = []
+        allowed = {"patch", "test", "rollback"}
         with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
@@ -259,14 +261,15 @@ class WorkLog:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(event, dict) and event.get("t"):
+                if isinstance(event, dict) and event.get("t") in allowed:
                     result.append(event)
         return result
 
-    def digest(self, limit=5, title=None, detail_chars=1200):
-        """给 agent 看的紧凑视图：每轮改了什么、测试怎么变的、还差什么。
+    def digest(self, limit=5, title=None, detail_chars=1200, reasoning_chars=400):
+        """给 agent 看的紧凑视图：每轮改了什么、为什么改、测试怎么变的。
 
         只给摘要，不回放 old/new 全文 —— 那是让模型花钱读自己刚写过的代码。
+        reasoning 是压缩后唯一能找回「当时怎么想」的东西，必须回读。
         """
         events = self.events()
         who = f"当前 Bug（{title}）" if title else ""
@@ -276,19 +279,14 @@ class WorkLog:
         groups = []
         for event in events:
             if event["t"] == "patch":
-                groups.append({"round": event.get("round"), "patch": event, "tests": [], "notes": []})
+                groups.append({"round": event.get("round"), "patch": event, "tests": []})
             elif event["t"] == "rollback":
                 # 回滚独立成组：它撤掉的轮次已经不在日志里了，挂在别的组下面会被读成那一轮的一部分
-                groups.append({"round": None, "patch": None, "tests": [], "notes": [], "rollback": event})
+                groups.append({"round": None, "patch": None, "tests": [], "rollback": event})
             elif groups:
-                groups[-1]["tests" if event["t"] == "test" else "notes"].append(event)
+                groups[-1]["tests"].append(event)
             else:
-                # 头部事件既可能是测试也可能是笔记：两者都要真的写进去，
-                # 否则第一条笔记（通常就写在第一个补丁之前）会被建了空组、内容直接丢掉，
-                # 模型回看时笔记一片空白，就再也不会写第二条了。
-                groups.append({"round": event.get("round"), "patch": None,
-                               "tests": [event] if event["t"] == "test" else [],
-                               "notes": [event] if event["t"] == "note" else []})
+                groups.append({"round": event.get("round"), "patch": None, "tests": [event]})
 
         shown = groups[-limit:] if isinstance(limit, int) and limit > 0 else groups
 
@@ -299,7 +297,7 @@ class WorkLog:
                 previous_map[id(event)] = previous
                 previous = event.get("fail_count")
 
-        # 「轮」只数带 patch 的组：开头的笔记和回滚都不是一轮，计进去会把表头抬得比实际高
+        # 「轮」只数带 patch 的组：回滚和开头的孤立测试都不是一轮，计进去会把表头抬得比实际高
         round_count = len([g for g in groups if g.get("patch")])
         rollback_count = self._count(events, "rollback")
         lines = [
@@ -308,20 +306,31 @@ class WorkLog:
             + (f" / {rollback_count} 次回滚" if rollback_count else "")
             + "）"
         ]
+        # 压缩后第一眼要看的不是「改了哪些行」，而是「当时为什么这么改」。
+        # 取最后一条存活 patch（回滚掉的已被 rollback 从 events 里删掉），再在下面按轮展开。
+        latest_patch = next((ev for ev in reversed(events) if ev["t"] == "patch"), None)
+        if latest_patch and reasoning_chars:
+            # 顶部只放短版，完整 reasoning 在下面对应轮次里，避免每次读日志都重复一遍
+            why = _clip(latest_patch.get("reasoning"), min(160, reasoning_chars))
+            if why:
+                lines.append(f"当前推断（轮 {latest_patch.get('round')}）：{why}")
         for group in shown:
             patch = group["patch"]
             rollback_event = group.get("rollback")
-            head_event = patch or rollback_event or (group["tests"] or group["notes"] or [{}])[0]
+            head_event = patch or rollback_event or (group["tests"] or [{}])[0]
             if rollback_event:
                 head = f"[回滚] {_stamp(head_event.get('ts'))}"
             elif group.get("round") is None:
-                # 第一轮之前的笔记/测试没有轮号，别渲染成「轮 None」
+                # 第一轮之前的测试没有轮号，别渲染成「轮 None」
                 head = f"[记录] {_stamp(head_event.get('ts'))}"
             else:
                 head = f"[轮 {group.get('round')}] {_stamp(head_event.get('ts'))}"
             if patch:
                 summary = (patch.get("summary") or "").strip()
                 lines.append(f"{head} {patch.get('status') or 'PATCH'}  {summary}".rstrip())
+                why = _clip(patch.get("reasoning"), reasoning_chars)
+                if why:
+                    lines.append(f"        推断：{why}")
                 for item in patch.get("files") or []:
                     name = str(item.get("path") or "").replace("\\", "/").rsplit("/", 1)[-1]
                     delta = ""
@@ -331,17 +340,16 @@ class WorkLog:
             elif rollback_event:
                 kind = rollback_event.get("kind") or ""
                 label = _ROLLBACK_LABELS.get(kind, kind or "回滚")
-                why = (rollback_event.get("reasoning") or "").strip()
                 lines.append(
                     f"{head} 撤销到第 {rollback_event.get('target_round')} 轮（{label}）"
-                    + (f"：{why}" if why else "")
                 )
+                why = _clip(rollback_event.get("reasoning"), reasoning_chars)
+                if why:
+                    lines.append(f"        推断：{why}")
             else:
                 lines.append(head)
             for event in group["tests"]:
                 lines.append("        " + _test_line(event, previous_map.get(id(event))))
-            for event in group["notes"]:
-                lines.append(f"        笔记：{event.get('text')}")
 
         latest = [ev for ev in events if ev["t"] == "test"]
         if latest and detail_chars:

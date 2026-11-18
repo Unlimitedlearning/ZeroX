@@ -116,22 +116,6 @@ def build_tools():
             }
         ),
         types.Tool(
-            name="note",
-            description=(
-                "记一条结论到工作日志：不改代码、不花测试预算。"
-                "用来写「现在最可能的根因」「为什么排除上一轮那条路」这类还落不成补丁的判断。"
-                "上下文会被压缩且不事先通知，没写下来的推理会直接消失；"
-                "get_work_log 以后也能看到这些笔记。注意：写笔记不算推进，不会解除连续只读计数。"
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "要记住的结论，一两句，不要抄代码"}
-                },
-                "required": ["text"]
-            }
-        ),
-        types.Tool(
             name="get_file_internal_structure",
             description="获取 Java 文件的代码结构（包含类名和方法名及其起始行号）。在你使用 search_code 找到文件后，强烈建议先调用此工具，再精准定位需要读取的行范围。",
             inputSchema={

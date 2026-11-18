@@ -49,6 +49,9 @@ def main():
         digest = wl.digest(limit=5, title="Demo_1b")
         assert "上轮 5" in digest and "好转 3" in digest, digest
         assert "变差" not in digest, digest
+        # 压缩后要靠 reasoning 找回「当时为什么改」，不能只看到改了哪些行
+        assert "边界判断错了" in digest and "换个方向" in digest, digest
+        assert "当前推断（轮 2）" in digest, digest
 
         restored, broken = wl.rollback(1, reasoning="探针确认 indexOfLast 返回首个匹配", kind="probe")
         assert not broken, broken
