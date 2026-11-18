@@ -27,7 +27,7 @@ import subprocess
 import sys
 from datetime import datetime
 
-# 与 src/zerox.py 的 metrics 行对齐：审计版本变了，旧结论就不要混着用
+# 审计规则一变就 +1；版本号同时写进 metrics 行，否则同一份日志里的结论分不清按哪版规则得出
 AUDIT_VERSION = 1
 
 AUDIT_LOG_NAME = "audit.jsonl"
@@ -76,8 +76,8 @@ def audit_events(events, test_globs=None):
       * test 事件的数量与最后一条的状态（用于报告复现成本）
     不给 events 也能跑（返回 clean + 0 补丁），方便历史 run 缺日志时对账。
     空列表（config 里写 `"audit_test_globs": []`）表示「本项目分不出测试代码」，
-    那就什么都不断定。默认值只有一份，在 zerox_core/config.py 的 DEFAULT_TARGET 里 ——
-    这里不再留第二份兜底副本：两份默认值迟早会不一致，而审计标准不一致比没有标准更糟。
+    默认值只有一份，在 zerox_core/config.py 的 DEFAULT_TARGET 里：两份默认值迟早会不一致，
+    而审计标准不一致比没有标准更糟。
     """
     globs = [str(g).strip() for g in (test_globs or []) if str(g).strip()]
 

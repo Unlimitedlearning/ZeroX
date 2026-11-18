@@ -41,13 +41,19 @@ Environment: **Defects4J 3.0.1** (`v3.0.1-7-g8c16da82`), Java 11, workspace on e
 | Field | Meaning |
 | :--- | :--- |
 | `bug_id` / `bug_id_requested` | Both hold the id you put in `benchmark_bugs` (e.g. `Lang_1`). The log directory on disk uses the canonical name (`Lang_1b`), so `audit.py` maps `Lang_1` → `Lang_1b` itself |
-| `status` | One of `Fixed` / `Failed` / `Error` / `MaxTurns` — `Fixed` means `run_test` reported all tests passing and the agent stopped; `MaxTurns` means it ran out of `agent.max_turns` without converging |
+| `status` | One of `Fixed` / `Failed` / `Error` — `Fixed` means `run_test` reported all tests passing and the agent stopped. The old `MaxTurns` state is gone with `agent.max_turns`: turns are not a convergence condition, the test budget is |
 | `total_time_seconds` | Wall-clock time for the whole bug |
 | `prompt_tokens` / `completion_tokens` / `total_tokens` | Token usage summed over every LLM call of that bug |
 | `api_calls` / `turns` | Number of LLM requests / conversation turns consumed |
 | `tests` / `total_attempts` / `current_round` | Test executions (the budget unit), `patch_and_log` **calls** (a rejected call still counts — see `Time_4` above), highest round reached |
 | `audit` / `audit_violations` | Post-hoc verdict from `audit.py`: `clean` or `invalid`, plus the paths that make it invalid |
 | `audit_version` | Version of the audit rules that produced that verdict (`audit.AUDIT_VERSION`) — bump it when the rules change, so older rows stay identifiable in the same file |
+
+### 📝 Transcript File
+
+`logs/<bug>/transcript.md` — what the agent itself did, in plain text: its own messages (`AI`), the model's thinking (`think`, when the provider returns `reasoning_content` / `reasoning`), every tool call with the **arguments actually sent** (`call:run_test {…}`), every tool reply (`result:run_test`, truncated to 2000 chars with the original length noted), and a `compact` marker recording how many characters a compaction threw away. It is rewritten when a bug starts.
+
+It exists because compaction deletes history from the context but not from the record: after the run you can read what the agent was thinking without replaying an LLM window. It is **not** an input to any decision — context compaction is triggered by `agent.compact_context_chars` (characters in `messages`), never by this file's size, which only ever grows.
 
 ## 📦 Benchmark Suite (BENCH30)
 
@@ -278,7 +284,7 @@ Because the verdict is derived from the append-only log, it can be replayed over
 | Key | Meaning |
 | :--- | :--- |
 | `max_tests` | Max `run_test` executions per bug (server side); the only hard budget |
-| `max_turns` | Max LLM turns per bug (client side) |
+| `compact_context_chars` | Context size (characters, not tokens) that triggers one history compaction — replacing the old "every 20 turns" rule, which compacted too late on a huge test log and too early on cheap read-only turns |
 | `system_prompt_file` | Prompt file, relative to the project root (absolute also works) |
 | `user_prompt_template` | First user message; `{bug_id}` is substituted |
 | `fixed_marker` / `failed_marker` | Strings the agent must output to end the task; keep them consistent with `AGENTS.md` |

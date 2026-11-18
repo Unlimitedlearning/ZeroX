@@ -3,8 +3,8 @@
     python src/zerox.py                       # 跑 config.json 里的 benchmark_bugs
     python src/zerox.py --config case/config.json
 
-本文件原来叫 run_benchmark.py。它不是「基准测试脚本」，而是 Agent 本体：
-循环、预算外账、指标都在这层（服务端看不到 token，也看不到终态）。
+本文件是 Agent 本体，不是「基准测试脚本」：循环、预算外账、指标都在这层
+（服务端看不到 token，也看不到终态）。
 """
 import asyncio
 import json
@@ -61,8 +61,14 @@ METRICS_FILE = os.path.join(LOG_DIR, "benchmark_metrics.jsonl")
 # 上下文压缩时保留的工具输出尾部长度（防止单条输出又把上下文撑爆）
 COMPACT_TOOL_TAIL_CHARS = 6000
 
-# agent 段落的默认值已经合并到 src/zerox_core/config.py 的 DEFAULT_AGENT，与 zerox_server.py 共用同一份，
-# 不再在这里维护第二份（两份默认值迟早会漏改一份）。
+# 连续只读调用的提醒：读代码免费，但读不完的代码不会变成修复。
+# 连续 FREE_CALL_NUDGE_AFTER 次只读调用（中间没有任何 patch_and_log / run_test）后，
+# 就在工具返回末尾加一条提醒，之后每次只读都加，直到出现补丁或测试才清零。
+FREE_CALL_NUDGE_AFTER = 6
+FREE_TOOLS = {"search_code", "read_specific_code", "get_file_internal_structure", "get_work_log"}
+
+# agent 段落的默认值在 src/zerox_core/config.py 的 DEFAULT_AGENT 里，与 zerox_server.py 共用同一份，
+# 这里不留第二份（两份默认值迟早会漏改一份）。
 # 注意：服务端只读 max_tests，客户端读剩下那几个；要改默认行为请改 config.json 的 agent 段落。
 
 
@@ -94,7 +100,9 @@ if api_key.startswith("${") and api_key.endswith("}"):
     api_key = os.getenv(api_key[2:-1])
 
 BUGS_TO_TEST = CONFIG.get("benchmark_bugs", ["Lang_1"])
-MAX_TURNS = AGENT_CONF["max_turns"]
+# 轮次没有上限：收敛的硬闸门是服务端的 max_tests（见 run_single_bug 的循环）
+# 上下文超过这么多字符就压缩（阈值写在 config.json 的 agent.compact_context_chars）
+COMPACT_CONTEXT_CHARS = int(AGENT_CONF.get("compact_context_chars") or 120000)
 FIXED_MARKER = AGENT_CONF["fixed_marker"]
 FAILED_MARKER = AGENT_CONF["failed_marker"]
 # 服务端 run_test 命中 passed_pattern 时返回的第一句话。
@@ -131,6 +139,81 @@ def append_metric(metric: dict):
     except OSError as e:
         print(f"  ⚠️ 写入指标文件失败: {e}")
 
+
+def transcript_path(bug_id: str) -> str:
+    """每个 bug 一份人类可读的对话记录：logs/<bug>/transcript.md。"""
+    return os.path.join(LOG_DIR, bug_id, "transcript.md")
+
+
+def reset_transcript(bug_id: str):
+    """每个 bug 开跑时重写一份（与服务端 checkout 时清空 work_log 同一时机）。"""
+    path = transcript_path(bug_id)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# {bug_id} agent transcript\n\n开始时间：{datetime.now().isoformat(timespec='seconds')}\n")
+    except OSError as err:
+        print(f"  ⚠️ [{bug_id}] 建 transcript 失败: {err}")
+
+
+def append_transcript(bug_id: str, turn: int, tag: str, text: str, limit: int = 2000):
+    """把一轮的 AI 输出 / 工具调用 / 工具结果追加进 transcript.md。
+
+    只给人复盘用：压缩会把上下文里的历史丢掉，而这里留着一份可读流水。
+    它【不】参与压缩判定 —— 只增不删的文件大小反映不了「当前上下文有多大」。
+    """
+    if not text:
+        return
+    body = text if len(text) <= limit else text[:limit] + f"\n…（截断，原长 {len(text)} 字）"
+    try:
+        with open(transcript_path(bug_id), "a", encoding="utf-8") as f:
+            f.write(f"\n### turn {turn} · {datetime.now().strftime('%H:%M:%S')} · {tag}\n\n{body}\n")
+    except OSError as err:
+        print(f"  ⚠️ [{bug_id}] 写 transcript 失败: {err}")
+
+
+def reasoning_text(msg) -> str:
+    """取出模型自己吐的思考内容（不同 provider 字段名不同，取不到就返回空）。
+
+    只写进 transcript.md 留档，【绝不能】回填进 messages：DeepSeek 的 reasoner 类模型
+    明确禁止把 reasoning_content 再发回去（400）。所以它也不计入 context_chars。
+    """
+    extra = msg.get("model_extra") if isinstance(msg, dict) else getattr(msg, "model_extra", None)
+    for name in ("reasoning_content", "reasoning"):
+        value = msg.get(name) if isinstance(msg, dict) else getattr(msg, name, None)
+        if not value and isinstance(extra, dict):
+            value = extra.get(name)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def context_chars(messages) -> int:
+    """当前上下文里所有消息正文 + 工具参数的字符数（不是 token，也不是日志文件大小）。
+
+    为什么不用 transcript.md 的大小当触发条件：那份文件只增不删，压缩之后它不会变小，
+    一次压缩后就再也不会触发第二次，除非额外记一个「上次压缩时的 offset」。
+    直接数 messages 没有这个问题，也不依赖磁盘。
+    """
+    total = 0
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
+        if isinstance(content, str):
+            total += len(content)
+        elif content is not None:
+            total += len(str(content))
+        # tool_calls 的参数（patch 的 diff 之类）同样占上下文，不能漏
+        calls = msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None)
+        for call in calls or []:
+            fn = call.get("function") if isinstance(call, dict) else getattr(call, "function", None)
+            if fn is None:
+                continue
+            args = fn.get("arguments") if isinstance(fn, dict) else getattr(fn, "arguments", "")
+            if args:
+                total += len(str(args))
+    return total
+
+
 async def run_single_bug(bug_id: str, session: ClientSession):
     print(f"\n" + "="*50)
     print(f"🚀 开始测试 Bug: {bug_id}")
@@ -140,6 +223,10 @@ async def run_single_bug(bug_id: str, session: ClientSession):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": AGENT_CONF["user_prompt_template"].replace("{bug_id}", bug_id)}
     ]
+
+    # 每个 bug 一份可读流水：AI 说了什么、调了什么、工具回了什么。
+    # 压缩会丢掉上下文里的历史，但这份文件留着，复盘时不用去翻 LLM 的 window。
+    reset_transcript(bug_id)
     
     mcp_tools = await session.list_tools()
     openai_tools = []
@@ -155,21 +242,30 @@ async def run_single_bug(bug_id: str, session: ClientSession):
 
     start_time = time.time()
     usage_totals = {"prompt": 0, "completion": 0, "total": 0, "calls": 0, "turns": 0}
-    # 服务端不再把自己的日志再吐一遍让客户端用正则解析：补丁数/轮次/测试次数
-    # 由客户端在循环里自己数（它就在现场），token 也只有它知道
+    # 补丁数/轮次/测试次数由客户端在循环里自己数（它就在现场），token 也只有它知道，
+    # 所以服务端不重吐日志、客户端也不解析它的日志
     counters = {"patches": 0, "tests": 0, "round": 0}
-    # 终态只有四种：Fixed / Failed / Error / MaxTurns。
-    # 跑到 max_turns 仍未收敛就是 MaxTurns，不再和超时、失败混用同一个字符串。
-    final_status = "MaxTurns"
+    # 连续只读调用计数：patch_and_log / run_test / rollback 会把它清零
+    free_streak = 0
+    # 终态只有三种：Fixed / Failed / Error，兜底值是 Error
+    # 出口只有三个：「测试通过」「明确失败」「异常」
+    final_status = "Error"
     # 【指标完整性】只在服务端真的报过「测试全部通过」后，才承认 agent 的 [FIXED]
     saw_passing_test = False
     # 本 bug 的第一次 run_test 显式声明全量 checkout（任务边界由客户端决定，见下方注入）
     fresh_task = True
 
-    for turn in range(MAX_TURNS):
+    # 轮次没有上限：硬闸门是服务端的测试预算，用光时 run_test 返回【任务失败】把循环逼出去。
+    # 只读轮次不消耗预算，所以纯只读的循环（一次测试都不跑）只能人工中断。
+    turn = -1
+    while True:
+        turn += 1
 
-        if turn > 0 and turn % 20 == 0:
-            print(f"  ✂️ [{bug_id}] 触发上下文压缩！清理历史冗余对话，逼迫 AI 读取工作日志...")
+        # 按体量触发压缩：读代码的轮次几乎不涨上下文，一次 3MB 的测试日志却能一把撑爆窗口，
+        # 所以看的是上下文正文字数，不是轮数。阈值：config.json 的 agent.compact_context_chars
+        ctx_chars = context_chars(messages)
+        if turn > 0 and ctx_chars >= COMPACT_CONTEXT_CHARS:
+            print(f"  ✂️ [{bug_id}] 上下文已达 {ctx_chars} 字（阈值 {COMPACT_CONTEXT_CHARS}），触发压缩！清理历史冗余对话，逼迫 AI 读取工作日志...")
             
             # 保留 System Prompt
             system_prompt = messages[0]
@@ -196,6 +292,9 @@ async def run_single_bug(bug_id: str, session: ClientSession):
             # 🚨 绝不能把 role="tool" 的消息单独留下：tool 消息必须紧跟在带 tool_calls 的 assistant 消息之后，
             #    否则 API 直接 400（Messages with role 'tool' must be a response to a preceding message with 'tool_calls'）
             messages = [system_prompt, reset_prompt]
+            append_transcript(bug_id, turn + 1, "compact",
+                              f"上下文 {ctx_chars} 字 → {context_chars(messages)} 字，历史已丢弃；"
+                              f"保留最近一次工具输出尾 {COMPACT_TOOL_TAIL_CHARS} 字")
             # 注意：因为现在 messages 最后一条是 user，符合 API 规范，AI 收到后必须回复（大概率会去调 get_work_log）
 
         try:
@@ -219,6 +318,9 @@ async def run_single_bug(bug_id: str, session: ClientSession):
 
             # 安全提取文本（解决了 UnboundLocalError）
             text = response_msg.content.strip() if response_msg.content else ""
+            # 模型自己的思考过程（deepseek-flash 一般没有，reasoner 类才有）
+            append_transcript(bug_id, turn + 1, "think", reasoning_text(response_msg), limit=4000)
+            append_transcript(bug_id, turn + 1, "AI", text)
 
             # 如果 AI 输出了文本，简单打印并检查是否通关
             if text:
@@ -247,7 +349,6 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                 fn_name = tool_call.function.name
                 print(f"  [{bug_id}] Turn {turn+1} Call: {fn_name}")
 
-                # 删掉 try 外面那一行原生的 json.loads！！！
                 try:
                     fn_args = json.loads(tool_call.function.arguments)
                 except json.JSONDecodeError as e:
@@ -261,13 +362,16 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                     continue # 直接进入下一轮对话，放弃执行本次工具
                 
                 try:
-                    # 【单一策略源】服务端只负责执行与记账，不再做任何调用去重 / 免费重跑判定；
+                    # 【单一策略源】服务端只负责执行与记账，不做任何调用去重 / 免费重跑判定；
                     # 客户端也不缓存结果——两边各持一套策略必然打架。
                     # 新任务的第一跑由客户端显式传 force_checkout：服务端从不自己决定「重置工作区」，
                     # 所以也不会在任务中途把已经打好的补丁冲掉。
                     if fn_name == "run_test" and fresh_task:
                         fn_args["force_checkout"] = True
 
+                    # 留档写在注入之后：记录的是实际发出去的那份参数
+                    append_transcript(bug_id, turn + 1, f"call:{fn_name}",
+                                      json.dumps(fn_args, ensure_ascii=False))
                     result = await session.call_tool(fn_name, arguments=fn_args)
                     if fn_name == "run_test":
                         fresh_task = False
@@ -280,6 +384,18 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                             counters["round"] = max(counters["round"], called_round)
                     elif fn_name == "run_test":
                         counters["tests"] += 1
+
+                    # 只读调用连续计次：到阈值就在返回末尾加提醒（只加后缀，不改原有内容）
+                    if fn_name in FREE_TOOLS:
+                        free_streak += 1
+                        if free_streak >= FREE_CALL_NUDGE_AFTER:
+                            result_text += (
+                                f"\n\n[提醒] 你已经连续 {free_streak} 次只读调用，中间没有任何补丁。"
+                                "读代码不推进修复：把当前推断写成最小补丁，用 patch_and_log 记录。"
+                                "确实还缺信息时才继续读。"
+                            )
+                    else:
+                        free_streak = 0
 
                     # 服务端只在 passed_pattern 命中后才会回这句话，是唯一的正样本信号
                     if fn_name == "run_test" and PASSED_RESULT_MARKER in result_text:
@@ -299,6 +415,9 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                     "name": fn_name,
                     "content": result_text
                 })
+
+                # 工具返回同样是「AI 看到的东西」，一起留档（内部按 limit 截断）
+                append_transcript(bug_id, turn + 1, f"result:{fn_name}", result_text)
             
             if final_status in ("Fixed", "Failed"):
                 break
@@ -356,8 +475,8 @@ async def main():
                     "total_attempts": patches,
                     "tests": counters["tests"],
                     "audit": verdict.get("audit"),
-                    # 判定规则是会调的东西：审计版本号写进每行指标，否则改了标准以后
-                    # 同一份 benchmark_metrics.jsonl 里新旧结论分不清（audit.jsonl 里本来就有）
+                    # 判定规则是会变的东西：审计版本号写进每行指标，否则改了标准以后
+                    # 同一份 benchmark_metrics.jsonl 里的结论分不清按哪版规则得出
                     "audit_version": getattr(audit, "AUDIT_VERSION", None),
                     "audit_violations": [v["path"] for v in verdict.get("violations") or []],
                 })

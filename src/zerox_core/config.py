@@ -46,8 +46,8 @@ DEFAULT_TARGET = {
     # 判定「测试失败」的规则：count = 失败数，detail = 详细堆栈（两个命名分组都可以省略）
     "failed_pattern": r"Failing tests:\s*(?P<count>[1-9]\d*)(?P<detail>[\s\S]*)",
     # ---- 路径约束：运行时只拦「写不进当前工作区」的 patch ----
-    # 白名单/黑名单默认都空 = 不限制改哪个文件（往期默认只能改 src/main/java，
-    # 结果连 src/main/java/... 这种相对路径都被拒掉）。想收紧再填，fnmatch 语法。
+    # 白名单/黑名单默认都空 = 不限制改哪个文件。想收紧再填，fnmatch 语法；
+    # 注意模型常给 src/main/java/... 这类相对路径，规则要能匹配上。
     "patch_allow_globs": [],
     # 命中即拒绝，优先级高于白名单（例如不许改测试数据的备份文件）
     "patch_deny_globs": [],
@@ -63,7 +63,10 @@ DEFAULT_AGENT = {
     "max_tests": 12,
     # ---- 以下是客户端（src/zerox.py）的开关，服务端不读 ----
     # 都是「要经常微调」的默认值：真正生效的值请写在 config.json 的 agent 段落里，这里只是兑底
-    "max_turns": 100,                        # 客户端单个 bug 的最大对话轮数
+    # 上下文压缩阈值：整个上下文（system + 对话 + 工具输出）的字符数，到了就压缩一次。
+    # 按体量比按轮数准：读代码的轮次几乎不涨上下文，一次 3MB 的测试日志却能一把撑爆窗口。
+    # 字符→token 大约 ×3~4（代码/英文），中文接近 1:1，按你的模型窗口估一个就好
+    "compact_context_chars": 120000,
     "system_prompt_file": "AGENTS.md",       # 相对项目根目录（src/ 的上一层），也可以写绝对路径
     "user_prompt_template": "Please fix the bug for {bug_id}. Begin by calling run_test with bug_id='{bug_id}'.",
     "fixed_marker": "[FIXED]",               # agent 输出这个标记就算修复成功
