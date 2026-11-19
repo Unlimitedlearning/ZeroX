@@ -90,7 +90,7 @@ FREE_TOOLS = {"search_code", "read_specific_code", "get_file_internal_structure"
 
 # agent 段落的默认值在 src/zerox_core/config.py 的 DEFAULT_AGENT 里，与 zerox_server.py 共用同一份，
 # 这里不留第二份（两份默认值迟早会漏改一份）。
-# 注意：服务端只读 max_tests，客户端读剩下那几个；要改默认行为请改 config.json 的 agent 段落。
+# 注意：服务端只读 max_tests，客户端读剩下那几个；默认行为的修改入口是 config.json 的 agent 段落。
 
 
 def resolve_path(path: str) -> str:
@@ -115,7 +115,7 @@ AUDIT_TEST_GLOBS = TARGET_CONF.get("audit_test_globs")
 # 读取客户端超时
 CLIENT_TIMEOUT = CONFIG.get("timeouts", {}).get("llm_client", 360.0)
 
-# 兼容环境变量读取（如果你在 config 里写了 ${DEEPSEEK_API_KEY}）
+# 兼容环境变量读取（config 中填入 ${DEEPSEEK_API_KEY} 时解析为对应环境变量）
 api_key = LLM_CONF["api_key"]
 if api_key.startswith("${") and api_key.endswith("}"):
     api_key = os.getenv(api_key[2:-1])
