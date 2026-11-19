@@ -1,232 +1,289 @@
+# ZeroX：基于 MCP 的轻量级程序修复智能体
 
-# ZeroX: A Lightweight APR Agent via MCP
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+## 项目概述
 
-**ZeroX** (Zero Errors) is a lightweight Automated Program Repair (APR) agent based on the MCP (Model Context Protocol) and Nanobot framework. It is designed to solve the "Context Explosion" and infinite loop issues found in traditional APR agents (like RepairAgent) during long-running repair cycles.
+ZeroX 是一个基于模型上下文协议（MCP）的轻量级自动程序修复（APR）实验框架。项目将工具链缩减至 7 个，要求智能体将推理过程写入外部工作日志 `work_log.jsonl`。该日志在每轮被重建为一份常驻的「活状态卡」，使上下文压缩后的恢复不依赖智能体主动读取历史。
 
-By combining a minimalist toolchain, stateful external logging, and search-augmented localization, ZeroX achieves robust bug fixing with extreme token efficiency.
+有必要首先说明本项目的定位：
 
-## 💡 Core Innovations (The "Agentless" Philosophy)
+- **本项目未提出新的修复算法。** 原子化修改、回滚与事后审计等机制在既有智能体和版本控制工具中已广泛存在，不构成创新点。
+- **本文不声称达到当前最优水平。** 下文报告的 5/5 结果基于 5 个样本、单一难度层级、单一模型及 `temperature=0` 的配置，属于初步观察，不足以支撑对修复率的一般化结论。
+- **本项目的定位是一个可配置、可开关功能的对照实验平台。** 通过修改配置、运行批量缺陷并比较指标，观察各组件的独立作用。
 
-1. **Minimalist Toolchain & Stateful Logging**: By discarding massive native tool libraries, ZeroX keeps only 7 core MCP tools. The agent's reasoning process is forced into an external `work_log.jsonl`, achieving extreme context compression. The log is an **append-only event stream** (`patch` / `test` / `rollback`) owned by a standalone `worklog.py` (the single rewrite is `rollback()`, which archives the dropped events to `human_audit.jsonl` first): test outcomes are never overwritten, so `get_work_log` can hand back a compact digest — what each round changed, **why it was changed** (the reasoning you wrote), and whether the failure count is converging (`上轮 5 个 → 2 个`) — instead of replaying full `old/new` diffs. After a context compaction **within one run** the agent recovers its diagnosis from that digest instead of wasting a turn on a meaningless test run. The log is *not* a cross-process checkpoint — see **Limitations** for what happens on a restart or crash.
-2. **Atomic Patch Operations & Blocking Verification**: Through `patch_and_log`, the LLM is strictly forced to output `old/new` diffs rather than full code. Every write goes through `worklog.py`, which stores the before/after content as content-addressed blobs and applies a round atomically — if any file fails, all of them are restored. The `run_test` tool acts as a blocking function that automatically waits for execution to finish and returns parsed logs, eliminating useless polling.
-3. **Emergent Self-Healing under Minimalist Tools**: Facing missing static metadata, the agent spontaneously exhibits advanced debugging behavior: autonomously injecting diagnostic probes into test/production code, writing runtime variables to temporary files, and cleaning them up. This proves that under a non-polluted context, a lightweight LLM possesses powerful emergent abilities. (Solidified into SOP in `AGENTS.md`).
-4. **Nudge Theory & Asymmetric Memory Architecture**: Rollback means a clean slate for the AI (Preventing Context Poisoning), while all discarded patches and failed trajectories are strictly preserved in `human_audit.jsonl` for human researchers. This provides an untainted exploration space for the LLM while offering invaluable data for Error Analysis.
+项目目标是保持实现精简、状态外置、边界清晰，以便持续改善可靠性。
 
-## 📊 Experimental Results (Defects4J Benchmark)
+## 设计取舍
 
-Environment: **Defects4J 3.0.1** (`v3.0.1-7-g8c16da82`), Java 11, workspace on ext4, DeepSeek `deepseek-flash` at `temperature=0`. Every row comes from `benchmark_metrics.jsonl`; `Audit` is `python src/audit.py`, `Verified` is `python src/audit.py --verify`. Batch `logs/archive/20261118-133109` holds the setup-verification run, the current batch holds the rest.
+以下各条为工程实现层面的取舍，并非提出新的方法范式。
 
-| Bug ID | Status | Time (s) | Tokens | In / Out | Turns | Patch calls | Tests | Audit | Verified |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Chart_1b** | ✅ Fixed | 34.75 | 46.8K | 45,365 / 1,392 | 11 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
-| **Lang_43b** | ✅ Fixed | 82.35 | 57.4K | 51,433 / 5,965 | 8 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
-| **Lang_51b** | ✅ Fixed | 34.82 | 27.0K | 25,917 / 1,103 | 7 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
-| **Lang_60b** | ✅ Fixed | 41.98 | 37.9K | 36,565 / 1,329 | 10 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
-| **Time_4b** | ✅ Fixed | 83.78 | 112.1K | 100,745 / 11,318 | 10 | 2 | 2 | `clean` | ✅ `Verified Fixed` |
+**1. 工具精简与状态外置。** 仅保留 7 个 MCP 工具，强制智能体将推理过程写入 `work_log.jsonl`。该日志为 `patch` / `test` / `rollback` 三类事件的 append-only 流，由独立的 `worklog.py` 模块维护；唯一的重写操作是 `rollback()`，且其在重写前先将所丢弃的事件归档至 `human_audit.jsonl`。测试结果从不被覆盖，因此日志能够给出紧凑摘要：每一轮修改了什么、**修改理由**（由智能体写入）、失败数量是否呈收敛趋势（例如 `上轮 5 个 → 2 个`），而无需回放完整的 `old/new` 差异。上下文恢复的具体机制见下一节；需要强调，该恢复仅发生在同一进程内，并非跨进程检查点，进程重启的行为见「局限性」一节。
 
-> **5/5 Fixed · 5/5 `clean` · 5/5 `Verified Fixed`.** Every bug converged in one round and two test executions — the 12-test budget was never approached, and wall time is 35–84s. `Verified Fixed` means `audit.py --verify` restored the test files, re-ran the suite and it passed again, i.e. no fix leans on an edited test.
+**2. 带事务的补丁写入。** `patch_and_log` 要求大型语言模型输出 `old/new` 差异，而非完整代码。每次写入均经由 `worklog.py` 执行：修改前后的内容以内容寻址方式存为 blob，一轮中的所有文件共同提交，任一文件写入失败时全部还原。`run_test` 为阻塞调用，待测试执行完毕后返回解析结果，从而避免无效的轮询。
+
+**3. 回滚：清空上下文并保留历史。** 回滚对模型而言意味着清空上下文，以避免受既往失败轨迹干扰；被丢弃的补丁与失败轨迹则保存于 `human_audit.jsonl`，供人工分析。该机制属于上下文管理策略，不涉及新的方法设计。
+
+**4. 观察到的自主调试现象。** 在缺少静态元数据的条件下，观察到智能体会向测试代码或生产代码中插入诊断探针、将运行时变量写入临时文件并在随后清理。该现象仅在个别执行轨迹中出现，不足以据此推断轻量级模型具备更强的涌现能力。我们将其整理为 `AGENTS.md` 中的操作建议，以便复用。
+
+**5. 上下文策略：常驻活状态卡 + 价值裁剪。** 上下文管理分三层，目标是让恢复不依赖「智能体记得去读日志」这一软约束：
+
+- **活状态卡（L1）**：一条常驻于对话开头的 `system` 消息，每轮请求前都从 `work_log` 重建（内容为当前推断、失败数趋势、已排除方向），长度有上限（代码常量 `COMPACT_BRIEF_CHARS`）。它随每轮更新，压缩时也显式保留，因此智能体每一轮都带着最新状态，无需主动调用 `get_work_log` 来回忆。
+- **价值裁剪（L2）**：上下文超过 `compact_context_chars` 或连续只读达到 `compact_idle_reads` 时触发压缩。压缩不再按「最近 N 轮」一刀切，而是保留最近若干轮与最近若干个**决策轮**（`patch_and_log` / `run_test` / `rollback`），优先丢弃纯搜索与读代码的闲聊轮——早期写在 `reasoning` 里的关键假设因此得以保留。裁剪始终在 `assistant` 消息边界切分，避免产生孤立的 `tool` 消息导致接口报错。超长的工具输出与补丁参数会被对称截断（补丁参数以合法 JSON 占位，防止半截 JSON 被接口拒绝）。
+- **完整日志（L3）**：`work_log.jsonl` 保持不变；`get_work_log` 由必读降级为可选，仅在活状态卡不足以覆盖所需细节时调用。
+
+上述状态来自工具调用的参数与结果，不产生额外的大模型开销。所有恢复均发生在同一进程内，详见「局限性」一节。
+
+## 初步实验（Defects4J）
+
+实验环境：Defects4J 3.0.1（`v3.0.1-7-g8c16da82`）、Java 11、工作区位于 ext4、模型为 DeepSeek `deepseek-flash`、`temperature=0`。下表数据来自 `benchmark_metrics.jsonl`；`审计` 列为 `python src/audit.py` 的输出，`验证` 列为 `python src/audit.py --verify` 的输出。批次 `logs/archive/20261118-133109` 为环境搭建期间的验证运行，当前批次为其余结果。
+
+| 缺陷编号         | 状态      | 耗时（秒） | Tokens | 入 / 出            | 轮数 | 补丁调用 | 测试次数 | 审计      | 验证                 |
+| :----------- | :------ | :---- | :----- | :--------------- | :- | :--- | :--- | :------ | :----------------- |
+| **Chart_1b** | ✅ Fixed | 34.75 | 46.8K  | 45,365 / 1,392   | 11 | 1    | 2    | `clean` | ✅ `Verified Fixed` |
+| **Lang_43b** | ✅ Fixed | 82.35 | 57.4K  | 51,433 / 5,965   | 8  | 1    | 2    | `clean` | ✅ `Verified Fixed` |
+| **Lang_51b** | ✅ Fixed | 34.82 | 27.0K  | 25,917 / 1,103   | 7  | 1    | 2    | `clean` | ✅ `Verified Fixed` |
+| **Lang_60b** | ✅ Fixed | 41.98 | 37.9K  | 36,565 / 1,329   | 10 | 1    | 2    | `clean` | ✅ `Verified Fixed` |
+| **Time_4b**  | ✅ Fixed | 83.78 | 112.1K | 100,745 / 11,318 | 10 | 2    | 2    | `clean` | ✅ `Verified Fixed` |
+
+> **5/5 Fixed · 5/5 `clean` · 5/5 `Verified Fixed`。** 每个缺陷均在一轮内收敛、执行两次测试，未触及 12 次测试的预算上限，耗时为 35–84 秒。`Verified Fixed` 表示 `audit.py --verify` 恢复测试文件并重新运行测试后仍然通过，即修复未依赖对测试文件的修改。
 >
-> `Patch calls` counts `patch_and_log` **requests**, which is what the client sees. `Time_4` needed two: its first call never landed (the server logged `累计 1 次修改` and `work_log.jsonl` holds a single `patch` event), so one call was rejected and retried. The audit's own `补丁 N` is the applied count — report both if the distinction matters.
+> 限于样本规模与难度分布，上述结果不应作为修复率的依据。
 >
-> Coverage caveat before this goes anywhere near a paper: all five bugs build with **ant** (`Lang`, `Chart`, `Time`). The maven chain (`Csv`, `Compress`) has not been exercised yet, and 5/5 at tier-B difficulty is a small sample — repeat before quoting a rate.
+> `补丁调用` 统计的是客户端观察到的 `patch_and_log` **请求次数**。`Time_4` 的取值为 2：首次请求未落地（服务端记录 `累计 1 次修改`，`work_log.jsonl` 中仅有一个 `patch` 事件），故有一次请求被拒绝后重试。审计输出中的 `补丁 N` 为实际生效次数；如需区分，应同时报告两者。
 >
-> The same `Chart_1` took **658s** / 30.7K tokens / 9 turns when its workspace sat on a Windows drive (`/mnt/d`), with the same `Fixed` + `clean` verdict: wall time follows the filesystem (19×), token and turn counts follow the trajectory — only `Status` and `Audit` are stable across environments.
+> 在开展进一步研究之前，需注意以下覆盖问题：五个缺陷均使用 **ant** 构建（Lang、Chart、Time），maven 构建链（Csv、Compress）尚未测试；且 tier-B 难度的 5/5 样本量较小，需在扩大样本后重新评估。
+>
+> 对于同一 `Chart_1` 缺陷，当工作区位于 Windows 盘（`/mnt/d`）时，耗时为 **658 秒** / 30.7K tokens / 9 轮，判定结果同为 `Fixed` + `clean`。可见墙钟时间主要受文件系统影响（相差 19 倍），token 用量与轮数取决于执行轨迹；在不同环境下保持稳定的只有 `Status` 与 `Audit` 两项。
 
-### 📈 Metrics File
+### 指标文件
 
-`logs/benchmark_metrics.jsonl` — one JSON line per finished bug, appended by `src/zerox.py` (the agent) after every run (including crashes and timeouts). The server cannot record this itself: token usage is only visible to the side that calls the LLM.
+`logs/benchmark_metrics.jsonl` —— 每个已结束的缺陷对应一行 JSON 记录，由 `src/zerox.py`（客户端）追加写入，包括崩溃和超时的运行。该记录无法由服务端生成，因为 token 用量仅对调用大型语言模型的一方可见。
 
-| Field | Meaning |
-| :--- | :--- |
-| `bug_id` / `bug_id_requested` | Both hold the id you put in `benchmark_bugs` (e.g. `Lang_1`). The log directory on disk uses the canonical name (`Lang_1b`), so `audit.py` maps `Lang_1` → `Lang_1b` itself |
-| `status` | One of `Fixed` / `Failed` / `Error` — `Fixed` means `run_test` reported all tests passing and the agent stopped. The old `MaxTurns` state is gone with `agent.max_turns`: turns are not a convergence condition, the test budget is |
-| `total_time_seconds` | Wall-clock time for the whole bug |
-| `prompt_tokens` / `completion_tokens` / `total_tokens` | Token usage summed over every LLM call of that bug |
-| `api_calls` / `turns` | Number of LLM requests / conversation turns consumed |
-| `tests` / `total_attempts` / `current_round` | Test executions (the budget unit), `patch_and_log` **calls** (a rejected call still counts — see `Time_4` above), highest round reached |
-| `audit` / `audit_violations` | Post-hoc verdict from `audit.py`: `clean` or `invalid`, plus the paths that make it invalid |
-| `audit_version` | Version of the audit rules that produced that verdict (`audit.AUDIT_VERSION`) — bump it when the rules change, so older rows stay identifiable in the same file |
+| 字段                                                     | 含义                                                                                                                              |
+| :----------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------ |
+| `bug_id` / `bug_id_requested`                          | 均为 `benchmark_bugs` 中配置的标识符（如 `Lang_1`）。磁盘日志目录使用规范名称（`Lang_1b`），`audit.py` 会自行完成 `Lang_1` → `Lang_1b` 的映射                       |
+| `status`                                               | 取值为 `Fixed` / `Failed` / `Error`。`Fixed` 表示 `run_test` 报告全部测试通过且智能体停止。此前的 `MaxTurns` 状态已随 `agent.max_turns` 一同移除：收敛条件为测试预算，而非轮数 |
+| `total_time_seconds`                                   | 该缺陷的端到端墙钟时间                                                                                                                     |
+| `prompt_tokens` / `completion_tokens` / `total_tokens` | 该缺陷所有大模型调用的 token 用量之和                                                                                                          |
+| `api_calls` / `turns`                                  | 大模型请求次数 / 对话轮数                                                                                                                  |
+| `tests` / `total_attempts` / `current_round`           | 测试执行次数（预算单位）、`patch_and_log` **调用次数**（被拒绝的调用亦计数，参见上文 `Time_4`）、达到的最高轮次                                                          |
+| `audit` / `audit_violations`                           | `audit.py` 的事后判定：`clean` 或 `invalid`，以及导致 `invalid` 的路径                                                                         |
+| `audit_version`                                        | 生成该判定的审计规则版本（`audit.AUDIT_VERSION`）。规则变更时应递增版本号，以保证同一文件中旧记录的可识别性                                                                |
 
-### 📝 Transcript File
+### 执行记录文件
 
-`logs/<bug>/transcript.md` — what the agent itself did, in plain text (`<bug>` is the canonical name from `bug_id_template`, so `Lang_1` lands in `logs/Lang_1b/` next to its `work_log.jsonl`): its own messages (`AI`), the model's thinking (`think`, when the provider returns `reasoning_content` / `reasoning`), every tool call with the **arguments actually sent** (`call:run_test {…}`), every tool reply (`result:run_test`, truncated to 2000 chars with the original length noted), and a `compact` marker recording how many characters a compaction threw away. It is rewritten when a bug starts.
+`logs/<bug>/transcript.md` —— 以纯文本记录智能体的执行过程（`<bug>` 为 `bug_id_template` 生成的规范名称，因此 `Lang_1` 对应 `logs/Lang_1b/`，与同一缺陷的 `work_log.jsonl` 并列存放）。内容包括：智能体自身的消息（`AI`）、模型思考过程（`think`，当服务提供方返回 `reasoning_content` / `reasoning` 时）、每次工具调用及**实际发送的参数**（`call:run_test {…}`）、每次工具响应（`result:run_test`，截断至 2000 字符并注明原始长度），以及记录压缩所丢弃字符数的 `compact` 标记。每个缺陷开始时该文件会被重写。
 
-It exists because compaction deletes history from the context but not from the record: after the run you can read what the agent was thinking without replaying an LLM window. It is **not** an input to any decision — context compaction is triggered by `agent.compact_context_chars` (characters in `messages`), never by this file's size, which only ever grows.
+该文件存在的意义在于：上下文压缩会从对话历史中删除信息，但不会从记录中删除。运行结束后，可在不重放大模型上下文窗口的情况下查阅智能体当时的推理过程。该文件**不作为任何决策的输入**：上下文压缩由 `agent.compact_context_chars`（`messages` 的字符数）触发，与此文件的大小无关，后者只单调增长。
 
-## 📦 Benchmark Suite (BENCH30)
+## 基准测试集（BENCH30）
 
-`config.example.json` ships a public 30-bug Defects4J subset — 8 projects, three difficulty tiers — intended as a cheap, repeatable sanity sweep before spending hours on the full benchmark. The `benchmark_bugs` array in that file is the canonical list; it is the only copy you need to reproduce a run.
+`config.example.json` 附带一份公开的 Defects4J 子集，包含 30 个缺陷、8 个项目、三个难度层级，用于以较低成本开展可重复的冒烟测试。该文件中的 `benchmark_bugs` 数组为权威列表，复现实验仅需此一份配置。
 
-### Reproduce
+### 复现步骤
 
 ```bash
-cp config.example.json config.json   # then set target.tool_path + target.workspace_root
+cp config.example.json config.json   # 然后设置 target.tool_path + target.workspace_root
 export DEEPSEEK_API_KEY=...
 python src/zerox.py
 ```
 
-Everything machine-specific lives in `config.json` (`tool_path`, `workspace_root`, credentials) and is git-ignored; nothing else needs editing. `src/zerox.py` calls the model with `temperature=0`, so runs are near-deterministic — residual variation comes from provider-side batching, which is why the reporting section below still asks for repeats.
+所有与机器相关的配置（包括 `tool_path`、`workspace_root` 和凭证）均存放于 `config.json`，且已被 git 忽略，无需修改其他文件。`src/zerox.py` 以 `temperature=0` 调用模型，运行结果接近确定性；残余波动来源于服务提供方的批处理机制，因此下文仍建议开展重复实验。
 
-Built and verified against **Defects4J 3.0.1** (`v3.0.1-7-g8c16da82`, Java 11 required), whose bug-id ranges are Lang 1–65, Math 1–106, Chart 1–26, Time 1–27, Compress 1–47, Codec 1–18, Csv 1–16, Cli 1–40. Lang 18/25/48, Time 21 and Cli 6 do not exist upstream and are never referenced.
+项目基于 **Defects4J 3.0.1**（`v3.0.1-7-g8c16da82`，需要 Java 11）构建和验证，缺陷范围为 Lang 1–65、Math 1–106、Chart 1–26、Time 1–27、Compress 1–47、Codec 1–18、Csv 1–16、Cli 1–40。Lang 18/25/48、Time 21 与 Cli 6 在上游不存在，不会被引用。
 
-Setting it up takes ~10 minutes (`init.sh` pulls a 600 MB project bundle plus the Major / EvoSuite / Randoop jars). One manual step is needed on any machine: the `commons-csv` repository inside the official bundle ships CRLF blobs, so Defects4J's own `git apply` fails on `Csv_*` checkouts unless whitespace checking is off —
+环境搭建约需 10 分钟（`init.sh` 会下载 600 MB 的项目包以及 Major / EvoSuite / Randoop 的 jar 文件）。在任何环境中均需手动执行以下步骤：官方包中的 `commons-csv` 仓库包含 CRLF blob，除非关闭空白检查，否则 Defects4J 自身的 `git apply` 无法完成 `Csv_*` 的检出——
 
 ```bash
 git config --global apply.ignoreWhitespace change
 ```
 
-ZeroX itself is unaffected (the server normalizes `\r\n` before diffing and before matching `old_str`), but Defects4J cannot check out `Csv_*` without that setting.
+ZeroX 本身不受该设置影响：服务端在执行差异比较和匹配 `old_str` 之前会归一化 `\r\n`。但不设置该项，Defects4J 无法检出 `Csv_*`。
 
-### The 30 bugs
+### 30 个缺陷
 
-| Tier | Intent | Bugs |
-| :--- | :--- | :--- |
-| **A — floor probes** (8) | single-class, 1–5 line fixes. If this tier does not go ≥6/8, the toolchain or the prompt is broken — not the bug | `Lang_1` `Lang_4` `Lang_10` `Csv_1` `Codec_5` `Codec_11` `Cli_5` `Cli_13` |
-| **B — main battleground** (14) | needs cross-method tracing or an invariant; the real repair rate shows up here (30–70% is a healthy spread) | `Lang_43` `Lang_51` `Lang_60` `Chart_1` `Chart_13` `Chart_26` `Time_4` `Time_11` `Time_19` `Csv_9` `Compress_7` `Compress_25` `Compress_38` `Cli_28` |
-| **C — stress** (8) | numerical semantics and binary formats; 0–2/8 is a normal outcome | `Math_2` `Math_30` `Math_63` `Math_70` `Math_73` `Math_95` `Time_14` `Compress_45` |
+| 层级                 | 设计意图                                          | 缺陷                                                                                                                                                   |
+| :----------------- | :-------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **A — 底线探测**（8）    | 单类、1–5 行修复。若该层级低于 ≥6/8，应首先排查工具链或提示词，而非归因于缺陷本身 | `Lang_1` `Lang_4` `Lang_10` `Csv_1` `Codec_5` `Codec_11` `Cli_5` `Cli_13`                                                                            |
+| **B — 主要评估区间**（14） | 需要跨方法追踪或特定不变量；真实修复率主要体现在该层级（30–70% 属正常区间）     | `Lang_43` `Lang_51` `Lang_60` `Chart_1` `Chart_13` `Chart_26` `Time_4` `Time_11` `Time_19` `Csv_9` `Compress_7` `Compress_25` `Compress_38` `Cli_28` |
+| **C — 压力测试**（8）    | 数值语义与二进制格式；0–2/8 属正常结果                        | `Math_2` `Math_30` `Math_63` `Math_70` `Math_73` `Math_95` `Time_14` `Compress_45`                                                                   |
 
-Tiering is a **prior** based on project and patch size, not ground truth. Calibrate it against the metadata before trusting it (`defects4j` on `PATH`):
+分层是基于项目规模和补丁大小的**先验判断**，并非事实标签。采信该分层前，应先依据元数据校准（`defects4j` 需位于 `PATH` 中）：
 
 ```bash
-defects4j info -p Lang -b 1     # modified classes / methods
-defects4j bids -p Time         # bug ids that actually exist
+defects4j info -p Lang -b 1     # 查看修改的类与方法
+defects4j bids -p Time         # 列出实际存在的缺陷编号
 ```
 
-### Deliberately excluded
+### 有意排除的项目
 
-Closure, JacksonDatabind, Mockito and Gson. Single-bug test time (Closure takes minutes per test even on ext4), JDK sensitivity (Mockito) and very large suites would dominate a 30-bug sweep while injecting environment noise into the sample. They belong to a second phase.
+Closure、JacksonDatabind、Mockito 和 Gson。单缺陷测试耗时（Closure 即使在 ext4 上每次测试也需数分钟）、JDK 敏感性（Mockito）以及过大的测试集会显著拖慢 30 个缺陷的扫描，并向样本引入环境噪声。这些项目留待第二阶段处理。
 
-### What to report
+### 建议报告的内容
 
-1. `logs/benchmark_metrics.jsonl` — one line per finished bug (`status`, tokens, rounds, wall time).
-2. **plausible vs correct** — "all tests pass" is a plausible patch, not a correct one. Cross-check against the developer patch (`revision.id.fixed` in `defects4j/framework/projects/<Project>/active-bugs.csv`), and run `python src/audit.py --verify` to replay every finished bug with its test files restored: that re-run is what `Verified Fixed` means.
-3. **variance** — LLMs are non-deterministic; repeat each bug ≥3 times and report mean ± std.
-4. **per-tier and per-project rates** — one aggregate number hides everything interesting.
+1. `logs/benchmark_metrics.jsonl` —— 每个已结束缺陷一行，包含 `status`、token 用量、轮数和墙钟时间。
+2. **plausible 与 correct 的区分** —— 全部测试通过仅表示补丁为 plausible，不等同于 correct。需与开发者补丁对照（`defects4j/framework/projects/<Project>/active-bugs.csv` 中的 `revision.id.fixed`），并运行 `python src/audit.py --verify`，对每个已结束缺陷在恢复测试文件后重放测试：重放通过方可称为 `Verified Fixed`。
+3. **方差** —— 大型语言模型具有不确定性，每个缺陷应至少重复 3 次，报告均值 ± 标准差。
+4. **分层与分项目比率** —— 单一汇总数字会掩盖关键信息。
 
-`logs/benchmark_metrics.jsonl`, `logs/audit.jsonl` and `logs/<bug>/human_audit.jsonl` are the only files under `logs/` that git tracks, so published numbers stay auditable without committing every scratch log. If tier C suddenly scores far above the literature, run `python src/audit.py` and read the `invalid` rows before celebrating.
+`logs/` 目录下 git 仅跟踪 `logs/benchmark_metrics.jsonl`、`logs/audit.jsonl` 和 `logs/<bug>/human_audit.jsonl`，从而保证已发布数字可审计，同时避免提交全部临时日志。若 tier C 的结果显著高于文献值，应先运行 `python src/audit.py` 并检查 `invalid` 记录，再作进一步解读。
 
-## 📁 Directory Structure
+## 目录结构
 
 ```text
 ZeroX/
-├── .gitignore              # Ignore venv, __pycache__, logs, the real config and one-off tmp scripts
-├── README.md               # Project documentation
-├── AGENTS.md               # System prompt: tools, budget, workflow (Core Asset)
-├── config.example.json     # Template for configuration
-├── src/                    # All ZeroX code
-├── src/zerox.py            # Agent entry point: LLM loop, budget accounting, metrics (the only writer)
-├── src/zerox_server.py     # MCP Server: the 7 tools that touch the workspace
-├── src/zerox_core/         # Package: config defaults + validation, tool schemas, command executor
-├── src/worklog.py          # Standalone version-control module (blobs + append-only events + rollback)
-├── src/audit.py            # Post-hoc audit: Fixed vs Verified Fixed, no runtime edit restrictions
-├── case/                   # Defects4J-free Java case: config.json + pristine/ + work/ (git-ignored)
-├── tools/                  # new_run.py (archive a batch), show_setup_cmd.py (render a config's commands)
-├── tools/selftests/        # Offline selftests (worklog, audit): no WSL, no Defects4J
-├── logs/                   # Runtime logs, work logs, blob store, and benchmark metrics
+├── .gitignore              # 忽略 venv、__pycache__、logs、真实配置和本地草稿区
+├── local/                  # 本地草稿区：调试 / 实验 / 临时产物，整目录被 git 忽略
+├── README.md               # 本文档
+├── AGENTS.md               # 系统提示词：工具、预算、工作流（核心资产）
+├── config.example.json     # 配置模板
+├── requirements.txt        # 固定版本的运行依赖
+├── src/                    # 全部代码
+├── src/zerox.py            # 智能体入口：大模型循环、预算记账、指标（唯一写入方）
+├── src/zerox_server.py     # MCP 服务端：访问工作区的 7 个工具
+├── src/zerox_core/         # 包：配置默认值与校验、工具 schema、命令执行
+├── src/worklog.py          # 独立版本控制模块（blob + append-only 事件 + 回滚）
+├── src/audit.py            # 事后审计：Fixed 与 Verified Fixed，运行时不修改文件
+├── case/                   # 不依赖 Defects4J 的 Java 单文件样例：config.json + pristine/ + work/
+├── tools/                  # new_run.py（归档批次）、show_setup_cmd.py（渲染配置中的命令）
+├── tools/selftests/        # 离线自测（路径、worklog、审计），无需 WSL 和 Defects4J
+├── logs/                   # 运行日志、工作日志、blob 存储及基准指标
 ```
 
-## 🚀 Quick Start
+## 快速开始
 
-**1. Requirements & Installation**
-Ensure you have Python 3.10+ and an MCP-compatible client (like Claude Desktop, Cursor, or Nanobot).
+**1. 依赖与安装**
+
+需要 Python 3.10+ 以及兼容 MCP 的客户端（如 Claude Desktop、Cursor 或 Nanobot）。建议使用项目本地虚拟环境，使 ZeroX 的依赖与其他工具隔离：
+
 ```bash
-pip install mcp openai
+# Windows
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements.txt
+
+# macOS / Linux
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-**2. Configuration**
-Copy the template and fill in your absolute paths and LLM API keys:
+依赖版本固定于 `requirements.txt`（已在 Python 3.11.9 上验证）。下述所有 `python ...` 命令均在激活后的环境中执行。
+
+**2. 配置**
+
+复制模板，填入实际绝对路径和大型语言模型凭证：
+
 ```bash
 cp config.example.json config.json
 ```
-*(Note: Supports both Windows WSL and native Linux environments).*
 
-**3. Run the MCP Server**
+（同时支持 Windows WSL 和原生 Linux 环境。）
+
+`config.json` 已在 `.gitignore` 中忽略，含本机绝对路径或 API 凭证的配置文件不应提交。若需为单台机器保留本地设置（例如本地模型端点），可另存为 `config.local.json` 并使用 `--config` 指定，该类文件同样被忽略：
+
+```bash
+python src/zerox.py --config config.local.json
+```
+
+配置中的 `llm_config.base_url` 支持 OpenAI 兼容端点。将 `base_url` 指向本地推理服务（如 Ollama 的 `http://localhost:11434/v1`）即可接入本地模型；由于代码会直接读取 `api_key` 字段，本地服务无需真实密钥时填任意占位值（如 `"ollama"`）即可。需要注意，工具调用能力取决于模型本身：实测本地 4B 级模型能稳定调用工具，但未能修复本项目的真实缺陷，详见「局限性」一节。
+
+调试脚本、实验数据等本机产物统一放入 `local/`（例如一次复测的源码与日志放 `local/<实验名>/`）。该目录已被 `.gitignore` 整体忽略，提交时无需逐一检查。
+
+**3. 启动 MCP 服务端**
+
 ```bash
 python src/zerox_server.py
 ```
 
-**4. Automated Benchmark Testing**
-To run the batch testing script (which spawns the MCP client and interacts with the LLM automatically):
+**4. 批量测试**
+
+批量脚本会启动 MCP 客户端并自动与大型语言模型交互：
+
 ```bash
 python src/zerox.py
 ```
-To run the bundled single-file case instead of Defects4J, point the script at its config (`--config` is forwarded to the server via `ZEROX_CONFIG`, so both sides read the same file; relative paths are resolved against the project root, next to this README):
+
+若要运行自带的单文件样例而非 Defects4J，可将脚本指向对应配置（`--config` 会通过 `ZEROX_CONFIG` 转发给服务端，确保两侧读取同一份配置；相对路径按项目根目录解析，即本 README 所在目录）：
+
 ```bash
 python src/zerox.py --config case/config.json
 python src/audit.py --config case/config.json
 ```
 
-Before each new batch, archive the previous batch instead of letting the numbers mix — `python tools/new_run.py` moves everything under `logs/` into `logs/archive/<timestamp>/` (keeping a `manifest.json`), clears `__pycache__`, and prints the bug list it is about to run. The archived batch stays auditable: `python src/audit.py --logs logs/archive/<timestamp>`.
+每批运行前应归档上一批，避免数据混淆：`python tools/new_run.py` 会将 `logs/` 下全部内容移至 `logs/archive/<timestamp>/`（并生成 `manifest.json`），清除 `__pycache__`，并打印即将运行的缺陷列表。归档批次仍可审计：`python src/audit.py --logs logs/archive/<timestamp>`。
 
-**5. Bundled Single-File Case (`case/`)**
-A self-testing Java program that exercises the same toolchain without Defects4J — one test run takes seconds and needs no checkout at all, so it is the fastest regression check for any change to the tools:
+**5. 单文件样例（`case/`）**
+
+该样例为一个自带测试的 Java 程序，使用同一套工具链但不依赖 Defects4J —— 单次测试仅需数秒且无需检出，是修改工具后最快捷的回归检查：
 
 ```text
 case/
-├── config.json               # target.workspace_root = "work" (relative, no absolute paths in the repo)
-├── pristine/List_999.java    # the baseline; the agent never sees this directory
-└── work/List_999/            # the workspace: recreated by setup_cmd, git-ignored
+├── config.json               # target.workspace_root = "work"（相对路径，仓库中不含绝对路径）
+├── pristine/List_999.java    # 基线文件；智能体不可见
+└── work/List_999/            # 工作区：由 setup_cmd 重建，git 忽略
 ```
 
-- `pristine/List_999.java` — a `SortedInts` container (binary-search bounds, counting, ranged copy, bulk removal, sorted insert, nearest lookup) plus a harness in `main`. It prints one `[PASS]` / `[FAIL]` line per case and ends with `All tests passed` or `FAILED (n)`.
-- Baseline is `7/10`: the three duplicate-related cases (`count duplicates`, `last index of duplicates`, `remove all duplicates`) fail, everything else passes — one root cause, several delegated symptoms.
-- No comments anywhere, so the only ground truth is the test output.
-- Each case runs on a daemon thread with a 3s join timeout, so an exception or an infinite loop only fails that case.
-- The baseline lives **outside** the workspace: the agent cannot see or edit it, so there is no `pristine.bak` to keep in sync by hand, and `patch_deny_globs` is unnecessary. To change the case on purpose, edit `case/pristine/<name>.java` yourself, then `rm -rf case/work`.
-- Adding another single-file Java case: drop `case/pristine/<Name>.java`, add `<Name>` to `benchmark_bugs` in `case/config.json`. `setup_cmd` / `test_cmd` use `{bug_id}`, so nothing else changes. See `case/README.md` for the full recipe (including multi-file / Maven projects).
+- `pristine/List_999.java` —— 一个 `SortedInts` 容器（二分边界、计数、区间复制、批量删除、有序插入、最近查找）及 `main` 中的测试驱动程序。每条用例打印一行 `[PASS]` / `[FAIL]`，最后输出 `All tests passed` 或 `FAILED (n)`。
+- 基线结果为 `7/10`：三个与重复元素相关的用例（`count duplicates`、`last index of duplicates`、`remove all duplicates`）失败，其余通过 —— 单一根因对应多个表象。
+- 代码中不含任何注释，测试输出是唯一的判定依据。
+- 每条用例运行于守护线程，3 秒 join 超时，因此异常或死循环仅影响该条用例。
+- 基线文件位于工作区**外部**：智能体无法读取或修改，因而无需维护 `pristine.bak` 的同步，也无需配置 `patch_deny_globs`。如需有意修改该样例，请直接编辑 `case/pristine/<name>.java`，随后执行 `rm -rf case/work`。
+- 新增单文件 Java 样例：将 `case/pristine/<Name>.java` 放入目录，并把 `<Name>` 加入 `case/config.json` 的 `benchmark_bugs`。`setup_cmd` / `test_cmd` 使用 `{bug_id}`，其余配置无需变更。完整说明（含多文件 / Maven 项目）见 `case/README.md`。
 
-**6. Performance (WSL): keep `workspace_root` on ext4, not `/mnt/...`**
-Same machine, same bug (`Chart_1b`), same Defects4J 3.0.1 — only the workspace location differs:
+**6. 性能说明（WSL）：将 `workspace_root` 置于 ext4 而非 `/mnt/...`**
 
-| Step | Workspace under `/mnt/d/...` (drvfs) | Workspace under `/home/...` (ext4) |
-| :--- | :--- | :--- |
-| `defects4j checkout` | 218s | — |
-| `defects4j test` | 303s | **8s** (38×) |
-| whole bug, end to end | 658s | **34.75s** |
+在同一机器、同一缺陷（`Chart_1b`）、同一 Defects4J 3.0.1 环境下，仅工作区位置不同：
 
-Both runs are `Chart_1`, both ended `Fixed` + `clean`. The ext4 column has no separate checkout figure because the whole 34.75s already contains the checkout, two test executions and 11 LLM turns — the checkout itself is a few seconds of it.
+| 步骤                   | 工作区位于 `/mnt/d/...`（drvfs） | 工作区位于 `/home/...`（ext4） |
+| :------------------- | :------------------------ | :---------------------- |
+| `defects4j checkout` | 218s                      | —                       |
+| `defects4j test`     | 303s                      | **8s**（38×）             |
+| 单个缺陷端到端              | 658s                      | **34.75s**              |
 
-The 38× was measured on **one** bug (n=1), but the mechanism is per-file filesystem latency, not anything Defects4J-specific, so it generalises to any many-small-files workload. It also means the "3-6 minutes per test" figures elsewhere in this README were measuring the Windows drive, not the repair loop — on ext4, wall time is dominated by LLM turns again, and the 12-test budget is no longer expensive.
 
-Set `workspace_root` to something like `/home/<user>/zerox_workdir`. The workspace does **not** need to be visible from Windows: every read, patch and test goes through WSL commands.
+两次运行均为 `Chart_1`，均以 `Fixed` + `clean` 结束。ext4 一列未列出单独的检出耗时，因为 34.75 秒已包含检出、两次测试执行和 11 轮大模型调用 —— 检出本身仅占其中数秒。
 
-## 🧩 Configuration Reference (Swap Test Suites Without Touching Code)
+上述 38 倍差异基于单个缺陷测得（n=1），但其机制为逐文件系统的访问延迟，并非 Defects4J 特有，因而适用于一般性的大量小文件负载。这也说明，本文档其他章节提到的「单次测试 3–6 分钟」测量的是 Windows 盘环境，而非修复循环本身：在 ext4 上，墙钟时间重新由大模型轮数主导，12 次测试的预算不再昂贵。
 
-Everything environment-specific lives in `config.json`; the code only reads it. Four sections:
+应将 `workspace_root` 设置为类似 `/home/<user>/zerox_workdir` 的路径。工作区**无需**在 Windows 中可见：所有读取、修改和测试均通过 WSL 命令完成。
 
-| Section | Purpose |
+## 配置参考（更换测试套件无需修改代码）
+
+所有环境相关配置集中于 `config.json`，代码仅读取该文件。配置分为四部分：
+
+| 部分 | 用途 |
 | :--- | :--- |
-| `target` | Where the code lives and how to set it up / test it |
-| `agent` | Behaviour knobs and prompts — the parts you tune often |
-| `timeouts` | `test_execution` (server side) and `llm_client` (client side) |
-| `llm_config` / `benchmark_bugs` | Model credentials and the bug list |
+| `target` | 代码位置、准备方式、测试方式及判定规则 |
+| `agent` | 行为参数与提示词 —— 需要频繁调整的部分 |
+| `timeouts` | `test_execution`（服务端）与 `llm_client`（客户端） |
+| `llm_config` / `benchmark_bugs` | 模型凭证与缺陷列表 |
 
-### `target` — workspace, commands and verdicts
+### `target` —— 工作区、命令与判定
 
-| Field | Meaning |
+| 字段 | 含义 |
 | :--- | :--- |
-| `tool_path` | Test framework / build tool entry point, exposed as `{tool}` |
-| `workspace_root` | Root directory holding all bug workspaces, exposed as `{workspace_root}`. Three forms: `/mnt/d/work` (used as-is), `D:/work` (converted to `/mnt/d/work`), or `work` / `./work` (**relative to the config file's directory** — this is how `case/config.json` stays machine-independent). Under WSL, put it on ext4 (`/home/...`), never on `/mnt/<drive>` — see the performance note in Quick Start |
-| `workspace_template` | Per-bug directory template, exposed as `{workspace}` |
-| `setup_cmd` | Run once per new bug (checkout/unzip/switch branch). Empty = nothing to set up. A fresh checkout also clears that bug's `work_log.jsonl`, because the workspace is back to its initial state and old rounds no longer apply |
-| `test_cmd` | Run on every verification |
-| `require_workspace` | Whether the incremental run checks that `{workspace}` exists first |
-| `source_glob` | Default file pattern used by `search_code` |
-| `bug_id_pattern` | Regex used to parse `bug_id`; **every named group becomes a placeholder** |
-| `bug_id_template` | Canonical bug name (used for logs and `work_log.jsonl`) |
-| `default_version_suffix` | Appended to `{number}` when the pattern has no `suffix` group |
-| `passed_pattern` | Regex hit ⇒ all tests pass ⇒ bug fixed |
-| `failed_pattern` | Regex hit ⇒ tests fail; optional named groups `count` (int) and `detail` (stack trace) |
-| `patch_allow_globs` | Optional whitelist (`fnmatch`). **Empty by default** = any path inside the workspace is patchable |
-| `patch_deny_globs` | Optional blacklist. Hit ⇒ rejected, takes priority over the whitelist. Empty by default |
-| `patch_must_be_under_workspace` | Reject any patch whose path is outside `{workspace}` (default `true`). Relative paths are resolved against `{workspace}` before the check; `..` that stays inside is allowed, escaping after normalization is rejected (read and patch share `zerox_core.paths`) |
-| `audit_test_globs` | Which paths count as test code — **read only by `audit.py`, after the run** |
+| `tool_path` | 测试框架 / 构建工具入口，在命令中表示为 `{tool}` |
+| `workspace_root` | 所有缺陷工作区的根目录，在命令中表示为 `{workspace_root}`。支持三种形式：`/mnt/d/work`（原样使用）、`D:/work`（转换为 `/mnt/d/work`）、`work` / `./work`（**相对于配置文件所在目录** —— `case/config.json` 借此保持机器无关性）。在 WSL 下应置于 ext4（`/home/...`），而非 `/mnt/<drive>`，参见快速开始中的性能说明 |
+| `workspace_template` | 单个缺陷的目录模板，在命令中表示为 `{workspace}` |
+| `setup_cmd` | 每个新缺陷执行一次（检出 / 解压 / 切换分支）。留空表示无需准备。重新检出会同时清除该缺陷的 `work_log.jsonl`，因为工作区已回到初始状态，既有轮次不再适用 |
+| `test_cmd` | 每次验证时执行 |
+| `require_workspace` | 增量运行前是否检查 `{workspace}` 是否存在 |
+| `source_glob` | `search_code` 使用的默认文件通配符 |
+| `bug_id_pattern` | 解析 `bug_id` 的正则表达式；**每个命名分组均成为可用占位符** |
+| `bug_id_template` | 规范缺陷名称（用于日志及 `work_log.jsonl`） |
+| `default_version_suffix` | 当模式未提供 `suffix` 分组时，追加至 `{number}` 的后缀 |
+| `passed_pattern` | 命中即表示全部测试通过、缺陷已修复 |
+| `failed_pattern` | 命中即表示测试失败；可选命名分组 `count`（整数）与 `detail`（堆栈信息） |
+| `patch_allow_globs` | 可选白名单（`fnmatch` 语法）。**默认为空**，表示工作区内任意路径均可修改 |
+| `patch_deny_globs` | 可选黑名单。命中即拒绝，优先级高于白名单。默认为空 |
+| `patch_must_be_under_workspace` | 拒绝路径位于 `{workspace}` 之外的补丁（默认 `true`）。相对路径先按 `{workspace}` 解析再校验；未逃出工作区的 `..` 允许使用，归一化后逃逸的路径被拒绝（读取与修改共用 `zerox_core.paths`） |
+| `audit_test_globs` | 界定哪些路径算作测试代码 —— **仅 `audit.py` 在运行结束后读取** |
 
-Available placeholders: `{tool}`, `{workspace_root}`, `{workspace}`, `{bug_id}`, plus every named group of `bug_id_pattern` (e.g. `{project}`, `{number}`, `{version}`, `{suffix}`). Workspace paths are shell-quoted automatically in `setup_cmd` / `test_cmd`.
+可用占位符包括：`{tool}`、`{workspace_root}`、`{workspace}`、`{bug_id}`，以及 `bug_id_pattern` 的全部命名分组（如 `{project}`、`{number}`、`{version}`、`{suffix}`）。`setup_cmd` 与 `test_cmd` 中的工作区路径会自动添加 shell 引号。
 
-**Example — an existing project, tested with Maven, no checkout step** (put its workspace on ext4 under WSL, see the performance note in Quick Start):
+**示例 —— 已有项目，使用 Maven 测试，无需检出步骤**（按性能说明，工作区应置于 WSL 的 ext4 下）：
 
 ```json
 "target": {
@@ -243,7 +300,7 @@ Available placeholders: `{tool}`, `{workspace_root}`, `{workspace}`, `{bug_id}`,
 }
 ```
 
-**Example — one directory per bug, id doubles as the directory name (`quixbugs-quicksort` → `{workspace_root}/quixbugs-quicksort`):**
+**示例 —— 每个缺陷一个目录，标识符直接作为目录名（`quixbugs-quicksort` → `{workspace_root}/quixbugs-quicksort`）：**
 
 ```json
 "workspace_template": "{workspace_root}/{bug_id}",
@@ -255,43 +312,48 @@ Available placeholders: `{tool}`, `{workspace_root}`, `{workspace}`, `{bug_id}`,
 "failed_pattern": "FAILED \\((?P<count>\\d+)"
 ```
 
-### No runtime edit restrictions — audit after the fact
+### 运行时不限制文件修改，改由事后审计
 
-ZeroX deliberately does **not** police which files the agent edits while it works. The single runtime rule is "stay inside `{workspace}`": `patch_and_log` resolves relative paths against it first (`src/main/java/...` works), normalizes `..`, and rejects only paths that escape the workspace afterwards. Read tools use the same resolver in `zerox_core.paths`, so `src/main/../main/Foo.java` is valid for both reading and patching.
+ZeroX 有意不在智能体运行期间限制其可修改的文件范围。唯一的运行时约束是「位于 `{workspace}` 内」：`patch_and_log` 先将相对路径按该目录解析（`src/main/java/...` 形式可用），归一化 `..`，仅拒绝归一化后逃出工作区的路径。读取工具使用 `zerox_core.paths` 中的同一解析器，因此 `src/main/../main/Foo.java` 在读取和修改时均合法。
 
-Earlier versions had two guards — a `src/main/java` whitelist plus an `md5` baseline of the test tree re-checked before every run. Both were removed on purpose:
+早期版本曾设置两道约束 —— `src/main/java` 白名单，以及每次测试前重新校验的测试树 `md5` 基线 —— 现均已移除，原因如下：
 
-- the whitelist rejected legitimate patches. Models routinely pass `src/main/java/...` instead of an absolute path, and every rejection pushed the agent into firing a random patch to regain permission — at 3-6 minutes a test;
-- the baseline needed four extra config fields (`test_guard_suffixes`, `test_guard_ignore_dirs`, ...) just to avoid flagging Defects4J build output.
+- 白名单会拒绝合法补丁。模型通常以 `src/main/java/...` 而非绝对路径给出目标，每次拒绝都会导致智能体为重新获得权限而随机提交补丁；而单次测试耗时 3–6 分钟。
+- 基线方案需要额外四个配置字段（`test_guard_suffixes`、`test_guard_ignore_dirs` 等）才能避免将 Defects4J 构建产物误判为测试文件改动。
 
-The judgement moved to `audit.py`, which reads the finished `work_log.jsonl` and reports two separate labels:
+判定逻辑已迁移至 `audit.py`：它读取运行结束后的 `work_log.jsonl`，给出两个相互独立的标签：
 
-| Label | Meaning |
+| 标签 | 含义 |
 | :--- | :--- |
-| `audit: clean` / `invalid` | `invalid` = at least one round patched a file matching `target.audit_test_globs` |
-| `verified: true` / `false` | `python src/audit.py --verify` restores those test files (`git checkout --`, or `rm -f` for files the agent created), re-runs `test_cmd`, and checks `passed_pattern` again — passing with the suite restored means the fix does not lean on the edited tests |
+| `audit: clean` / `invalid` | `invalid` 表示至少有一轮修改了匹配 `target.audit_test_globs` 的文件 |
+| `verified: true` / `false` | `python src/audit.py --verify` 恢复相关测试文件（对已有文件执行 `git checkout --`，对智能体新建的文件执行 `rm -f`），重跑 `test_cmd`，再次检查 `passed_pattern` —— 恢复测试后仍通过，说明修复未依赖对测试的修改 |
 
-Because the verdict is derived from the append-only log, it can be replayed over historical runs months later, without touching the workspace or spending a single test. Publish both numbers: **Fixed** and **Verified Fixed**.
+由于判定由 append-only 日志推导得出，数月后仍可在历史运行上重放，无需触碰工作区，也无需消耗测试次数。两项结果均应报告：**Fixed** 与 **Verified Fixed**。
 
-**No call arbitration, no free-rerun accounting.** Both used to live in the server and both were removed deliberately: they policed the cheapest actions (a few seconds of reading, one test) while pushing the agent into random patches just to regain permission to read — and a random patch costs a whole 3-6 minute test. What is left is a single hard budget, **test executions per bug** (`agent.max_tests`, default 12), plus one line of `[预算]` bookkeeping appended to every `run_test` / `patch_and_log` reply. Patches are unlimited and free; reading is unlimited and free.
+**无调用仲裁，无免费重跑记账。** 二者此前均位于服务端，现均已移除：它们约束的是代价最低的操作（数秒的读取、一次测试），却导致智能体为重新获得读取权限而随机提交补丁 —— 而一次随机补丁需要消耗完整的 3–6 分钟测试。目前仅保留一项硬性预算：每个缺陷的**测试执行次数**（`agent.max_tests`，默认 12），以及附加在每条 `run_test` / `patch_and_log` 响应末尾的 `[预算]` 记账信息。补丁数量与读取次数均不受限制。
 
-**`run_test` never resets the workspace on its own.** A checkout happens only when the caller explicitly passes `force_checkout: true` (the benchmark client does this on the first call of each bug) or when the bug id changes with no patches pending. Switching bugs while patches are pending is refused rather than silently wiping them — the old rule (`reset_task_state` flipping `IS_TASK_INITIALIZED` triggered a re-checkout) was what made the agent look *stuck at `run_test`*: every retry re-ran on freshly checked-out, still-buggy code.
+**`run_test` 不会自行重置工作区。** 仅当调用方显式传入 `force_checkout: true`（基准客户端在每个缺陷的首次调用时如此设置），或缺陷标识符发生变化且无待处理补丁时，才会执行检出。存在待处理补丁时切换缺陷会被拒绝，而非静默清除 —— 旧规则（`reset_task_state` 翻转 `IS_TASK_INITIALIZED` 触发重新检出）正是智能体表现为「停滞在 `run_test`」的原因：每次重试都在刚刚检出、仍含缺陷的代码上重新执行。
 
-> **Known blind spot:** the single-file case (`case/config.json`) keeps the code under test and the harness in the same file, so `audit_test_globs` cannot tell them apart — it is set to `[]` there, every patch audits as `clean`, and the prompt is the only constraint.
+> **已知盲点：** 单文件样例（`case/config.json`）将被测代码与测试驱动程序置于同一文件，`audit_test_globs` 无法区分二者，因此该配置中将其设为 `[]`，所有补丁均审计为 `clean`，仅依靠提示词约束。
 
-### `agent` — behaviour and prompts
+### `agent` —— 行为参数与提示词
 
-| Key | Meaning |
+| 配置项 | 含义 |
 | :--- | :--- |
-| `max_tests` | Max `run_test` executions per bug (server side); the only hard budget |
-| `compact_context_chars` | Context size (characters, not tokens) that triggers one history compaction — replacing the old "every 20 turns" rule, which compacted too late on a huge test log and too early on cheap read-only turns |
-| `system_prompt_file` | Prompt file, relative to the project root (absolute also works) |
-| `user_prompt_template` | First user message; `{bug_id}` is substituted |
-| `fixed_marker` / `failed_marker` | Strings the agent must output to end the task; keep them consistent with `AGENTS.md` |
+| `max_tests` | 每个缺陷最多执行 `run_test` 的次数（服务端），唯一的硬性预算 |
+| `compact_context_chars` | 触发一次历史压缩的上下文大小（字符数，非 token）—— 取代旧的「每 20 轮」规则；后者在遇到庞大测试日志时压缩过晚，在廉价的只读轮次上压缩过早 |
+| `system_prompt_file` | 提示词文件，相对于项目根目录（绝对路径亦可用） |
+| `user_prompt_template` | 第一条用户消息，其中 `{bug_id}` 会被替换 |
+| `fixed_marker` / `failed_marker` | 智能体结束任务必须输出的标记；须与 `AGENTS.md` 保持一致 |
 
-## ⚠️ Limitations
+## 局限性
 
-**No cross-process resume.** The `work_log.jsonl` digest recovers a lost *context* — after a compaction, the agent re-reads its own history from the log and keeps going in the same process. It is not a checkpoint: the LLM conversation, token counters and turn state live only in the `src/zerox.py` process. Restarting the script starts a fresh batch from the first entry in `benchmark_bugs`; there is no `--resume`. Concretely, on each bug the client sets `force_checkout: true` on the first `run_test` and rewrites `transcript.md`, and the server clears that bug's `work_log.jsonl` when it re-checks out the workspace — so a restarted bug loses its in-flight patch history and starts from clean buggy code. A crash mid-bug leaves only `logs/<bug>/crash.txt`; no `benchmark_metrics.jsonl` row is appended for a bug that never reached an exit status. Batch runs are therefore expected to finish in one sitting, or to be re-run from scratch.
+**不支持跨进程恢复。** 活状态卡与压缩机制恢复的是丢失的**上下文** —— 压缩发生后，智能体依靠每轮重建的状态卡与保留的决策轮在同一进程内继续执行。它并非检查点：大模型对话、token 计数和轮次状态仅存于 `src/zerox.py` 进程内。重启脚本将从 `benchmark_bugs` 的第一项开始新一轮批次，不提供 `--resume` 选项。具体而言，每个缺陷开始时客户端在首次 `run_test` 设置 `force_checkout: true` 并重写 `transcript.md`，服务端在重新检出工作区时清除该缺陷的 `work_log.jsonl` —— 因此重启一个缺陷会丢失进行中的补丁历史，从干净的含缺陷代码重新开始。运行中途崩溃仅留下 `logs/<bug>/crash.txt`；未达到退出状态的缺陷不会向 `benchmark_metrics.jsonl` 写入记录。因此，批量运行应在一个会话中完成，或从头重新执行。
+
+**小模型能够调用工具，并不意味着能够修复缺陷。** 本地 4B 级模型（如 qwen3.5:4b）在工具调用方面表现稳定，但在本项目的实验中未能定位并修复 Lang_1 —— 其在搜索步骤上反复循环。该现象表明，稳定的工具调用能力与修复真实缺陷的能力属于两个不同层面，不应以前者推断后者。
+
+**覆盖范围有限。** 目前仅在 5 个缺陷上完成验证，均采用 ant 构建且均属于 tier-B。maven 构建链、跨项目泛化以及更大样本尚未验证。
 
 ---
-*ZeroX is proudly built by a freshman at Guangdong University of Technology. (ZeroX 由广东工业大学大一新生独立开发)*
+
+*ZeroX 由广东工业大学大一新生独立开发。*
