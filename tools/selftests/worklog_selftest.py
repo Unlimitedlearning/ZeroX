@@ -53,6 +53,13 @@ def main():
         assert "边界判断错了" in digest and "换个方向" in digest, digest
         assert "当前推断（轮 2）" in digest, digest
 
+        # 【滚动摘要】brief() 是压缩时常驻注入的精简视图：含当前推断与失败趋势，且受长度约束
+        brief = wl.brief(title="Demo_1b")
+        assert "当前推断（轮 2）" in brief and "换个方向" in brief, brief
+        assert "测试趋势：5 → 2" in brief, brief
+        assert len(wl.brief(max_chars=80)) <= 90, "brief 必须尊重 max_chars 上限"
+        assert "暂无历史工作日志" in worklog.WorkLog(os.path.join(tmp, "empty")).brief()
+
         restored, broken = wl.rollback(1, reasoning="探针确认 indexOfLast 返回首个匹配", kind="probe")
         assert not broken, broken
         assert len(set(restored)) == 2, restored
@@ -68,6 +75,9 @@ def main():
         assert wl.stats()["rollbacks"] == 1 and wl.stats()["probe_rollbacks"] == 1, wl.stats()
         digest_after = wl.digest(limit=5, title="Demo_1b")
         assert "[回滚]" in digest_after and "撤销到第 1 轮（探针）" in digest_after, digest_after
+        # 压缩后的摘要必须带上「已排除方向」，否则模型会重复走死路
+        brief_after = wl.brief(title="Demo_1b")
+        assert "已排除" in brief_after and "探针" in brief_after, brief_after
 
         again, _ = wl.rollback(1, reasoning="重复调用不应再出记录", kind="deadend")
         assert again == [], "没有可回滚的内容时应什么都不做"

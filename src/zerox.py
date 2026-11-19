@@ -19,9 +19,14 @@ from mcp.client.stdio import stdio_client
 
 # 同目录模块：事后审计（运行时不做编辑限制，跑完再判定 clean / invalid）
 import audit
+import worklog
 # 内部包在 src/zerox_core/：包名不能叫 zerox，否则会盖住本文件（src/zerox.py）
 from zerox_core import PASSED_RESULT_MARKER
 from zerox_core import config as config_mod
+# 上下文裁剪的纯函数抽到 zerox_core，便于离线单测（import 本文件会初始化 client）
+from zerox_core.context import (
+    keep_valuable_turns, trim_tool_outputs, context_chars, split_turns,
+)
 
 CONFIG_FILE = "config.json"
 
@@ -62,12 +67,17 @@ METRICS_FILE = os.path.join(LOG_DIR, "benchmark_metrics.jsonl")
 
 # 上下文压缩时保留的工具输出尾部长度（防止单条输出又把上下文撑爆）
 COMPACT_TOOL_TAIL_CHARS = 6000
-# 压缩后保留最近几轮完整对话，而不是只留一条工具输出：一刀切干净会让它把压缩前
-# 刚读过的文件重新读一遍——Time_11 实测压缩后前三个调用就是在重读同一个测试方法。
+# 【价值裁剪】压缩时保留「最近 N 轮」+「最近 K 个决策轮（补丁/测试/回滚）」。
+# 只看最近会丢掉早期想通的关键假设（写在 patch reasoning 里）；只按价值留会把刚做的事全清掉，
+# 导致它重新读一遍压缩前刚读过的文件（Time_11 实测压缩后前三个调用在重读同一方法）。两者都要。
 COMPACT_KEEP_TURNS = 2
-# 保留轮次里单条工具输出的字上限（留头留尾、中间注明原长）：否则一条 3MB 测试日志
-# 能把刚压缩出来的上下文再撑爆一次。
+COMPACT_KEEP_DECISIONS = 4
+# 保留轮次里单条工具输出 / 补丁参数的字上限（留头留尾、中间注明原长）：否则一条 3MB
+# 测试日志或大补丁 diff 能把刚压缩出来的上下文再撑爆一次。
 COMPACT_KEEP_MSG_CHARS = 4000
+# 【滚动摘要】压缩时从 work_log 生成一段受控长度的状态快照，随压缩提示一起常驻注入，
+# 让模型一睁眼就看到「当前推断 / 失败趋势 / 已排除方向」，不再只靠它主动调 get_work_log。
+COMPACT_BRIEF_CHARS = 1200
 
 # 上下文压缩的两个阈值都来自 config.json 的 agent 段落：
 #   compact_context_chars  体量触发（窗口会不会爆）
@@ -165,6 +175,20 @@ def canonical_bug_id(bug_id: str) -> str:
     return (bug_ctx or {}).get("bug_id") or bug_id
 
 
+def state_card_content(bug_id: str) -> str:
+    """【L1 活状态卡】每轮从 work_log 重建的当前状态，作为常驻 system 消息。
+
+    它不是压缩那一刻的死快照，而是每次请求前都刷新 —— 模型每一轮都带着最新状态，
+    恢复不再依赖「模型记得去读 get_work_log」这一步软约束。读日志失败只降级，不中断。
+    """
+    try:
+        log_home = os.path.join(LOG_DIR, canonical_bug_id(bug_id))
+        brief = worklog.WorkLog(log_home).brief(max_chars=COMPACT_BRIEF_CHARS, title=bug_id)
+        return ("[LIVE STATE · rebuilt from work log every turn · survives compaction]\n" + brief)
+    except Exception as err:
+        return f"[LIVE STATE · 暂不可用: {err}]"
+
+
 def transcript_path(bug_id: str) -> str:
     """每个 bug 一份人类可读的对话记录：logs/<规范名>/transcript.md。"""
     return os.path.join(LOG_DIR, canonical_bug_id(bug_id), "transcript.md")
@@ -213,76 +237,16 @@ def reasoning_text(msg) -> str:
     return ""
 
 
-def keep_recent_turns(messages, turns):
-    """从尾部往前数 turns 个「assistant 消息 + 它的 tool 结果」组，返回可安全保留的切片。
-
-    起点必须落在 assistant 消息上：tool 消息只能紧跟在带 tool_calls 的 assistant 后面，
-    从一条 tool 消息中间切会直接 400。system 和压缩提示由调用方拼在前面。
-    """
-    starts = []
-    for i, msg in enumerate(messages):
-        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
-        if role == "assistant":
-            starts.append(i)
-    if not starts or turns <= 0:
-        return []
-    start = starts[-turns] if len(starts) >= turns else starts[0]
-    return messages[start:]
-
-
-def trim_tool_outputs(msgs, limit):
-    """把保留轮次里的工具输出掐到 limit 字（留头留尾，中间标出原长）。
-
-    只处理 role="tool" 的 dict：它们在客户端是我们自己拼的，可以安全复制；
-    assistant 消息是 SDK 对象，原样传回给 API。
-    """
-    out = []
-    for msg in msgs:
-        if isinstance(msg, dict) and msg.get("role") == "tool":
-            content = msg.get("content")
-            if isinstance(content, str) and len(content) > limit:
-                head = content[: limit * 2 // 3]
-                msg = dict(msg, content=(
-                    f"{head}\n…（截断，原长 {len(content)} 字）…\n"
-                    f"{content[len(head):][-(limit - len(head)):]}"
-                ))
-        out.append(msg)
-    return out
-
-
-def context_chars(messages) -> int:
-    """当前上下文里所有消息正文 + 工具参数的字符数（不是 token，也不是日志文件大小）。
-
-    为什么不用 transcript.md 的大小当触发条件：那份文件只增不删，压缩之后它不会变小，
-    一次压缩后就再也不会触发第二次，除非额外记一个「上次压缩时的 offset」。
-    直接数 messages 没有这个问题，也不依赖磁盘。
-    """
-    total = 0
-    for msg in messages:
-        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
-        if isinstance(content, str):
-            total += len(content)
-        elif content is not None:
-            total += len(str(content))
-        # tool_calls 的参数（patch 的 diff 之类）同样占上下文，不能漏
-        calls = msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None)
-        for call in calls or []:
-            fn = call.get("function") if isinstance(call, dict) else getattr(call, "function", None)
-            if fn is None:
-                continue
-            args = fn.get("arguments") if isinstance(fn, dict) else getattr(fn, "arguments", "")
-            if args:
-                total += len(str(args))
-    return total
-
-
 async def run_single_bug(bug_id: str, session: ClientSession):
     print(f"\n" + "="*50)
     print(f"🚀 开始测试 Bug: {bug_id}")
     print("="*50)
     
+    # 【L1 活状态卡】常驻 system 消息：每轮刷新，压缩时显式保留，不随历史被裁掉。
+    state_card = {"role": "system", "content": state_card_content(bug_id)}
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
+        state_card,
         {"role": "user", "content": AGENT_CONF["user_prompt_template"].replace("{bug_id}", bug_id)}
     ]
 
@@ -335,48 +299,64 @@ async def run_single_bug(bug_id: str, session: ClientSession):
         if turn > 0 and (forced or ctx_chars >= COMPACT_CONTEXT_CHARS):
             reason = ("只读 streak 到点预约" if forced
                       else f"上下文已达 {ctx_chars} 字（阈值 {COMPACT_CONTEXT_CHARS}）")
-            print(f"  ✂️ [{bug_id}] {reason}，触发压缩！清理历史冗余对话，逼迫 AI 读取工作日志...")
-            
-            # 保留 System Prompt
-            system_prompt = messages[0]
-            
-            # 保留最近 N 轮完整对话（从 assistant 边界切，见 keep_recent_turns）：
-            # 只留一条工具输出等于把刚形成的推理链一刀切断，它会重新读一遍。
-            kept = trim_tool_outputs(keep_recent_turns(messages, COMPACT_KEEP_TURNS),
-                                     COMPACT_KEEP_MSG_CHARS)
+            print(f"  ✂️ [{bug_id}] {reason}，触发压缩！按价值保留决策轮，丢弃闲聊轮...")
 
-            # 找不到完整的最近轮次时（比如还没发生过 tool 调用），退回只留最后一条工具输出
+            # 【L1】压缩这一刻先把常驻状态卡刷新到最新——它是唯一的活状态源，
+            # 压缩后依然在 messages[1]，模型一睁眼就能看到，不必去读日志。
+            state_card["content"] = state_card_content(bug_id)
+
+            # 【L2 价值裁剪】保留「最近 N 轮」+「最近 K 个决策轮（补丁/测试/回滚）」：
+            # 既不让刚做的事被清空（会重读文件），也不丢掉早期写在 reasoning 里的关键假设。
+            # keep_valuable_turns 从 assistant 边界切，结果不含孤立 tool 消息，可安全回传。
+            kept = trim_tool_outputs(
+                keep_valuable_turns(messages, recent=COMPACT_KEEP_TURNS,
+                                    decisions=COMPACT_KEEP_DECISIONS),
+                COMPACT_KEEP_MSG_CHARS,
+            )
+
+            # 找不到完整轮次时（比如还没发生过 tool 调用），退回只留最后一条工具输出
             recent_tool_output = ""
             if not kept:
                 for msg in reversed(messages):
-                    # 兼容 dict 和 SDK 对象两种消息形态，否则永远匹配不到 tool 消息
                     role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
-                    # 只保留最近的 tool 消息，最多保留 1 条
                     if role == "tool":
                         content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
                         recent_tool_output = content if isinstance(content, str) else str(content)
                         break
-            
-            reset_content = "SYSTEM NOTICE: The conversation history has been compacted to save memory. I have kept your most recent turns below. You should immediately call `get_work_log` to review your past attempts (each patch's reasoning and the test trend are there too), and then continue fixing."
+
+            # 状态卡已经常驻在最上方，这里不再重复注入摘要，只说明发生了什么。
+            reset_content = (
+                "SYSTEM NOTICE: Conversation history was compacted to save memory. "
+                "Your current state is in the LIVE STATE message above — it is refreshed "
+                "from the work log every turn and already reflects all patches, test "
+                "results and ruled-out directions, so continue directly from it. "
+                "Call `get_work_log` only if you need a detail the LIVE STATE does not show."
+            )
+
             if recent_tool_output:
                 # 只留尾部：测试报错的关键信息都在最后，也能避免单条输出再次撑爆上下文
                 reset_content += "\n\n--- Most recent tool output (tail) ---\n" + recent_tool_output[-COMPACT_TOOL_TAIL_CHARS:]
             
             reset_prompt = {"role": "user", "content": reset_content}
-            
-            # 重新组装：System + 提示词(user) + 保留的最近几轮
-            # 🚨 绝不能把 role="tool" 的消息单独留下：tool 消息必须紧跟在带 tool_calls 的 assistant 消息之后，
-            #    否则 API 直接 400（Messages with role 'tool' must be a response to a preceding message with 'tool_calls'）
-            messages = [system_prompt, reset_prompt] + kept
+
+            # 重新组装：主 system + 活状态卡(system) + 提示词(user) + 价值裁剪后的轮次。
+            # 🚨 绝不能把 role="tool" 的消息单独留下：tool 消息必须紧跟在带 tool_calls 的 assistant 之后。
+            messages = [messages[0], state_card, reset_prompt] + kept
             append_transcript(bug_id, turn + 1, "compact",
-                              f"上下文 {ctx_chars} 字 → {context_chars(messages)} 字，历史已丢弃；"
-                              f"保留最近 {len(kept)} 条消息（≤{COMPACT_KEEP_TURNS} 轮，单条 ≤{COMPACT_KEEP_MSG_CHARS} 字）")
+                              f"上下文 {ctx_chars} 字 → {context_chars(messages)} 字；"
+                              f"价值裁剪保留 {len(kept)} 条消息（最近 {COMPACT_KEEP_TURNS} 轮 + "
+                              f"最近 {COMPACT_KEEP_DECISIONS} 个决策轮，单条 ≤{COMPACT_KEEP_MSG_CHARS} 字）；"
+                              f"活状态卡常驻")
             # 注意：messages 末尾可能是 tool 消息（保留轮次带的），API 同样接受，模型会接着回复
 
             # 压缩就是「把当前记忆换掉」这个动作本身，所以两个计数器必须一起归零：
             # 否则 streak 还停在 12 以上，下一轮立刻又预约一次，变成无限反复擦记忆。
             compact_due_turn = None
             free_streak = 0
+
+        # 【L1】每轮请求前都把活状态卡刷到最新：它常驻 messages[1]，压缩时也保留。
+        # 这样模型每一轮都带着「当前推断 / 失败趋势 / 已排除方向」，恢复不靠它记得读日志。
+        state_card["content"] = state_card_content(bug_id)
 
         try:
             response = await client.chat.completions.create(

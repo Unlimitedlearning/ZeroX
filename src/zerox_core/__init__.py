@@ -5,6 +5,7 @@
     config.py    配置默认值 / 合并 / 校验 / 正则编译 / resolve_bug（纯函数）
     schemas.py   MCP 工具 schema（纯数据，改描述文案只改这里）
     exec_env.py  命令执行器：把 WSL 转发 / 原生 bash 的差异收在一个地方
+    context.py   上下文裁剪纯函数：对称截工具输出/补丁参数、按价值裁剪轮次、数体积
     PASSED_RESULT_MARKER  服务端通过文案 / 客户端正样本判定共用的协议常量
 
 依赖方向是单向的：入口（src/zerox.py）、src/zerox_server.py、src/audit.py 都依赖本包，

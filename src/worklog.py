@@ -360,6 +360,57 @@ class WorkLog:
                 lines.append(detail[-detail_chars:])
         return "\n".join(lines)
 
+    def brief(self, max_chars=1200, title=None):
+        """压缩后常驻注入上下文的精简快照：当前推断 / 失败数趋势 / 已排除方向。
+
+        与 digest() 的区别：digest 是模型主动调用 get_work_log 时才看到的完整视图；
+        brief 是压缩那一刻由客户端主动塞回上下文的一段状态，恢复不再只靠模型「记得去读日志」。
+        总长度受 max_chars 约束，避免摘要本身又把刚压缩出来的窗口撑大。
+        """
+        events = self.events()
+        who = f"当前 Bug（{title}）" if title else "当前任务"
+        if not events:
+            return f"{who}：暂无历史工作日志。"
+
+        patches = [e for e in events if e["t"] == "patch"]
+        tests = [e for e in events if e["t"] == "test"]
+        rollbacks = [e for e in events if e["t"] == "rollback"]
+
+        lines = [f"{who}·状态摘要（共 {len(patches)} 轮补丁 / {len(tests)} 次测试"
+                 + (f" / {len(rollbacks)} 次回滚" if rollbacks else "") + "）"]
+
+        # 当前假设：最后一条存活补丁的推理（回滚掉的已不在 events 里）
+        latest = next((e for e in reversed(patches)), None)
+        if latest:
+            lines.append(f"当前推断（轮 {latest.get('round')}）："
+                         + (_clip(latest.get("reasoning"), 220) or "（未记录）"))
+            summary = _clip(latest.get("summary"), 120)
+            if summary:
+                lines.append(f"本轮动作：{summary}")
+
+        # 失败数趋势：首 → 末，是判断收敛还是发散的关键信号
+        if tests:
+            first, last = tests[0], tests[-1]
+            lines.append(f"测试趋势：{first.get('fail_count', '?')} → "
+                         f"{last.get('fail_count', '?')} 个失败（{last.get('status', '?')}）")
+            detail = (last.get("detail") or "").strip()
+            if detail:
+                last_line = detail.splitlines()[-1] if detail.splitlines() else detail
+                lines.append("最近报错：" + _clip(last_line, 180))
+
+        # 已排除方向：回滚理由，防止压缩后重复走死路
+        for rb in rollbacks[-3:]:
+            label = _ROLLBACK_LABELS.get(rb.get("kind"), rb.get("kind") or "回滚")
+            lines.append(f"已排除（回滚到轮 {rb.get('target_round')}，{label}）："
+                         + (_clip(rb.get("reasoning"), 120) or "（未记录）"))
+
+        text = "\n".join(lines)
+        if max_chars and len(text) > max_chars:
+            suffix = f"\n…（摘要截断，原长 {len(text)} 字；完整历史调用 get_work_log）"
+            # 提示语也要算进上限内，否则 max_chars 名存实亡、摘要反而撑大窗口
+            text = text[:max(0, max_chars - len(suffix))] + suffix
+        return text
+
     def stats(self):
         """给指标用的原始计数（不含解析逻辑）。"""
         events = self.events()
