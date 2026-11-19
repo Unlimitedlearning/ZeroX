@@ -40,16 +40,14 @@ ZeroX 是一个基于模型上下文协议（MCP）的轻量级自动程序修�
 
 | 缺陷编号         | 状态      | 耗时（秒） | Tokens | 入 / 出            | 轮数 | 补丁调用 | 测试次数 | 审计      | 验证 |
 | :----------- | :------ | :---- | :----- | :--------------- | :- | :--- | :--- | :------ | :--- |
-| **Lang_4b**  | ✅ Fixed | 66.26 | 24.0K  | 23,029 / 930     | 6  | 1    | 2    | `clean` | —    |
-| **Chart_1b** | ✅ Fixed | 27.45 | 35.5K  | 34,655 / 871     | 8  | 1    | 2    | `clean` | —    |
-| **Codec_5b** | ✅ Fixed | 41.93 | 130.4K | 125,268 / 5,121  | 14 | 1    | 2    | `clean` | —    |
-| **Csv_1b**   | ✅ Fixed | 18.63 | 50.8K  | 49,154 / 1,632   | 10 | 1    | 2    | `clean` | —    |
-| **Time_4b**  | ✅ Fixed | 68.18 | 211.8K | 203,497 / 8,311  | 16 | 1    | 2    | `clean` | —    |
-| **Cli_5b**   | ✅ Fixed | 18.57 | 48.5K  | 47,254 / 1,283   | 10 | 1    | 2    | `clean` | —    |
+| **Lang_4b**  | ✅ Fixed | 66.26 | 24.0K  | 23,029 / 930     | 6  | 1    | 2    | `clean` | ✅ `Verified Fixed` |
+| **Chart_1b** | ✅ Fixed | 27.45 | 35.5K  | 34,655 / 871     | 8  | 1    | 2    | `clean` | ✅ `Verified Fixed` |
+| **Codec_5b** | ✅ Fixed | 41.93 | 130.4K | 125,268 / 5,121  | 14 | 1    | 2    | `clean` | ✅ `Verified Fixed` |
+| **Csv_1b**   | ✅ Fixed | 18.63 | 50.8K  | 49,154 / 1,632   | 10 | 1    | 2    | `clean` | ✅ `Verified Fixed` |
+| **Time_4b**  | ✅ Fixed | 68.18 | 211.8K | 203,497 / 8,311  | 16 | 1    | 2    | `clean` | ✅ `Verified Fixed` |
+| **Cli_5b**   | ✅ Fixed | 18.57 | 48.5K  | 47,254 / 1,283   | 10 | 1    | 2    | `clean` | ✅ `Verified Fixed` |
 
-> **6/6 Fixed · 6/6 `clean`。** 每个缺陷均在一轮内收敛、执行两次测试，未触及 12 次测试的预算上限，耗时为 19–68 秒。六个缺陷覆盖 Lang、Chart、Codec、Csv、Time、Cli 六个项目，其中四个属于 tier-A、两个属于 tier-B；构建方式同时包含 ant 与 maven。
->
-> **本批次未报告 `Verified Fixed`。** `audit.py --verify` 需要启动 WSL 复跑 `defects4j test`，本机安全策略阻止了 `wsl.exe`；因此本批次只给出基于 append-only 工作日志的 `clean` 判定，不声称补丁在恢复测试文件后仍通过。早期批次的 `Verified Fixed` 结果保留在 `logs/archive/` 中。
+> **6/6 Fixed · 6/6 `clean` · 6/6 `Verified Fixed`。** 每个缺陷均在一轮内收敛、执行两次测试，未触及 12 次测试的预算上限，耗时为 19–68 秒。六个缺陷覆盖 Lang、Chart、Codec、Csv、Time、Cli 六个项目，其中四个属于 tier-A、两个属于 tier-B；构建方式同时包含 ant 与 maven。`Verified Fixed` 表示 `audit.py --verify` 复跑 `test_cmd` 后仍命中 `passed_pattern`；本批次审计均为 `clean`（未改动测试文件），故复跑为原样重放，用于排除 flaky pass。
 >
 > 限于样本规模与难度分布，上述结果不应作为修复率的依据。
 >
@@ -215,6 +213,18 @@ python src/audit.py --config case/config.json
 
 每批运行前应归档上一批，避免数据混淆：`python tools/new_run.py` 会将 `logs/` 下全部内容移至 `logs/archive/<timestamp>/`（并生成 `manifest.json`），清除 `__pycache__`，并打印即将运行的缺陷列表。归档批次仍可审计：`python src/audit.py --logs logs/archive/<timestamp>`。
 
+**事后审计与验证。** 批量运行结束后，分两步判定结果。第一步只读 `work_log.jsonl`，不运行任何测试，给出 `clean` / `invalid`（是否改过测试文件）；第二步才复跑测试，确认修复不是 flaky pass：
+
+```bash
+python src/audit.py               # 第一步：审计，秒级
+python src/audit.py --verify      # 第二步：复跑 test_cmd，每个缺陷 3-6 分钟
+python src/audit.py --verify --bug Lang_1   # 只验证单个缺陷（前缀匹配）
+```
+
+`--verify` 的行为取决于审计结论：若为 `invalid`（补丁动过测试文件），先用 `git checkout --` / `rm -f` 还原这些文件再复跑；若为 `clean`，则原样复跑。两种情况下都要求复跑命中 `passed_pattern` 才记为 `Verified Fixed`。复跑通过 WSL 执行 `defects4j test`，耗时主要受工作区文件系统影响（ext4 上远快于 `/mnt/...`，见性能说明）；实时输出写入 `logs/<bug>/verify.log`，可用 `tail -f` 查看进度。结果以追加方式写入 `logs/audit.jsonl`，每行一个缺陷，含 `verified` 与 `verified_reason`；加 `--no-write` 可只看不写。
+
+> Windows 下必须能在 PATH 中找到 `wsl` 且 WSL 内已装好 Defects4J，否则复跑会报 `WinError 5 拒绝访问` 并记为未复现 —— 这不代表修复失败，只是验证环境不可用。
+
 **5. 单文件样例（`case/`）**
 
 该样例为一个自带测试的 Java 程序，使用同一套工具链但不依赖 Defects4J —— 单次测试仅需数秒且无需检出，是修改工具后最快捷的回归检查：
@@ -327,7 +337,7 @@ ZeroX 有意不在智能体运行期间限制其可修改的文件范围。唯�
 | 标签 | 含义 |
 | :--- | :--- |
 | `audit: clean` / `invalid` | `invalid` 表示至少有一轮修改了匹配 `target.audit_test_globs` 的文件 |
-| `verified: true` / `false` | `python src/audit.py --verify` 恢复相关测试文件（对已有文件执行 `git checkout --`，对智能体新建的文件执行 `rm -f`），重跑 `test_cmd`，再次检查 `passed_pattern` —— 恢复测试后仍通过，说明修复未依赖对测试的修改 |
+| `verified: true` / `false` | `python src/audit.py --verify` 重跑 `test_cmd` 并再次检查 `passed_pattern`。若审计为 `invalid`，先还原相关测试文件（对已有文件执行 `git checkout --`，对智能体新建的文件执行 `rm -f`）再复跑；若审计为 `clean`，则原样复跑。复跑通过即 `verified: true`（同时记录 `verified_reason` 与 `reverted` 列表），用于排除 flaky pass 与对测试的依赖 |
 
 由于判定由 append-only 日志推导得出，数月后仍可在历史运行上重放，无需触碰工作区，也无需消耗测试次数。两项结果均应报告：**Fixed** 与 **Verified Fixed**。
 
