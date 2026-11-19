@@ -10,7 +10,7 @@ build/
 dist/
 
 # ZeroX specific
-# logs/ is scratch space, except the audit trail we publish:
+# logs/ holds scratch space except the published audit trail:
 #   logs/benchmark_metrics.jsonl  one line per finished bug
 #   logs/audit.jsonl              post-hoc verdict (clean / invalid, Verified Fixed)
 #   logs/<bug>/human_audit.jsonl  discarded patches + rollback history
@@ -22,25 +22,25 @@ logs/**
 # archive/ 是项目尚未定稿时的历史运行归档，不作为正式数据提交
 logs/archive/
 
-# 只忽略【项目根目录】的 config.json（本机配置）。
-# 必须写成 /config.json：无斜杠的规则会在任意层级生效，会把 case/config.json 一起忽略掉
+# 仅忽略项目根目录的 config.json（本机配置）。
+# 规则必须带前导斜杠：无斜杠的规则会在任意层级生效，从而误伤 case/config.json
 /config.json
 # 本机的一次性配置（单 bug 复测、换环境验证之类）——这些文件通常内嵌本机绝对路径 / API key。
-# 模板除外，所以要把 config.example.json 加回来。
+# 模板除外：通过例外规则保留 config.example.json。
 /config.*.json
 !/config.example.json
-# 带本地路径的私有配置：本地模型端点、个人环境参数等。用通用名 *.local.* 兜住，
-# 便于任何人按自己的环境写配置而不小心提交（config.local.json 之类）。
+# 带本地路径的私有配置：本地模型端点、个人环境参数等，由通用后缀 *.local.* 统一覆盖
+# （如 config.local.json），避免本地配置随提交入库。
 *.local.json
 *.local.jsonl
 *.local.toml
 *.local.yaml
 *.local.yml
 *.local.txt
-# 本地草稿区：调试实验、临时导出、抓包等本机产物统一放 local/，整目录忽略。
-# 只要写进 local/ 就不会入库，提交前无需逐一检查。
+# 本地草稿区：调试实验、临时导出、抓包等本机产物统一放 local/；
+# 该目录整体忽略，其下文件的入库状态由目录规则统一决定。
 /local/
-# 兜底：即使有人在草稿区之外落了调试文件，也一并挡住（常含本机绝对路径或调试输出）。
+# 兜底规则：草稿区之外落下的调试文件同样忽略（常含本机绝对路径或调试输出）。
 .tmp*/
 /tmp/
 /tools/tmp_*.sh
@@ -49,7 +49,7 @@ logs/archive/
 temp_code_*.txt
 scratch_*.py
 debug_*.py
-# case/ 的工作区是生成物（setup_cmd 重建），基线在 case/pristine/ 下，别把工作区提进来
+# case/ 的工作区是生成物（由 setup_cmd 重建），基线位于 case/pristine/ 下，工作区不入库
 case/work/
 *.log
 
