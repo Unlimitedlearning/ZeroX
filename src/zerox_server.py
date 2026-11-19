@@ -41,11 +41,10 @@ CURRENT_WORKDIR = None
 # 一个变量只描述一件事：setup 失败时就地置回 None
 START_TIME = None
 CURRENT_ROUND = 0
-# 累计补丁数：只用于指标与预算读数，不是任务终止条件
+# 累计补丁数：只用于日志与指标，不是任务终止条件
 TOTAL_ATTEMPTS = 0
-# 累计测试次数：本任务真正的成本单位（一次测试 3-6 分钟），也是唯一的硬闸门
+# 累计测试次数：唯一的强制限制；达到上限即终止任务，不向 agent 报告剩余次数
 TOTAL_TESTS = 0
-READ_CODE_COUNT = 0
 
 # ==========================================
 # [跨平台] 运行环境检测（IS_WINDOWS 跟随执行器一起外迁到 src/zerox_core/exec_env.py）
@@ -84,8 +83,8 @@ TARGET = config_mod.load_target_config(CONFIG, CONFIG_FILE)
 AGENT_CONFIG = config_mod.load_agent_config(CONFIG, CONFIG_FILE)
 TOOL_PATH = TARGET["tool_path"]
 WORKSPACE_ROOT = (TARGET["workspace_root"] or "").rstrip("/")
-# 预算单位是「测试次数」：一个 patch 只花几 KB 上下文，一次测试要 3-6 分钟。
-# 所以要限制的是昂贵的那个动作，patch 本身不限次（编译错误修复也算 patch，不该吃预算）。
+# 唯一的强制限制是「测试次数」：达到上限即终止任务。补丁本身不限次。
+# 该计数只在服务端用于终止判定，不向 agent 播报，避免把测试暗示成需要节省的稀缺资源。
 MAX_TESTS = AGENT_CONFIG.get("max_tests", 12)
 TEST_TIMEOUT = CONFIG["timeouts"]["test_execution"]
 
@@ -157,19 +156,6 @@ def check_patch_path(raw_path: str):
 def resolve_read_path(raw_path):
     """读工具的统一入口：纯解析逻辑在 zerox_core.paths，这里只注入当前工作区。"""
     return core_paths.resolve_read_path(raw_path, CURRENT_WORKDIR)
-
-
-# ==========================================
-# 【预算读数】只报不管
-# 把事实告诉 agent，由它自己决定；唯一的硬闸门是测试次数（见 run_test）。
-# ==========================================
-def budget_line() -> str:
-    """一行预算读数，附在 run_test / patch_and_log 的返回末尾。"""
-    left = max(0, MAX_TESTS - TOTAL_TESTS)
-    return (
-        f"\n\n[预算] 测试 {TOTAL_TESTS}/{MAX_TESTS}（还剩 {left} 次）"
-        f" · 补丁 {TOTAL_ATTEMPTS} 个 · 本轮已读代码 {READ_CODE_COUNT} 次"
-    )
 
 
 def write_target_file(target_path: str, content: str):
@@ -299,7 +285,7 @@ def patches_touching_tests():
     客户端就会把这个 pass 当成唯一正样本、metrics 也会记 Fixed
     （Time_11 实测：测试体被换成 assertNotNull(...) 后套件就通过，主代码一个字都没改）。
 
-    判定直接调 audit.audit_events：运行时的闸门和事后审计必须是同一套标准，
+    判定直接调 audit.audit_events：运行时的检查与事后审计必须是同一套标准，
     否则会出现「跑的时候放过了、审计才报违规」这种自相矛盾的结果（且那份逻辑已被
     tools/selftests/audit_selftest.py 覆盖，不需要在服务端再写一遍）。
     """
@@ -328,7 +314,7 @@ async def list_tools():
 async def call_tool(name: str, arguments: dict):
     global current_log_handle, current_process, WORK_JSON_FILE, TEST_LOG_FILE, CURRENT_BUG
     global START_TIME, CURRENT_ROUND, TOTAL_ATTEMPTS, TOTAL_TESTS
-    global READ_CODE_COUNT, CURRENT_WORKDIR
+    global CURRENT_WORKDIR
 
     # 🚨 绝杀：每次调用任何工具前，强制等待上一次的测试进程跑完（防并发冲突）
     wait_for_previous_process()
@@ -347,11 +333,11 @@ async def call_tool(name: str, arguments: dict):
         setup_cmd = bug_ctx["setup_cmd"]
         test_cmd = bug_ctx["test_cmd"]
 
-        # 【预算闸门】一次测试 3-6 分钟，跑满就结束 —— 这是唯一会真正拖住任务的地方。
+        # 【测试次数上限】测试次数达到上限即终止任务 —— 这是服务端唯一的强制限制。
         # 放在 checkout 之前有两个理由：
-        #   1. 预算已经用尽时，没必要再花 2-3 分钟准备一个不会跑测试的工作区；
+        #   1. 次数已经用尽时，没必要再花时间准备一个不会跑测试的工作区；
         #   2. 只有「换了 bug」才算新任务并复位 TOTAL_TESTS。否则 agent 自己传一个
-        #      force_checkout=true 就能把 12 次预算重置成满额，这道闸门就形同虚设。
+        #      force_checkout=true 就能把次数重置成满额，这道限制即可被绕过。
         is_new_bug = CURRENT_BUG != new_bug_id
         if not is_new_bug and TOTAL_TESTS >= MAX_TESTS:
             reset_task_state("MaxTests")
@@ -391,7 +377,7 @@ async def call_tool(name: str, arguments: dict):
             WORK_JSON_FILE = os.path.join(CURRENT_BUG_DIR, "work_log.jsonl")
             
             # 【新一轮任务】工作区刚被重置，旧的 work_log 里的轮次/补丁已经对不上当前代码，
-            # 留着只会误导 agent（和指标里的 current_round），直接清掉
+            # 留着只会误导 agent（和指标里的 current_round），直接删除
             if os.path.exists(WORK_JSON_FILE):
                 try:
                     os.remove(WORK_JSON_FILE)
@@ -403,10 +389,9 @@ async def call_tool(name: str, arguments: dict):
             START_TIME = time.time()
             CURRENT_ROUND = 0
             TOTAL_ATTEMPTS = 0
-            # 只有新 bug 才复位测试预算：同一个 bug 上的 force_checkout 不能当「续命」用
+            # 只有新 bug 才复位测试计数：同一个 bug 上的 force_checkout 不能当「续命」用
             if is_new_bug:
                 TOTAL_TESTS = 0
-            READ_CODE_COUNT = 0
             
             logging.info(f"切换当前 Bug 为 {CURRENT_BUG} | 执行全量 Checkout")
 
@@ -468,27 +453,27 @@ async def call_tool(name: str, arguments: dict):
                 # 超时不能把补丁一起丢掉：保持「已检出 + 已修改」，下一次 run_test 走增量而不是重新 checkout
                 # （START_TIME 兼做就绪标志：重新起算即可）
                 START_TIME = time.time()
-                return [types.TextContent(type="text", text=f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。" + budget_line(), isError=True)]
+                return [types.TextContent(type="text", text=f"【测试超时】执行超过 {TEST_TIMEOUT} 秒仍未结束，进程已被强制终止。", isError=True)]
 
             logging.info("测试进程结束，正在解析日志...")
             
             # 读取并解析日志
             if not os.path.exists(TEST_LOG_FILE):
-                save_test_result("Unknown", None, "测试完成，但日志文件不存在。")
-                return [types.TextContent(type="text", text="测试完成，但日志文件不存在。", isError=True)]
+                save_test_result("Unknown", None, "测试完成，但服务端未生成测试日志。请重试 run_test；若连续出现，停止并说明情况。")
+                return [types.TextContent(type="text", text="测试完成，但服务端未生成测试日志。请重试 run_test；若连续出现，停止并说明情况。", isError=True)]
             
             with open(TEST_LOG_FILE, "r", encoding="utf-8", errors="replace") as log_f:
                 content = log_f.read()
 
             if not content.strip():
-                save_test_result("EmptyLog", None, "【日志为空】测试没有任何输出。")
-                return [types.TextContent(type="text", text="【日志为空】测试没有任何输出。")]
+                save_test_result("EmptyLog", None, "【日志为空】测试没有任何输出，无法判定结果。请重试一次 run_test。")
+                return [types.TextContent(type="text", text="【日志为空】测试没有任何输出，无法判定结果。请重试一次 run_test。")]
 
             exit_code = current_process.returncode
 
             # 【可配置判定】通过/失败规则来自 config.json 的 target.passed_pattern / failed_pattern
             if PASS_RE.search(content):
-                # 【假通过闸门】通过的前置条件：这次跑的是原始测试。改测试能造出通过，但造不出修复，
+                # 【假通过检查】通过的前置条件：这次跑的是原始测试。改测试能造出通过，但造不出修复，
                 # 所以只把「原始测试上的通过」当成正样本；被污染的那次会明确要求它先 rollback。
                 dirty = patches_touching_tests()
                 if dirty:
@@ -525,7 +510,7 @@ async def call_tool(name: str, arguments: dict):
                 # 只在 maven 项目的 target/surefire-reports/ 里；实测 ant 项目（Lang）workspace 的
                 # build/ 下只有 classes 和 tests，没有任何报告文件，所以只给一条路径 + 一次止损。
                 # 提示只进本次返回、不写进 work_log —— 否则 digest 的 1200 字尾部窗口会被提示挤掉真实报错。
-                # 取法是 search_code + read_specific_code，两步都是免费的，不花测试预算。
+                # 取法是 search_code + read_specific_code，两步都只读，不消耗测试次数。
                 hint = (
                     "\n\n[提示] 需要断言原文（expected/actual、出错行）时：只有 maven 项目有 —— "
                     "search_code(keyword='<失败测试的类名>', file_pattern='*.xml')，"
@@ -533,7 +518,7 @@ async def call_tool(name: str, arguments: dict):
                     "搜不到一次就别再找日志（ant 项目的 build/ 下只有 classes 和 tests，没有报告），"
                     "直接去读失败的测试方法本身。"
                 )
-                return [types.TextContent(type="text", text=fail_msg + hint + budget_line())]
+                return [types.TextContent(type="text", text=fail_msg + hint)]
 
             tail_msg = f"最新日志如下（退出码 {exit_code}）:\n{content[-2000:]}"
             save_test_result("Unknown", None, tail_msg)
@@ -558,7 +543,7 @@ async def call_tool(name: str, arguments: dict):
         
         # grep 的 --include 只匹配 basename。模型常传 "src/main/java/.../Foo.java" 或
         # "*tz/*.java" 这种带路径的模式，直接拼进 --include 会静默返回「未找到」，
-        # 模型还会反过来怀疑是自己用错了工具（Time_11 的 turn 12/13 各撞一次）。
+        # 模型还会反过来怀疑是自己用错了工具（Time_11 的 turn 12/13 各出现一次）。
         # 现在把路径拆开：basename 给 --include，不带通配的路径前缀当搜索目录；
         # 前缀下没有命中就退回整个工作区，并在结果里说明换了范围。
         include = pattern.rsplit("/", 1)[-1] or TARGET["source_glob"]
@@ -596,7 +581,6 @@ async def call_tool(name: str, arguments: dict):
         if not ok_path:
             return [types.TextContent(type="text", text=path_or_err, isError=True)]
         wsl_path = path_or_err
-        READ_CODE_COUNT += 1
         start_line = arguments.get("start_line")
         end_line = arguments.get("end_line")
 
@@ -612,16 +596,30 @@ async def call_tool(name: str, arguments: dict):
             if start_line is None or end_line is None:
                 return [types.TextContent(type="text", text=f"【警告：正在读取全量文件，共 {total_lines} 行，可能很占上下文。建议下次指定 start_line 和 end_line】\n" + result.stdout)]
 
-            # 切片（注意 Python 的 0-index 和越界处理）
-            start_idx = max(0, start_line - 1)
-            end_idx = min(total_lines, end_line)
+            # 行号边界：越界时明确说明总行数，避免返回空结果让模型原样重试
+            if start_line < 1 or end_line < start_line:
+                return [types.TextContent(type="text", text=(
+                    f"行号无效：start_line={start_line}, end_line={end_line}。"
+                    f"{wsl_path} 共 {total_lines} 行，请传 1 ≤ start_line ≤ end_line ≤ {total_lines}。"
+                ), isError=True)]
 
+            if start_line > total_lines:
+                return [types.TextContent(type="text", text=(
+                    f"起始行超出文件末尾：{wsl_path} 共 {total_lines} 行，start_line={start_line}。"
+                    f"请改读 1-{total_lines} 之间的范围，或改用 search_code 定位。"
+                ), isError=True)]
+
+            start_idx = start_line - 1
+            end_idx = min(total_lines, end_line)
             selected_lines = lines[start_idx:end_idx]
 
             # 带行号输出
             formatted_lines = [f"{start_idx + i + 1}: {line}" for i, line in enumerate(selected_lines)]
 
-            return [types.TextContent(type="text", text=f"文件 {wsl_path} 第 {start_line}-{end_line} 行内容如下:\n" + "\n".join(formatted_lines))]
+            header = f"文件 {wsl_path} 第 {start_idx + 1}-{end_idx} 行（共 {total_lines} 行）内容如下："
+            if end_line > total_lines:
+                header += f"\n（end_line={end_line} 超出末尾，已截断到 {total_lines}）"
+            return [types.TextContent(type="text", text=header + "\n" + "\n".join(formatted_lines))]
         except Exception as e:
             return [types.TextContent(type="text", text=f"异常: {str(e)}")]
 
@@ -657,7 +655,7 @@ async def call_tool(name: str, arguments: dict):
                         structure_info.append(f"[第 {i+1} 行] 方法: {method_match.group(1)}")
 
             if not structure_info:
-                return [types.TextContent(type="text", text="未在文件中找到明显的类或方法结构，请直接使用 read_specific_code 读取全量代码（不传 start_line），自行分析。")]
+                return [types.TextContent(type="text", text="未在文件中找到明显的类或方法结构。可先用 read_specific_code 读取前 80 行，或用 search_code 定位具体方法名后再读该范围。")]
             
             # 行为约束：让模型按行读、别读全文件（schema 里的建议此前从未真正生效）
             # 措辞刻意不说「权威/完全信任」——结构来自简单正则，会漏构造函数、泛型方法，
@@ -682,8 +680,9 @@ async def call_tool(name: str, arguments: dict):
         if WORK_JSON_FILE is None:
             return [types.TextContent(type="text", text="【系统拒绝】请先调用 run_test 初始化当前 Bug 的测试环境。", isError=True)]
         
-        round_num = arguments.get("round")
-        status = arguments.get("status")
+        # 轮号由服务端自增，不采信模型传入的值：模型常在各轮里重复填同一个数，
+        # 而 rollback 的「撤销第 N 轮及之后」完全依赖这个编号。
+        round_num = (CURRENT_ROUND or 0) + 1
         reasoning = arguments.get("reasoning")
         fix_summary = arguments.get("fix_summary")
         changes = arguments.get("changes", [])
@@ -749,7 +748,7 @@ async def call_tool(name: str, arguments: dict):
             for wsl_path in order
         ]
         try:
-            _worklog().apply(round_num, status, reasoning, fix_summary, writes)
+            _worklog().apply(round_num, "PATCHED", reasoning, fix_summary, writes)
         except worklog.WorkLogError as err:
             msg = f"写入硬盘失败：{err}。已自动还原 {len(err.restored)} 个文件"
             if err.broken:
@@ -757,11 +756,10 @@ async def call_tool(name: str, arguments: dict):
             msg += "。本轮修改未写入工作日志。"
             return [types.TextContent(type="text", text=msg, isError=True)]
 
-        # 更新全局轮次变量，供预算读数使用
+        # 更新全局轮次变量，供失败信息与指标使用
         CURRENT_ROUND = round_num
         TOTAL_ATTEMPTS += 1
-        READ_CODE_COUNT = 0
-        return [types.TextContent(type="text", text="Patch applied successfully. IMMEDIATELY call run_test to verify. Do NOT speak." + budget_line())]
+        return [types.TextContent(type="text", text="补丁已应用。请立刻调用 run_test 验证，不要输出解释。")]
 
     elif name == "get_work_log":
         # 【多 Bug 隔离】只读当前 Bug 的工作日志

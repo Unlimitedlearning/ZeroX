@@ -1,9 +1,9 @@
-"""ZeroX Agent 入口：驱动 LLM 与 MCP Server 对话，直到测试报「全部通过」或预算用尽。
+"""ZeroX Agent 入口：驱动 LLM 与 MCP Server 对话，直到测试报「全部通过」或测试次数用尽。
 
     python src/zerox.py                       # 跑 config.json 里的 benchmark_bugs
     python src/zerox.py --config case/config.json
 
-本文件是 Agent 本体，不是「基准测试脚本」：循环、预算外账、指标都在这层
+本文件是 Agent 本体，不是「基准测试脚本」：循环、计数与指标都在这层
 （服务端看不到 token，也看不到终态）。
 """
 import asyncio
@@ -76,15 +76,15 @@ COMPACT_KEEP_DECISIONS = 4
 # 测试日志或大补丁 diff 能把刚压缩出来的上下文再撑爆一次。
 COMPACT_KEEP_MSG_CHARS = 4000
 # 【滚动摘要】压缩时从 work_log 生成一段受控长度的状态快照，随压缩提示一起常驻注入，
-# 让模型一睁眼就看到「当前推断 / 失败趋势 / 已排除方向」，不再只靠它主动调 get_work_log。
+# 让模型一睁眼就看到「当前推断 / 最近测试 / 已排除方向」，不再只靠它主动调 get_work_log。
 COMPACT_BRIEF_CHARS = 1200
 
 # 上下文压缩的两个阈值都来自 config.json 的 agent 段落：
 #   compact_context_chars  体量触发（窗口会不会爆）
-#   compact_idle_reads     空转触发（有没有在原地读）
+#   compact_idle_reads     空转触发（是否在重复读取同一位置）
 # 空转触发不再往工具返回里插提醒（实测模型无视，还污染结果）：「小步推进」写在
 # AGENTS.md 里常驻。这里只留机制：连续 N 次只读（中间没有任何补丁/测试）就预约
-# 两轮之后压缩一次，逼它醒来看 get_work_log。
+# 两轮之后压缩一次，强制其在下一轮重新读取 get_work_log。
 # 数值在下面和 COMPACT_CONTEXT_CHARS 一起从 AGENT_CONF 读（这里还没读配置）。
 FREE_TOOLS = {"search_code", "read_specific_code", "get_file_internal_structure", "get_work_log"}
 
@@ -121,7 +121,7 @@ if api_key.startswith("${") and api_key.endswith("}"):
     api_key = os.getenv(api_key[2:-1])
 
 BUGS_TO_TEST = CONFIG.get("benchmark_bugs", ["Lang_1"])
-# 轮次没有上限：收敛的硬闸门是服务端的 max_tests（见 run_single_bug 的循环）
+# 轮次没有上限：唯一的强制限制是服务端的 max_tests（见 run_single_bug 的循环）
 # 上下文超过这么多字符就压缩（阈值写在 config.json 的 agent.compact_context_chars）
 COMPACT_CONTEXT_CHARS = int(AGENT_CONF.get("compact_context_chars") or 160000)
 # 连续只读调用到点就预约压缩（阈值在 agent.compact_idle_reads）；0 / null = 只按体量压缩。
@@ -165,7 +165,7 @@ def canonical_bug_id(bug_id: str) -> str:
     """请求名 → 磁盘用的规范名（Lang_1 → Lang_1b）。
 
     服务端用 resolve_bug() 算工作区与 logs/<规范名>/，审计也按规范名找目录；
-    客户端留档也走同一个纯函数，否则一次运行会裂成 Lang_1/（transcript）
+    客户端归档也走同一个纯函数，否则一次运行会分裂为 Lang_1/（transcript）
     和 Lang_1b/（work_log、test.log）两个目录。
     """
     try:
@@ -225,7 +225,7 @@ def append_transcript(bug_id: str, turn: int, tag: str, text: str, limit: int = 
 def reasoning_text(msg) -> str:
     """取出模型自己吐的思考内容（不同 provider 字段名不同，取不到就返回空）。
 
-    只写进 transcript.md 留档，【绝不能】回填进 messages：DeepSeek 的 reasoner 类模型
+    只写进 transcript.md 归档，【绝不能】回填进 messages：DeepSeek 的 reasoner 类模型
     明确禁止把 reasoning_content 再发回去（400）。所以它也不计入 context_chars。
     """
     extra = msg.get("model_extra") if isinstance(msg, dict) else getattr(msg, "model_extra", None)
@@ -277,7 +277,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     free_streak = 0
     # 「到点强制压缩」的预约（0-based 的 turn 号）：只读 streak 到 COMPACT_IDLE_READS 时
     # 记下 turn+2 —— 下一轮留一轮反应时间，再下一轮顶部执行。写补丁/跑测试会取消它：
-    # 已经在推进就不必擦记忆。这样「上下文将截断」才是可兑现的承诺，而不是随轮数漂移的口头警告。
+    # 已经在推进就不必丢弃上下文。这样「上下文将截断」才是可兑现的承诺，而不是随轮数漂移的口头警告。
     compact_due_turn = None
     # 终态只有三种：Fixed / Failed / Error，兜底值是 Error
     # 出口只有三个：「测试通过」「明确失败」「异常」
@@ -287,8 +287,8 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     # 本 bug 的第一次 run_test 显式声明全量 checkout（任务边界由客户端决定，见下方注入）
     fresh_task = True
 
-    # 轮次没有上限：硬闸门是服务端的测试预算，用光时 run_test 返回【任务失败】把循环逼出去。
-    # 只读轮次不消耗预算，所以纯只读的循环（一次测试都不跑）只能人工中断。
+    # 轮次没有上限：唯一的强制限制是服务端的测试次数上限，用尽时 run_test 返回【任务失败】强制循环退出。
+    # 只读轮次不消耗测试次数，所以纯只读的循环（一次测试都不跑）只能人工中断。
     turn = -1
     while True:
         turn += 1
@@ -349,7 +349,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
             # 注意：messages 末尾可能是 tool 消息（保留轮次带的），API 同样接受，模型会接着回复
 
             # 压缩就是「把当前记忆换掉」这个动作本身，所以两个计数器必须一起归零：
-            # 否则 streak 还停在 12 以上，下一轮立刻又预约一次，变成无限反复擦记忆。
+            # 否则 streak 还停在 12 以上，下一轮立刻又预约一次，变成无限重复丢弃上下文。
             compact_due_turn = None
             free_streak = 0
 
@@ -430,7 +430,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                     if fn_name == "run_test" and fresh_task:
                         fn_args["force_checkout"] = True
 
-                    # 留档写在注入之后：记录的是实际发出去的那份参数
+                    # 归档写在注入之后：记录的是实际发出去的那份参数
                     append_transcript(bug_id, turn + 1, f"call:{fn_name}",
                                       json.dumps(fn_args, ensure_ascii=False))
                     result = await session.call_tool(fn_name, arguments=fn_args)
@@ -440,9 +440,10 @@ async def run_single_bug(bug_id: str, session: ClientSession):
 
                     if fn_name == "patch_and_log":
                         counters["patches"] += 1
-                        called_round = fn_args.get("round")
-                        if isinstance(called_round, int):
-                            counters["round"] = max(counters["round"], called_round)
+                        # 轮号由服务端按 CURRENT_ROUND + 1 自增，这里镜像同一规则：
+                        # 只有真正落盘的补丁才推进一轮，被拒绝的调用不推进。
+                        if not getattr(result, "isError", False):
+                            counters["round"] += 1
                     elif fn_name == "run_test":
                         counters["tests"] += 1
                     elif fn_name == "rollback" and not getattr(result, "isError", False):
@@ -462,7 +463,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                             compact_due_turn = turn + 2
                     else:
                         free_streak = 0
-                        # 写了补丁 / 跑了测试 = 已经在推进，没必要再擦它的记忆
+                        # 写了补丁 / 跑了测试 = 已经在推进，无需丢弃其上下文
                         compact_due_turn = None
 
                     # 服务端只在 passed_pattern 命中后才会回这句话，是唯一的正样本信号
@@ -470,7 +471,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                         saw_passing_test = True
 
                     if "【任务失败】" in result_text:
-                        print(f"  💀 [{bug_id}] Server 端测试预算用尽，任务结束。")
+                        print(f"  💀 [{bug_id}] 服务端测试次数达到上限，任务结束。")
                         final_status = "Failed"
                         break
                 except Exception as e:
@@ -484,7 +485,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                     "content": result_text
                 })
 
-                # 工具返回同样是「AI 看到的东西」，一起留档（内部按 limit 截断）
+                # 工具返回同样是「AI 看到的东西」，一起归档（内部按 limit 截断）
                 append_transcript(bug_id, turn + 1, f"result:{fn_name}", result_text)
             
             if final_status in ("Fixed", "Failed"):

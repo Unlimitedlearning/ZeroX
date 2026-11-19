@@ -1,7 +1,7 @@
 """worklog —— 给 agent 用的最小版本控制系统（与 APR 无关，可单独复用）。
 
 三个概念：
-  blob    文件内容按 sha1 存一份，和路径无关，天然去重，也不会被同名文件撞掉
+  blob    文件内容按 sha1 存一份，和路径无关，天然去重，也不会被同名文件覆盖
   event   一条 JSON 事件（patch / test / rollback），append-only
   round   一轮修复；rollback(to_round) 撤销该轮及之后的全部 patch
 
@@ -13,7 +13,7 @@
 
 日志格式（work_log.jsonl，一行一条）。正常路径只追加、永不覆盖写；唯一的例外是
 rollback()：它先把被撤销的事件抄进 human_audit.jsonl，再重写 work_log.jsonl（见下方 rollback）：
-  {"t":"patch","ts":"2026-11-17T14:12:05","round":3,"status":"PATCH_GENERATED",
+  {"t":"patch","ts":"2026-11-17T14:12:05","round":3,"status":"PATCHED",
    "reasoning":"...","summary":"...",
    "files":[{"path":"/ws/src/Foo.java","before":"<sha1>"|null,"after":"<sha1>",
              "added":4,"removed":2}]}
@@ -199,7 +199,7 @@ class WorkLog:
         dropped = [ev for ev in events if ev["t"] == "patch" and _round_reached(ev.get("round"), to_round)]
 
         restored, broken = [], []
-        # 倒序撤销：同一个文件被改过多次时，最后落地的 before 才是原始内容
+        # 倒序撤销：同一个文件被改过多次时，最后一次写入前的 before 才是原始内容
         for event in reversed(dropped):
             for item in reversed(event.get("files") or []):
                 path = item.get("path")
@@ -364,7 +364,7 @@ class WorkLog:
         """压缩后常驻注入上下文的精简快照：当前推断 / 失败数趋势 / 已排除方向。
 
         与 digest() 的区别：digest 是模型主动调用 get_work_log 时才看到的完整视图；
-        brief 是压缩那一刻由客户端主动塞回上下文的一段状态，恢复不再只靠模型「记得去读日志」。
+        brief 是压缩那一刻由客户端主动写回上下文的一段状态，恢复不再只靠模型「记得去读日志」。
         总长度受 max_chars 约束，避免摘要本身又把刚压缩出来的窗口撑大。
         """
         events = self.events()
@@ -388,11 +388,23 @@ class WorkLog:
             if summary:
                 lines.append(f"本轮动作：{summary}")
 
-        # 失败数趋势：首 → 末，是判断收敛还是发散的关键信号
+        # 失败数趋势：首 → 末，是判断收敛还是发散的关键信号。
+        # 只有一次测试时不写成「N → N」：那读起来像「补丁没生效」，模型会据此重打一遍。
         if tests:
             first, last = tests[0], tests[-1]
-            lines.append(f"测试趋势：{first.get('fail_count', '?')} → "
-                         f"{last.get('fail_count', '?')} 个失败（{last.get('status', '?')}）")
+            last_round = last.get("round") or 0
+            if len(tests) >= 2:
+                lines.append(f"测试趋势：{first.get('fail_count', '?')} → "
+                             f"{last.get('fail_count', '?')} 个失败（{last.get('status', '?')}）")
+            else:
+                lines.append(f"上次测试（轮 {last_round}）：{last.get('fail_count', '?')} 个失败"
+                             f"（{last.get('status', '?')}）")
+            # 补丁已打上但还没测：必须点明「下面是打补丁之前的数字」，
+            # 否则状态卡会被读成「刚打的补丁仍然失败」。
+            untested = [p for p in patches if (p.get("round") or 0) > last_round]
+            if untested:
+                rounds = "、".join(str(p.get("round")) for p in untested)
+                lines.append(f"未验证：轮 {rounds} 的补丁还没跑过测试，以上是它之前的结果")
             detail = (last.get("detail") or "").strip()
             if detail:
                 last_line = detail.splitlines()[-1] if detail.splitlines() else detail

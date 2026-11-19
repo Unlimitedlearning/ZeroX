@@ -31,7 +31,7 @@ def _call_arguments(call):
 def _clip_arguments(args, limit):
     """把超长的 tool_calls.arguments 压成合法 JSON 占位串（留头留尾 + 原长）。
 
-    用 json.dumps 而不是裸截断，是为了让结果仍是合法 JSON —— 历史 assistant 消息会被
+    用 json.dumps 而不是直接截断，是为了让结果仍是合法 JSON —— 历史 assistant 消息会被
     原样回传 API，半截 JSON 参数在部分 provider 上会触发 400。完整参数能从 get_work_log
     找回，所以这里只保留供模型辨认方向的头尾片段。
     """

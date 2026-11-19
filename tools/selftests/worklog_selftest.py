@@ -60,6 +60,29 @@ def main():
         assert len(wl.brief(max_chars=80)) <= 90, "brief 必须尊重 max_chars 上限"
         assert "暂无历史工作日志" in worklog.WorkLog(os.path.join(tmp, "empty")).brief()
 
+        # 【未验证补丁】打完补丁还没跑测试时，状态卡不能让旧结果看起来像新结果：
+        # Lang_10 上模型把单次测试的「2 → 2」读成「刚打的补丁仍失败」，转去写探针，多花了两倍 token。
+        tmp2 = os.path.join(tmp, "case2")
+        os.makedirs(tmp2)
+        target2 = os.path.join(tmp2, "Bar.java")
+        with open(target2, "w", encoding="utf-8", newline="") as f:
+            f.write("a\nb\n")
+        wl2 = worklog.WorkLog(os.path.join(tmp, "logs2"))
+        wl2.test(0, "Failed", 2, "2 failing tests ...")
+        b1 = wl2.brief(title="Demo_2b")
+        assert "→" not in b1 and "上次测试（轮 0）" in b1, b1
+        wl2.apply(1, "PATCHED", "空格应精确匹配", "把 \\s*+ 改成 \\s", [
+            (target2, "a\nb\n", "a\nc\n"),
+        ])
+        b2 = wl2.brief(title="Demo_2b")
+        assert "未验证：轮 1" in b2, b2
+        wl2.test(1, "Passed", 0, "")
+        b3 = wl2.brief(title="Demo_2b")
+        assert "未验证" not in b3 and "测试趋势：2 → 0" in b3, b3
+        wl2.apply(2, "PATCHED", "再改一次", "调整边界", [(target2, "a\nc\n", "a\nd\n")])
+        b4 = wl2.brief(title="Demo_2b")
+        assert "测试趋势：2 → 0" in b4 and "未验证：轮 2" in b4, b4
+
         restored, broken = wl.rollback(1, reasoning="探针确认 indexOfLast 返回首个匹配", kind="probe")
         assert not broken, broken
         assert len(set(restored)) == 2, restored

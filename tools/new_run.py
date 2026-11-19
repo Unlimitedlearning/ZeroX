@@ -9,7 +9,7 @@
   1. 把 logs/ 下除 archive/ 之外的一切（benchmark_metrics.jsonl / audit.jsonl /
      mcp_server.log / 每个 bug 的 work_log + blobs + test.log + verify.log）移动到
      logs/archive/<YYYYmmdd-HHMMSS>/，并写一份 manifest.json；
-  2. 顺手清掉 __pycache__（下次运行会自动重建，不影响任何结果）；
+  2. 同时清理 __pycache__（下次运行会自动重建，不影响任何结果）；
   3. 打印 config.json 里这次要跑的 bug 列表和接下来的两条命令。
 
 因为整轮数据都被移走了，不需要再单独备份 metrics：新一轮会重新建文件。

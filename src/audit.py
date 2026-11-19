@@ -53,7 +53,7 @@ def match_any_glob(path: str, globs) -> bool:
 
 
 def load_events(log_path):
-    """读 work_log.jsonl；坏行跳过，不让一条脏数据废掉整次审计。"""
+    """读取 work_log.jsonl；跳过无法解析的行，避免单行损坏导致整次审计失败。"""
     events = []
     if not log_path or not os.path.exists(log_path):
         return events
@@ -216,7 +216,7 @@ def verify_fixed(bug_dir, workspace, test_cmd, passed_pattern,
                     "notes": notes}
 
     # 输出直接写盘而不是走 PIPE：复跑要 3-6 分钟，走 PIPE 意味着这几分钟里一个字也看不到，
-    # 看上去就是「卡住」。写文件后旁边 tail -f logs/<bug>/verify.log 就能看进度。
+    # 外部观察会以为进程已挂起。改为写文件后，可在旁边 tail -f logs/<bug>/verify.log 查看进度。
     log_path = os.path.join(str(bug_dir), "verify.log") if bug_dir else None
     handle = None
     try:

@@ -59,7 +59,7 @@ DEFAULT_TARGET = {
 }
 
 DEFAULT_AGENT = {
-    # 单个 bug 允许的 run_test 次数上限：一次测试 3-6 分钟，这是本任务唯一真实的成本
+    # 单个 bug 允许的 run_test 次数上限：服务端唯一的强制限制，达到即终止任务
     "max_tests": 12,
     # ---- 以下是客户端（src/zerox.py）的开关，服务端不读 ----
     # 都是「要经常微调」的默认值：实际生效值由 config.json 的 agent 段落提供，这里仅作兜底

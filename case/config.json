@@ -21,7 +21,7 @@
     "max_tests": 12,
     "compact_context_chars": 120000,
     "system_prompt_file": "AGENTS.md",
-    "user_prompt_template": "Please fix the bug in {bug_id}. It is a single Java file that contains both the code under test and its tests: never change main(), the test helpers or the expected values. Begin by calling run_test with bug_id='{bug_id}'.",
+    "user_prompt_template": "Please fix the Java bug {bug_id}. Begin by calling run_test with bug_id='{bug_id}'.",
     "fixed_marker": "[FIXED]",
     "failed_marker": "[FAILED]"
   },
