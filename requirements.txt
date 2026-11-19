@@ -1,0 +1,4 @@
+# ZeroX runtime dependencies
+# Verified on Python 3.11.9 (Windows); the rest of the project uses only the stdlib.
+openai==3.42.0
+mcp==1.30.0
