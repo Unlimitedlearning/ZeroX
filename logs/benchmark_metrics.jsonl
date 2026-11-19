@@ -1,1 +1,0 @@
-{"timestamp": "2026-11-19T00:04:17", "bug_id": "Lang_1", "bug_id_requested": "Lang_1", "status": "Fixed", "total_time_seconds": 96.37, "prompt_tokens": 95528, "completion_tokens": 4393, "total_tokens": 99921, "api_calls": 14, "turns": 14, "current_round": 1, "total_attempts": 1, "tests": 2, "audit": "clean", "audit_version": 2, "audit_violations": [], "audit_rolled_back": []}

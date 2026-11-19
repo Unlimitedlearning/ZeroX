@@ -19,6 +19,8 @@ logs/**
 !logs/benchmark_metrics.jsonl
 !logs/audit.jsonl
 !logs/*/human_audit.jsonl
+# archive/ 是项目尚未定稿时的历史运行归档，不作为正式数据提交
+logs/archive/
 
 # 只忽略【项目根目录】的 config.json（本机配置）。
 # 必须写成 /config.json：无斜杠的规则会在任意层级生效，会把 case/config.json 一起忽略掉
