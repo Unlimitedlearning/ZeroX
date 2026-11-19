@@ -176,10 +176,11 @@ def canonical_bug_id(bug_id: str) -> str:
 
 
 def state_card_content(bug_id: str) -> str:
-    """【L1 活状态卡】每轮从 work_log 重建的当前状态，作为常驻 system 消息。
+    """【L1 活状态卡】每轮从 work_log 重建的当前状态，作为请求末尾的 system 消息。
 
     它不是压缩那一刻的死快照，而是每次请求前都刷新 —— 模型每一轮都带着最新状态，
     恢复不再依赖「模型记得去读 get_work_log」这一步软约束。读日志失败只降级，不中断。
+    放在请求末尾而非开头，是为了让前面的历史前缀保持稳定、命中服务端缓存。
     """
     try:
         log_home = os.path.join(LOG_DIR, canonical_bug_id(bug_id))
@@ -242,11 +243,12 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     print(f"🚀 开始测试 Bug: {bug_id}")
     print("="*50)
     
-    # 【L1 活状态卡】常驻 system 消息：每轮刷新，压缩时显式保留，不随历史被裁掉。
+    # 【L1 活状态卡】不进入 messages 正文，仅在每次 API 调用时临时拼到末尾。
+    # 这样 system + 逐轮累积的历史构成稳定前缀，可被服务端前缀缓存命中；
+    # 每轮变化的状态卡位于末尾，不会让前面的缓存前缀失效。
     state_card = {"role": "system", "content": state_card_content(bug_id)}
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        state_card,
         {"role": "user", "content": AGENT_CONF["user_prompt_template"].replace("{bug_id}", bug_id)}
     ]
 
@@ -301,10 +303,6 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                       else f"上下文已达 {ctx_chars} 字（阈值 {COMPACT_CONTEXT_CHARS}）")
             print(f"  ✂️ [{bug_id}] {reason}，触发压缩！按价值保留决策轮，丢弃闲聊轮...")
 
-            # 【L1】压缩这一刻先把常驻状态卡刷新到最新——它是唯一的活状态源，
-            # 压缩后依然在 messages[1]，模型一睁眼就能看到，不必去读日志。
-            state_card["content"] = state_card_content(bug_id)
-
             # 【L2 价值裁剪】保留「最近 N 轮」+「最近 K 个决策轮（补丁/测试/回滚）」：
             # 既不让刚做的事被清空（会重读文件），也不丢掉早期写在 reasoning 里的关键假设。
             # keep_valuable_turns 从 assistant 边界切，结果不含孤立 tool 消息，可安全回传。
@@ -324,10 +322,10 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                         recent_tool_output = content if isinstance(content, str) else str(content)
                         break
 
-            # 状态卡已经常驻在最上方，这里不再重复注入摘要，只说明发生了什么。
+            # 状态卡在每轮请求时拼在末尾，这里不再重复注入摘要，只说明发生了什么。
             reset_content = (
                 "SYSTEM NOTICE: Conversation history was compacted to save memory. "
-                "Your current state is in the LIVE STATE message above — it is refreshed "
+                "Your current state is in the LIVE STATE message at the end — it is refreshed "
                 "from the work log every turn and already reflects all patches, test "
                 "results and ruled-out directions, so continue directly from it. "
                 "Call `get_work_log` only if you need a detail the LIVE STATE does not show."
@@ -339,14 +337,15 @@ async def run_single_bug(bug_id: str, session: ClientSession):
             
             reset_prompt = {"role": "user", "content": reset_content}
 
-            # 重新组装：主 system + 活状态卡(system) + 提示词(user) + 价值裁剪后的轮次。
+            # 重新组装：主 system + 提示词(user) + 价值裁剪后的轮次。
+            # 状态卡不进 messages，每轮请求时单独拼到末尾（见下方 api_messages）。
             # 🚨 绝不能把 role="tool" 的消息单独留下：tool 消息必须紧跟在带 tool_calls 的 assistant 之后。
-            messages = [messages[0], state_card, reset_prompt] + kept
+            messages = [messages[0], reset_prompt] + kept
             append_transcript(bug_id, turn + 1, "compact",
                               f"上下文 {ctx_chars} 字 → {context_chars(messages)} 字；"
                               f"价值裁剪保留 {len(kept)} 条消息（最近 {COMPACT_KEEP_TURNS} 轮 + "
                               f"最近 {COMPACT_KEEP_DECISIONS} 个决策轮，单条 ≤{COMPACT_KEEP_MSG_CHARS} 字）；"
-                              f"活状态卡常驻")
+                              f"状态卡按请求拼接")
             # 注意：messages 末尾可能是 tool 消息（保留轮次带的），API 同样接受，模型会接着回复
 
             # 压缩就是「把当前记忆换掉」这个动作本身，所以两个计数器必须一起归零：
@@ -354,14 +353,16 @@ async def run_single_bug(bug_id: str, session: ClientSession):
             compact_due_turn = None
             free_streak = 0
 
-        # 【L1】每轮请求前都把活状态卡刷到最新：它常驻 messages[1]，压缩时也保留。
-        # 这样模型每一轮都带着「当前推断 / 失败趋势 / 已排除方向」，恢复不靠它记得读日志。
+        # 【L1】每轮请求前把活状态卡刷到最新，并临时拼到消息末尾：
+        # 前缀（system + 历史）保持稳定以命中服务端缓存，变化只发生在末尾这一条。
+        # 状态卡不写入 messages，因此压缩裁剪不会碰到它，上下文计数也不含它。
         state_card["content"] = state_card_content(bug_id)
+        api_messages = messages + [state_card]
 
         try:
             response = await client.chat.completions.create(
                 model=LLM_CONF["model_name"],
-                messages=messages,
+                messages=api_messages,
                 tools=openai_tools,
                 temperature=0.0
             )
