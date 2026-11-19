@@ -92,9 +92,8 @@ def main():
         check(verdict["audit"] == "invalid", "新建测试文件必须判 invalid")
         check(verdict["violations"][0]["created"] is True, "新建文件必须标 created=true")
 
-        # ---- 3.5 回滚归档：work_log 干净，但 human_audit 里藏着改测试的轮次 ----
-        # 真实事故（Time_11）：四轮探针全在改 TestCompiler.java，最后 rollback 把证据搬进
-        # human_audit.jsonl，审计只读 work_log 就报了 clean。现在要两个都说得清。
+        # ---- 3.5 回滚归档（v1）：审计只读 work_log，不看 human_audit.jsonl ----
+        # work_log 干净就判 clean；归档里即便藏着改测试的轮次也不读取、不产出 rolled_back 字段。
         rolled_dir = os.path.join(tmp, "rolledb")
         write_log(rolled_dir, [
             event("patch", round=1, files=[{"path": SRC, "before": "sha1", "after": "sha2"}]),
@@ -105,9 +104,9 @@ def main():
                   rollback_target=1),
         ], name="human_audit.jsonl")
         verdict = audit.audit_bug_dir(rolled_dir, test_globs=GLOBS)
-        check(verdict["audit"] == "clean", "回滚掉的越界不该把最终状态判成 invalid")
-        check(len(verdict["rolled_back_violations"]) == 1, "回滚归档里的越界必须单独报出来")
-        check(verdict["rolled_back_violations"][0]["path"] == TEST, "回滚归档里的违规文件认错了")
+        check(verdict["audit"] == "clean", "work_log 干净就该判 clean")
+        check("rolled_back_violations" not in verdict, "v1 不该产出回滚归档字段")
+        check(verdict["audit_version"] == 1, "审计版本号应为 1")
 
         # ---- 4. bug 名解析：Lang_1 命中 Lang_1b，不能抓到 Lang_10b ----
         logs_dir = os.path.join(tmp, "logs")

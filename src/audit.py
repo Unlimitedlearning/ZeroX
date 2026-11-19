@@ -28,8 +28,8 @@ import sys
 from datetime import datetime
 
 # 审计规则一变就 +1；版本号同时写进 metrics 行，否则同一份日志里的结论分不清按哪版规则得出
-# v2：除了 work_log，还读 human_audit.jsonl（回滚归档），把「改过测试又回滚」单独报出来
-AUDIT_VERSION = 2
+# v1：只读 work_log 判定 clean/invalid，不报告回滚归档（human_audit.jsonl）
+AUDIT_VERSION = 1
 
 AUDIT_LOG_NAME = "audit.jsonl"
 
@@ -160,14 +160,6 @@ def audit_bug_dir(bug_dir, test_globs=None):
     """审计一个 bug 的日志目录（只读 work_log，不跑测试，几毫秒）。"""
     log_path = os.path.join(str(bug_dir), "work_log.jsonl")
     verdict = audit_events(load_events(log_path), test_globs=test_globs)
-    # 【回滚归档也要读】rollback 会把被撑销的轮次从 work_log 里删掉、抄进 human_audit.jsonl，
-    # 于是「改过测试再回滚」和「从未改过」在 work_log 里长得一模一样（Time_11 实测：四轮全在
-    # 改 TestCompiler.java，审计却报 clean）。这里把归档的结论单独报出来，但不改 clean/invalid
-    # 判定：判定看的是最终存活的那几轮，回滚过的轮已经不在工作区里了。
-    rolled = audit_events(
-        load_events(os.path.join(str(bug_dir), "human_audit.jsonl")), test_globs=test_globs)
-    verdict["rolled_back_patches"] = rolled["patches"]
-    verdict["rolled_back_violations"] = rolled["violations"]
     verdict["bug_id"] = os.path.basename(str(bug_dir).rstrip("/\\"))
     verdict["bug_dir"] = str(bug_dir)
     verdict["audit_version"] = AUDIT_VERSION
@@ -305,16 +297,6 @@ def _print_verdict(row):
         detail = " 动过测试：" + ", ".join(parts)
     elif row.get("audit") == "unknown":
         detail = f" （{row.get('reason')}）"
-    # 回滚掉的越界单独一栏：不改变 clean/invalid，但你一眼能看到「这个 clean 是回滚换来的」
-    rolled = row.get("rolled_back_violations") or []
-    if rolled:
-        names = []
-        for item in rolled:
-            path = item.get("path") if isinstance(item, dict) else str(item)
-            rounds = item.get("rounds") if isinstance(item, dict) else None
-            name = os.path.basename(str(path))
-            names.append(f"{name}@轮{rounds}" if rounds else name)
-        detail += " · 回滚过测试：" + ", ".join(names)
     verified = row.get("verified")
     verify_text = "" if verified is None else (" · Verified" if verified else " · 未复现")
     print(f"{mark} {row['bug_id']:<12} {row.get('audit', '?'):<8} "
@@ -383,11 +365,6 @@ def main(argv=None):
             "patches": verdict.get("patches", 0),
             "tests": verdict.get("tests", 0),
             "rounds": verdict.get("rounds", 0),
-            "rolled_back_patches": verdict.get("rolled_back_patches", 0),
-            "rolled_back_violations": [
-                {"path": v["path"], "rounds": v.get("rounds") or [], "created": v.get("created")}
-                for v in verdict.get("rolled_back_violations") or []
-            ],
             "last_test_status": verdict.get("last_test_status"),
             "verified": None,
         }
@@ -430,9 +407,6 @@ def main(argv=None):
         invalid = sum(1 for r in rows if r["audit"] == "invalid")
         unknown = sum(1 for r in rows if r["audit"] == "unknown")
         line = f"合计 {total}：clean {clean} · invalid {invalid} · unknown {unknown}"
-        rolled = sum(1 for r in rows if r.get("rolled_back_violations"))
-        if rolled:
-            line += f" · 回滚过测试 {rolled}"
         if args.verify:
             verified = sum(1 for r in rows if r.get("verified"))
             line += f" · Verified Fixed {verified}"

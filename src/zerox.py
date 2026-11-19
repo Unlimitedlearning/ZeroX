@@ -560,11 +560,6 @@ async def main():
                     # 同一份 benchmark_metrics.jsonl 里的结论分不清按哪版规则得出
                     "audit_version": getattr(audit, "AUDIT_VERSION", None),
                     "audit_violations": [v["path"] for v in verdict.get("violations") or []],
-                    # 回滚掉的越界不算 invalid（最终状态是干净的），但一个 clean 到底是“没碰测试”
-                    # 还是“碰了又回滚”完全是两回事，benchmark 必须能把它数出来。
-                    "audit_rolled_back": [
-                        v["path"] for v in verdict.get("rolled_back_violations") or []
-                    ],
                 })
                 results[bug] = {
                     "status": status, 
