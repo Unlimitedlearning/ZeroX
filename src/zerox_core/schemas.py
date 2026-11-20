@@ -48,7 +48,7 @@ def build_tools():
         ),
         types.Tool(
             name="patch_and_log",
-            description="核心工具：将修改方案持久化到日志，并自动把代码 Diff 应用到目标文件。每次修改代码必须调用此工具，严禁输出全量代码。old 片段须与文件精确匹配且在文件中唯一出现，否则整轮被拒。",
+            description="核心工具：将修改方案持久化到日志，并自动把补丁应用到目标文件。每次修改代码必须调用此工具，严禁输出全量代码。patch_diff 用行号锚点：给 start_line + anchor + new，服务端按锚点定位替换，无需抄写含缩进的原文，省 token 且不易出错。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -63,11 +63,15 @@ def build_tools():
                                 "file_path": {"type": "string", "description": "你修改了哪个文件"},
                                 "patch_diff": {
                                     "type": "object",
+                                    "description": "行号锚点补丁：start_line/anchor/new（可加 end_line 改多行，op=delete 删行）。",
                                     "properties": {
-                                        "old": {"type": "string", "description": "被修改的原始代码片段（必须与文件精确匹配，包含缩进）"},
-                                        "new": {"type": "string", "description": "修改后的新代码片段"}
+                                        "start_line": {"type": "integer", "description": "要修改的起始行号（从1开始，来自 read_specific_code 返回的行号）"},
+                                        "end_line": {"type": "integer", "description": "结束行号（含），省略则只改 start_line 一行"},
+                                        "anchor": {"type": "string", "description": "起始行上的一段原文（至少8字符），用于校验行号；不用带缩进"},
+                                        "op": {"type": "string", "enum": ["replace", "delete", "insert"], "description": "replace=替换（默认），delete=删除该行范围，insert=在 start_line 前插入"},
+                                        "new": {"type": "string", "description": "替换/插入的新内容；delete 时不需要"}
                                     },
-                                    "required": ["old", "new"]
+                                    "required": ["start_line", "anchor"]
                                 }
                             },
                             "required": ["file_path", "patch_diff"]

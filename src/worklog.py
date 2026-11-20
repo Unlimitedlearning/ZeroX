@@ -321,7 +321,7 @@ class WorkLog:
     def digest(self, limit=5, title=None, detail_chars=1200, reasoning_chars=400):
         """给 agent 看的紧凑视图：每轮改了什么、为什么改、测试怎么变的。
 
-        只给摘要，不回放 old/new 全文 —— 那是让模型花钱读自己刚写过的代码。
+        只给摘要，不回放完整补丁内容 —— 那是让模型花钱读自己刚写过的代码。
         reasoning 是压缩后唯一能找回「当时怎么想」的东西，必须回读。
         """
         events = self.events()

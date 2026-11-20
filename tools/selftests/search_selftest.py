@@ -10,6 +10,8 @@
   5. max_results 截断有总数与剩余数提示；regex 模式在摘要里标明
   6. extract_method_body 按花括号配平只取一个方法，字符串/注释里的括号不干扰
   7. extract_compile_errors 提取去重、路径压 basename，提取不到时回退
+  8. apply_line_patches 行号锚点：基本替换/缩进容忍/漂移修正/多处倒序/删除/插入
+  9. 锚点的各类拒绝：过短/缺失/歧义/越界/坏行号/缺 new
 """
 import os
 import sys
@@ -24,6 +26,7 @@ from zerox_core.search import (  # noqa: E402
     definition_score,
     extract_compile_errors,
     extract_method_body,
+    apply_line_patches,
     format_results,
     locate_method_line,
     parse_failing_tests,
@@ -168,6 +171,84 @@ def test_compile_errors():
     check(n1 == 1 and "Bar.java" not in few, few)
 
 
+SAMPLE = "\n".join([
+    "line0 content here",
+    "    private static final byte SPACE = 32;",
+    "line2",
+    "line3",
+    "    public void testFoo() {",
+    "line5",
+    "line6",
+])
+
+
+def test_line_anchor_apply():
+    # 1. 基本替换：只改锚点行，其余不变
+    out, err = apply_line_patches(SAMPLE, [{
+        "start_line": 2, "anchor": "private static final byte SPACE",
+        "new": "    private static final byte SPACE = 65; // changed"}])
+    check(err is None, f"基本替换不应报错: {err}")
+    check("SPACE = 65" in out and "line2" in out, out)
+
+    # 2. 缩进容忍：锚点不带缩进也应匹配
+    out, err = apply_line_patches(SAMPLE, [{
+        "start_line": 2, "anchor": "private static final byte SPACE", "new": "X"}])
+    check(err is None and out.splitlines()[1] == "X", f"缩进容忍失败: {out}, {err}")
+
+    # 3. 行号漂移：写成 3，真实锚点在 2，±3 内应自动修正
+    out, err = apply_line_patches(SAMPLE, [{
+        "start_line": 3, "anchor": "private static final byte SPACE", "new": "FIXED"}])
+    check(err is None and "FIXED" in out, f"漂移修正失败: {out}, {err}")
+
+    # 4. 多处 change 倒序应用：两个不同行都被正确替换
+    out, err = apply_line_patches(SAMPLE, [
+        {"start_line": 2, "anchor": "private static final byte SPACE", "new": "AAA"},
+        {"start_line": 5, "anchor": "public void testFoo()", "new": "BBB"}])
+    check(err is None and "AAA" in out and "BBB" in out, f"倒序应用失败: {out}, {err}")
+
+    # 5. 多行范围替换
+    out, err = apply_line_patches(SAMPLE, [{
+        "start_line": 2, "end_line": 3, "anchor": "private static final byte SPACE", "new": "ONE"}])
+    check(err is None and "line2" not in out and "ONE" in out, f"多行替换失败: {out}, {err}")
+
+    # 6. delete 删行
+    out, err = apply_line_patches(SAMPLE, [{
+        "start_line": 2, "end_line": 3, "anchor": "private static final byte SPACE", "op": "delete"}])
+    check(err is None and "SPACE" not in out and "line2" not in out, f"删除失败: {out}, {err}")
+
+    # 7. insert 插到文件头
+    out, err = apply_line_patches(SAMPLE, [{
+        "start_line": 1, "anchor": "line0 content here", "op": "insert", "new": "HEADER"}])
+    check(err is None and out.splitlines()[0] == "HEADER", f"头部插入失败: {out}, {err}")
+
+
+def test_line_anchor_rejects():
+    # 锚点过短
+    out, err = apply_line_patches(SAMPLE, [{"start_line": 2, "anchor": "SP", "new": "X"}])
+    check(out is None and "至少" in err, f"过短应拒绝: {err}")
+
+    # 锚点缺失
+    out, err = apply_line_patches(SAMPLE, [{"start_line": 2, "anchor": "noSuchMethodAnywhere", "new": "X"}])
+    check(out is None and "未找到" in err, f"缺失应拒绝: {err}")
+
+    # 锚点歧义：指定行不含锚点、需在 ±3 内搜索时找到多处匹配
+    dup = "\n".join(["dup line same here", "x", "dup line same here"])
+    out, err = apply_line_patches(dup, [{"start_line": 2, "anchor": "dup line same here", "new": "Z"}])
+    check(out is None and "多行" in err, f"歧义应拒绝: {err}")
+
+    # 越界
+    out, err = apply_line_patches(SAMPLE, [{"start_line": 999, "anchor": "private static final byte SPACE", "new": "X"}])
+    check(out is None and "越过" in err, f"越界应拒绝: {err}")
+
+    # 非法行号
+    out, err = apply_line_patches(SAMPLE, [{"start_line": 0, "anchor": "private static final byte SPACE", "new": "X"}])
+    check(out is None and "正整数" in err, f"非法行号应拒绝: {err}")
+
+    # 缺 new
+    out, err = apply_line_patches(SAMPLE, [{"start_line": 2, "anchor": "private static final byte SPACE"}])
+    check(out is None and "缺少" in err, f"缺 new 应拒绝: {err}")
+
+
 if __name__ == "__main__":
     test_command()
     test_scoring()
@@ -175,4 +256,6 @@ if __name__ == "__main__":
     test_failing_tests()
     test_method_body()
     test_compile_errors()
+    test_line_anchor_apply()
+    test_line_anchor_rejects()
     print("search selftest: OK")

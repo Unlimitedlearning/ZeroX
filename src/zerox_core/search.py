@@ -256,3 +256,116 @@ def extract_method_body(source, start_line, max_lines=60, max_chars=1600):
         body = body[:max_chars] + f"\n…（方法体截断，原长 {len(numbered)} 字；完整内容用 read_specific_code 读）"
         body_truncated = True
     return body, len(picked), (truncated or body_truncated)
+
+
+# ---------------- 行号锚点补丁 ----------------
+# 模型报行号 + 一段锚点原文，服务端校验锚点后替换，无需抄写含缩进的原文。
+# 所有 change 的锚点只对「本轮开始时的原始行数组」校验，避免前面的替换污染后续定位。
+ANCHOR_MIN_CHARS = 8          # 锚点去空白后的最短长度，太短易歧义
+ANCHOR_SEARCH_RADIUS = 3      # 行号漂移时在其 ±N 行内搜索唯一锚点
+
+_LINE_ANCHOR_ERRORS = {
+    "bad_line": "start_line 必须是正整数",
+    "bad_range": "end_line 必须 >= start_line",
+    "out_of_range": "行号越过文件末尾",
+    "anchor_short": f"anchor 去空白后至少需要 {ANCHOR_MIN_CHARS} 个字符",
+    "anchor_missing": "在指定行及附近未找到锚点，请重新 read_specific_code 核对",
+    "anchor_ambiguous": "锚点匹配到多行，请换更独特的锚点或加长",
+    "no_new": "缺少 new 内容；删除请显式传 op=delete",
+}
+
+
+def _anchor_text(s):
+    """锚点比对用的归一化：去首尾空白、压缩内部空白，容忍缩进与空格差异。"""
+    return re.sub(r"\s+", "", s or "")
+
+
+def plan_line_patches(lines, changes):
+    """把行号锚点的 changes 解析成待应用计划，纯计算、不碰文件。
+
+    返回 (plans, error)：
+        plans: [(idx0, end_idx0, new_lines, mode)]：
+             replace/delete 的 idx 为 0-based 左闭右闭；insert 的 end_idx = start_idx-1，
+             表示在 start 行之前插入；new_lines 为替换/插入进去的行列表。
+      error: 出错时的人类可读描述，此时 plans 无意义。
+    所有锚点都对传入的原始 lines 校验，不受其他 change 影响。
+    校验顺序保证：任一 change 有问题就整轮拒绝（调用方据此不落盘）。
+    """
+    line_count = len(lines)
+    plans = []
+    for ch in changes:
+        start = ch.get("start_line")
+        end = ch.get("end_line", start)
+        anchor = ch.get("anchor", "")
+        op = ch.get("op", "replace")
+
+        if not isinstance(start, int) or isinstance(start, bool) or start < 1:
+            return None, _LINE_ANCHOR_ERRORS["bad_line"]
+        if not isinstance(end, int) or isinstance(end, bool) or end < start:
+            return None, _LINE_ANCHOR_ERRORS["bad_range"]
+        if start > line_count or end > line_count:
+            return None, _LINE_ANCHOR_ERRORS["out_of_range"]
+
+        akey = _anchor_text(anchor)
+        if len(akey) < ANCHOR_MIN_CHARS:
+            return None, _LINE_ANCHOR_ERRORS["anchor_short"]
+
+        # 锚点只在原始行数组上定位；优先指定行，漂移则在 ±R 行内找唯一匹配。
+        start_idx = start - 1
+        if akey not in _anchor_text(lines[start_idx]):
+            candidates = [
+                i for i in range(max(0, start_idx - ANCHOR_SEARCH_RADIUS),
+                                 min(line_count, start_idx + ANCHOR_SEARCH_RADIUS + 1))
+                if akey in _anchor_text(lines[i])
+            ]
+            if not candidates:
+                return None, _LINE_ANCHOR_ERRORS["anchor_missing"]
+            if len(candidates) > 1:
+                return None, _LINE_ANCHOR_ERRORS["anchor_ambiguous"]
+            start_idx = candidates[0]
+
+        # end_line 随行号修正一起平移：模型看到的是连续区间，漂移是整段一起偏。
+        shift = start_idx - (start - 1)
+        end_idx = min(line_count - 1, end - 1 + shift)
+        if end_idx < start_idx:
+            end_idx = start_idx
+
+        if op == "delete":
+            new_lines = []
+        elif op in ("replace", "insert"):
+            if "new" not in ch or ch.get("new") is None:
+                return None, _LINE_ANCHOR_ERRORS["no_new"]
+            new_text = ch["new"]
+            if not isinstance(new_text, str):
+                return None, "new 必须是字符串"
+            new_lines = new_text.replace("\r\n", "\n").split("\n")
+        else:
+            return None, "op 必须是 replace / delete / insert"
+
+        plans.append((start_idx, end_idx, new_lines, op))
+
+    # 倒序应用：先改大行号，前面的替换不影响未处理区间的下标。
+    plans.sort(key=lambda p: p[0], reverse=True)
+    return plans, None
+
+
+def apply_line_patches(content, changes):
+    """对整文件内容应用行号锚点补丁，返回 (new_content, error)。
+
+    纯函数：不读写文件，调用方自行决定是否落盘。任一 change 校验失败则整轮拒绝，
+    返回 (None, 错误文本)，保证「要么全成、要么全不动」，与 worklog 的原子性一致。
+    """
+    src = content.replace("\r\n", "\n")
+    lines = src.split("\n")
+    plans, err = plan_line_patches(lines, changes)
+    if err:
+        return None, err
+
+    out = list(lines)
+    for start_idx, end_idx, new_lines, mode in plans:
+        if mode == "insert":
+            # 在 start_idx 对应行之前插入（start_idx=0 即插到文件头）
+            out[start_idx:start_idx] = new_lines
+        else:
+            out[start_idx:end_idx + 1] = new_lines
+    return "\n".join(out), None

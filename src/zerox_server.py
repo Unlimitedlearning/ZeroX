@@ -800,40 +800,38 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text=reject_text, isError=True)]
 
         target_paths = [path for _ok, path in checked]
+
+        # 按文件分组：一个文件只回读一次。同一文件的多个 change 必须一次性交给
+        # apply_line_patches（它对同一份原始行数组校验锚点、倒序应用），不能逐个叠加。
+        grouped = {}  # wsl_path -> [patch_diff]
         for idx, change in enumerate(changes):
             wsl_path = target_paths[idx]
-            patch_diff = change.get("patch_diff", {})
-            old_str = patch_diff.get("old", "")
-            new_str = patch_diff.get("new", "")
+            if not wsl_path:
+                return [types.TextContent(type="text", text="参数错误：file_path 不能为空。", isError=True)]
+            pd = change.get("patch_diff", {})
+            if not isinstance(pd, dict):
+                return [types.TextContent(type="text", text="参数错误：patch_diff 必须是对象。", isError=True)]
+            grouped.setdefault(wsl_path, []).append(pd)
+            if wsl_path not in staged_writes:
+                staged_writes[wsl_path] = None
+                order.append(wsl_path)
 
-            if not wsl_path or not old_str:
-                return [types.TextContent(type="text", text="参数错误：file_path 或 old 不能为空。", isError=True)]
-
+        for wsl_path, pds in grouped.items():
             try:
-                # 只有首次遇到这个文件才回读磁盘，后续直接基于内存里的最新内容继续替换
-                if wsl_path not in staged_writes:
-                    res = execute_in_target(f"cat {shlex.quote(wsl_path)}")
-                    if res.returncode != 0:
-                        return [types.TextContent(type="text", text=f"修改失败：找不到文件 {wsl_path}", isError=True)]
-
-                    content = res.stdout.replace("\r\n", "\n") # 顺手解决 CRLF 问题
-                    staged_writes[wsl_path] = {"content": content, "original": res.stdout} # original 留给备份和失败还原
-                    order.append(wsl_path)
-
-                content = staged_writes[wsl_path]["content"]
-                old_str_normalized = old_str.replace("\r\n", "\n")
-
-                count = content.count(old_str_normalized)
-                if count == 0:
-                    return [types.TextContent(type="text", text=f"修改失败：{wsl_path} 中找不到 old 片段。请重新核对缩进和代码内容。", isError=True)]
-                elif count > 1:
-                    return [types.TextContent(type="text", text=f"修改失败：old 片段在 {wsl_path} 中出现了 {count} 次，请提供更长的上下文。", isError=True)]
-
-                # 逐段叠加到内存里，本轮结束时只写盘一次
-                staged_writes[wsl_path]["content"] = content.replace(old_str_normalized, new_str, 1)
-
+                res = execute_in_target(f"cat {shlex.quote(wsl_path)}")
+                if res.returncode != 0:
+                    return [types.TextContent(type="text", text=f"修改失败：找不到文件 {wsl_path}", isError=True)]
+                content = res.stdout.replace("\r\n", "\n")  # 顺手解决 CRLF 问题
+                original = res.stdout  # 留给备份和失败还原
             except Exception as e:
-                return [types.TextContent(type="text", text=f"代码校验发生异常: {str(e)}", isError=True)]
+                return [types.TextContent(type="text", text=f"读取文件失败: {str(e)}", isError=True)]
+
+            # 行号锚点：一次处理该文件的所有 change，对原始内容校验锚点后倒序替换。
+            after, err = code_search.apply_line_patches(content, pds)
+            if err:
+                return [types.TextContent(type="text", text=f"补丁未应用：{wsl_path} —— {err}。本轮修改未落盘。", isError=True)]
+
+            staged_writes[wsl_path] = {"content": after, "original": original}
 
         # 第二阶段：写入目标文件 + 记账；原子性由 worklog 负责（要么全成，要么全还原）
         writes = [
@@ -867,7 +865,7 @@ async def call_tool(name: str, arguments: dict):
         if not os.path.exists(WORK_JSON_FILE):
             return [types.TextContent(type="text", text=f"当前 Bug（{CURRENT_BUG}）暂无历史工作日志。")]
 
-        # digest：每轮改了什么、测试怎么变的、还差什么（不回放 old/new 全文）
+        # digest：每轮改了什么、测试怎么变的、还差什么（不回放完整补丁内容）
         try:
             text = _worklog().digest(limit=limit, title=CURRENT_BUG)
         except Exception as err:
