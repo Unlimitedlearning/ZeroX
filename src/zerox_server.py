@@ -25,6 +25,8 @@ from zerox_core.config import resolve_bug as _resolve_bug
 from zerox_core.exec_env import IS_WINDOWS, execute_in_target, popen_in_target, win_path_to_wsl
 # 外置版本库：work_log 事件流 / blob 快照 / 回滚（独立模块，不依赖本文件任何东西）
 import worklog
+# 失败诊断：归因卡 / 停滞检测的判定逻辑集中在此，server 只读事件 + 拼返回
+import diagnosis
 # 判定逻辑只有一份：服务端的「通过前先查有没有动测试」和跑完的事后审计用同一个重放器
 import audit
 
@@ -273,6 +275,62 @@ def locate_failing_tests(detail_text, workdir, limit=3):
     return located
 
 
+def locate_assertion_details(workspace, max_files=3, chars_per_file=6000):
+    """从工作区的测试报告文件里提取 expected/actual，返回可直接拼接的文本。
+
+    Defects4J 的 stdout 只有「Failing tests」用例名清单，断言明细在报告文件里
+    （Maven 的 surefire-reports、Ant 的 test-results）。一次 find 找候选 + 逐个截断读取，
+    全程本地、不耗模型对话轮。找不到就返回空串——纯增益，不影响原有返回。
+    """
+    try:
+        find_cmd = (
+            f"find {shlex.quote(workspace)} "
+            r"\( -path '*/surefire-reports/*.txt' -o -path '*/surefire-reports/*.xml' "
+            r"-o -path '*/test-results/*.txt' -o -path '*/test-reports/*.txt' \) "
+            f"-type f 2>/dev/null | head -n {max_files}"
+        )
+        found = execute_in_target(find_cmd)
+        paths = [p.strip() for p in (found.stdout or "").splitlines() if p.strip()]
+        corpus = []
+        for path in paths:
+            ok, readable = resolve_read_path(path)
+            if not ok:
+                continue
+            res = execute_in_target(f"head -c {chars_per_file} {shlex.quote(readable)}")
+            if res.returncode == 0 and res.stdout:
+                corpus.append(res.stdout)
+        if not corpus:
+            return ""
+        text, _n = code_search.extract_assertions("\n".join(corpus))
+        return text
+    except Exception as err:
+        # 与失败用例定位同理：报告读取是优化，任何异常都不能打断 run_test。
+        logging.warning(f"断言原文本地提取跳过: {str(err)}")
+        return ""
+
+
+# 测试日志安全读取：正常日志几十 KB；超过 2MB 基本是探针打进热路径刷屏或 Java OOM
+# 的半成品。整段读进内存会让后续正则/断言提取在数百 MB 文本上卡死（实测 451MB 卡死），
+# 因此超限只读头部（编译/启动）+ 尾部（BUILD 结果与 Failing tests），中间明确省略。
+LOG_READ_MAX_BYTES = 2 * 1024 * 1024
+LOG_HEAD_BYTES = 256 * 1024
+
+
+def read_test_log(path):
+    """安全读取测试日志，返回 (content, truncated)。任何异常都必须由调用方兜底。"""
+    size = os.path.getsize(path)
+    if size <= LOG_READ_MAX_BYTES:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(), False
+    tail_bytes = LOG_READ_MAX_BYTES - LOG_HEAD_BYTES
+    with open(path, "rb") as f:
+        f.seek(0)
+        head = f.read(LOG_HEAD_BYTES).decode("utf-8", "replace")
+        f.seek(-tail_bytes, os.SEEK_END)
+        tail = f.read(tail_bytes).decode("utf-8", "replace")
+    return code_search.cap_log_text(head, tail, size), True
+
+
 def wait_for_previous_process():
     """统一阻塞等待函数：如果有测试在跑，最多等TEST_TIMEOUT秒。"""
     global current_process
@@ -495,8 +553,15 @@ async def call_tool(name: str, arguments: dict):
                 save_test_result("Unknown", None, "测试完成，但服务端未生成测试日志。请重试 run_test；若连续出现，停止并说明情况。")
                 return [types.TextContent(type="text", text="测试完成，但服务端未生成测试日志。请重试 run_test；若连续出现，停止并说明情况。", isError=True)]
             
-            with open(TEST_LOG_FILE, "r", encoding="utf-8", errors="replace") as log_f:
-                content = log_f.read()
+            content, log_truncated = read_test_log(TEST_LOG_FILE)
+            truncated_notice = ""
+            if log_truncated:
+                truncated_notice = (
+                    "\n\n【日志异常庞大（已截断）】测试日志超过 2MB，中间重复输出已省略"
+                    "（只保留开头与末尾）。这通常是调试输出被放进了高频调用路径，或 Java 进程 OOM。"
+                    "请检查最近补丁是否把打印语句/高开销调用放进了循环或高频方法；"
+                    "断言原文已改为从测试报告文件本地提取。"
+                )
 
             if not content.strip():
                 save_test_result("EmptyLog", None, "【日志为空】测试没有任何输出，无法判定结果。请重试一次 run_test。")
@@ -533,6 +598,7 @@ async def call_tool(name: str, arguments: dict):
                     compile_msg += f"\n{errors_text}\n\n以下为编译日志尾部（原文）：\n{content[-1200:]}"
                 else:
                     compile_msg += f"\n请根据日志修复错误：\n{content[-2500:]}"
+                compile_msg += truncated_notice
                 save_test_result("CompileError", None, compile_msg)
                 return [types.TextContent(type="text", text=compile_msg)]
 
@@ -578,12 +644,37 @@ async def call_tool(name: str, arguments: dict):
                 if prefix:
                     surface += "\n\n【测试日志尾部（含 stderr）】\n" + prefix[-1200:]
 
-                # 固定取法说明已移入 AGENTS.md（system prompt，前缀缓存只付一次），
-                # 不再每条失败重发 237 字；这里只留一句极简指引。
-                surface += "\n\n[提示] 断言原文（expected/actual）的取法见系统提示。"
+                # 【断言原文】先从已读入的 test.log 提取；stdout 没有堆栈时再查工作区报告文件
+                # （surefire-reports / test-results）。两者都提取不到才退回取法指引。
+                assertion_text, _n = code_search.extract_assertions(content)
+                if not assertion_text:
+                    assertion_text = locate_assertion_details(workspace)
+                if assertion_text:
+                    surface += "\n\n" + assertion_text
+                else:
+                    # 固定取法说明已移入 AGENTS.md（system prompt，前缀缓存只付一次），
+                    # 这里只留一句极简指引。
+                    surface += "\n\n[提示] 断言原文（expected/actual）的取法见系统提示。"
+
+                # 【归因卡 + 停滞提示】读当前 work_log 事件流本地生成，省去模型翻日志。
+                # 一次性 surface，不写进持久 detail（brief 取 detail 末行会被污染）。
+                try:
+                    wl = _worklog()
+                    events = wl.events() if wl is not None else []
+                    card = diagnosis.build_failure_card(events)
+                    if card:
+                        surface += "\n\n" + card
+                    stall = diagnosis.detect_stall(events)
+                    if stall:
+                        surface += "\n\n" + stall
+                except Exception as err:
+                    logging.warning(f"失败归因卡生成跳过: {str(err)}")
+
+                surface += truncated_notice
                 return [types.TextContent(type="text", text=surface)]
 
             tail_msg = f"最新日志如下（退出码 {exit_code}）:\n{content[-2000:]}"
+            tail_msg += truncated_notice
             save_test_result("Unknown", None, tail_msg)
             return [types.TextContent(type="text", text=tail_msg)]
 
@@ -843,10 +934,25 @@ async def call_tool(name: str, arguments: dict):
             msg += "。本轮修改未写入工作日志。"
             return [types.TextContent(type="text", text=msg, isError=True)]
 
+        # 【热路径提示】新增打印若落在 sample/parse/循环类方法，提前一句客观位置提示，
+        # 拦住「探针打进热路径刷屏日志拖垮 JVM」。只陈述代码事实，不判断意图。
+        # 一次性返回，不写进 work_log（避免污染 brief 的「最近报错」末行）。
+        hotspot_notice = ""
+        try:
+            for hp_path, hp_pds in grouped.items():
+                hp_source = staged_writes[hp_path]["original"]
+                hp_changes = [(pd.get("start_line"), pd.get("end_line"), pd.get("new"))
+                              for pd in hp_pds]
+                notice = diagnosis.detect_hotspot(hp_source, hp_changes)
+                if notice:
+                    hotspot_notice += "\n\n" + notice
+        except Exception as err:
+            logging.warning(f"热路径提示生成跳过: {str(err)}")
+
         # 更新全局轮次变量，供失败信息与指标使用
         CURRENT_ROUND = round_num
         TOTAL_ATTEMPTS += 1
-        return [types.TextContent(type="text", text="补丁已应用。请立刻调用 run_test 验证，不要输出解释。")]
+        return [types.TextContent(type="text", text="补丁已应用。请立刻调用 run_test 验证，不要输出解释。" + hotspot_notice)]
 
     elif name == "get_work_log":
         # 【多 Bug 隔离】只读当前 Bug 的工作日志

@@ -3,6 +3,7 @@
 不接触文件系统、目标环境或全局状态，便于离线单测。
 server 只负责注入当前工作区与配置，解析/排序规则都在这里。
 """
+import html
 import re
 import shlex
 
@@ -160,6 +161,68 @@ def extract_compile_errors(log, max_errors=8, msg_chars=200):
     if not found:
         return "", 0
     return ("【编译错误（本地提取）】\n" + "\n".join(found), len(found))
+
+
+# 断言原文提取：JUnit ComparisonFailure / TestNG / Hamcrest / surefire XML 属性。
+# XML 实体先解码（&lt; → <），这样 `<failure message="expected:&lt;x&gt; but was:&lt;y&gt;">`
+# 与纯文本堆栈能用同一组模式；每条模式都要求成对的 expected/but was 结构，
+# 单独出现的 expectedTime、expectedValue 之类变量名不会被误判。
+_ASSERTION_PATTERNS = (
+    re.compile(r"expected:\s*<\s*(.{1,240}?)\s*>\s*but\s+was:\s*<\s*(.{1,240}?)\s*>", re.I | re.S),
+    re.compile(r"expected\s+\[\s*(.{1,240}?)\s*\]\s*but\s+found\s+\[\s*(.{1,240}?)\s*\]", re.I | re.S),
+    re.compile(r"expected:\s*(?!<|\[)(.{1,240}?)\s+but\s+was:\s*(?!<|\[)(.{1,240}?)(?=\s*(?:\n|$|at\s|\s{2}))", re.I),
+    re.compile(r"Expected:\s*(.{1,240}?)\s+but:\s*was\s+(.{1,240}?)(?=\s*(?:\n|$))", re.I | re.S),
+)
+
+
+def _clean_assertion_value(value, limit):
+    """压平空白并截断断言值；保留原文字符，只把换行/制表换成空格。"""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def cap_log_text(head, tail, total_bytes):
+    """把超长日志的头尾片段拼成一段带省略标记的文本。纯函数，不读文件。
+
+    head/tail 是调用方按字节上限读取并 decode 好的片段；total_bytes 只用于提示
+    原文多大。日志超过上限时中间往往是探针刷屏的重复输出，丢掉它不影响 BUILD
+    结果与 Failing tests（都在尾部），却能避免数百 MB 文本上的正则卡死。
+    """
+    size_mb = (total_bytes or 0) / (1024 * 1024)
+    marker = f"\n... [日志 {size_mb:.1f}MB 过大，中间已省略] ...\n"
+    return f"{head or ''}{marker}{tail or ''}"
+
+
+def extract_assertions(log, max_pairs=4, value_chars=180):
+    """从测试日志或 surefire 报告文本提取 (expected, actual) 对，返回 (文本, 条数)。
+
+    数据源是调用方给的原文：可以是一整段 test.log，也可以是某个 *.xml / *.txt 报告。
+    提取不到返回 ("", 0)，调用方据此回退到「取法见系统提示」，不会误报断言值。
+    去重保序，值里的换行压成空格并按 value_chars 截断，避免长期望值刷屏。
+    """
+    text = html.unescape(str(log or ""))
+    pairs, seen = [], set()
+    for pattern in _ASSERTION_PATTERNS:
+        for match in pattern.finditer(text):
+            expected = _clean_assertion_value(match.group(1), value_chars)
+            actual = _clean_assertion_value(match.group(2), value_chars)
+            if not expected and not actual:
+                continue
+            key = (expected, actual)
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(key)
+            if len(pairs) >= max_pairs:
+                break
+        if len(pairs) >= max_pairs:
+            break
+    if not pairs:
+        return "", 0
+    lines = [f"- expected: {exp!r} / actual: {act!r}" for exp, act in pairs]
+    return "【断言原文（本地提取）】\n" + "\n".join(lines), len(pairs)
 
 
 # 方法体抽取：从声明行起，靠花括号配平找到方法末尾；忽略字符串/字符/注释里的括号。
