@@ -134,6 +134,19 @@ class WorkLog:
         self.io = io or LocalIO()
         self.test_tail = test_tail
 
+    def reset_events(self):
+        """清空本运行的推导痕迹：事件日志（work_log.jsonl）与 think（thoughts.jsonl）。
+
+        开跑新任务时调用：首轮 API 请求在 run_test（进而服务端 checkout 清日志）之前发出，
+        若沿用上一次运行的历史，L1 状态卡会把上次的补丁与「测试全部通过」当成当前状态
+        喂给模型，等于把答案泄露出去。thoughts 同样要清，否则 brief() 会因它非空而继续
+        渲染上次的思考节选。
+        保留 human_audit.jsonl（跨运行的事后审计归档）与 blobs/（按内容寻址，残留不冲突），
+        只清与「本次运行」一一对应的那两份。
+        """
+        self.io.remove(self.log_path)
+        self.io.remove(self.thought_path)
+
     # ---------------- 写 ----------------
 
     def note(self, turn, text):

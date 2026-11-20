@@ -235,17 +235,25 @@ def append_l1_state(bug_id: str, turn: int, content: str, compacted: bool = Fals
 
 
 def reset_transcript(bug_id: str):
-    """每个 bug 开跑时重写 transcript，并清空 think / 状态卡的逐轮归档（同一时机）。"""
+    """每个 bug 开跑时重置全部逐轮归档，保证首轮状态卡从空白开始。
+
+    必须包括 work_log.jsonl：首次 API 请求在 run_test 之前发出，服务端要到 checkout 才清日志，
+    若不在这里先清，状态卡会读到上一次运行的补丁与「测试全部通过」，等于把答案喂给模型。
+    human_audit.jsonl（事后审计）与 blobs/ 保留，不受本次重置影响。
+    """
     path = transcript_path(bug_id)
+    home = os.path.dirname(path)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(home, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"# {bug_id} agent transcript\n\n开始时间：{datetime.now().isoformat(timespec='seconds')}\n")
-        for aux in (l1_state_path(bug_id), os.path.join(os.path.dirname(path), "thoughts.jsonl")):
+        for aux in (l1_state_path(bug_id), os.path.join(home, "thoughts.jsonl")):
             try:
                 os.remove(aux)
             except FileNotFoundError:
                 pass
+        # 事件日志也归零；用 WorkLog 的方法清，避免和它的路径约定各写一份
+        worklog.WorkLog(home).reset_events()
     except OSError as err:
         print(f"  ⚠️ [{bug_id}] 建 transcript 失败: {err}")
 
@@ -292,6 +300,12 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     log_home = os.path.join(LOG_DIR, canonical_bug_id(bug_id))
     wl = worklog.WorkLog(log_home)
 
+    # 每个 bug 一份可读流水：AI 说了什么、调了什么、工具回了什么。
+    # 压缩会丢掉上下文里的历史，但这份文件留着，复盘时不用去翻 LLM 的 window。
+    # 【顺序关键】必须先于 state_card_content：后者要读刚被清空的 work_log，
+    # 晚一步就会把上一次运行的补丁和通过结论当成当前状态注入首轮请求。
+    reset_transcript(bug_id)
+
     # 【L1 活状态卡】不进入 messages 正文，仅在每次 API 调用时临时拼到末尾。
     # 这样 system + 逐轮累积的历史构成稳定前缀，可被服务端前缀缓存命中；
     # 每轮变化的状态卡位于末尾，不会让前面的缓存前缀失效。
@@ -300,10 +314,6 @@ async def run_single_bug(bug_id: str, session: ClientSession):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": AGENT_CONF["user_prompt_template"].replace("{bug_id}", bug_id)}
     ]
-
-    # 每个 bug 一份可读流水：AI 说了什么、调了什么、工具回了什么。
-    # 压缩会丢掉上下文里的历史，但这份文件留着，复盘时不用去翻 LLM 的 window。
-    reset_transcript(bug_id)
     
     mcp_tools = await session.list_tools()
     openai_tools = []

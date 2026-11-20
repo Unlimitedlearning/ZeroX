@@ -128,8 +128,19 @@ def main():
         assert wl.stats()["probe_rollbacks"] == 1, "更早的探针回滚记录不应被第二次回滚删掉"
 
         # 归档必须还在，供人工复盘
-        with open(os.path.join(tmp, "logs", "human_audit.jsonl"), encoding="utf-8") as f:
+        audit_path = os.path.join(tmp, "logs", "human_audit.jsonl")
+        with open(audit_path, encoding="utf-8") as f:
             assert f.read().strip(), "被撤销的事件应归档到 human_audit.jsonl"
+
+        # ---- 开跑重置：清事件日志，保留审计归档 ----
+        assert os.path.exists(wl.log_path), "重置前应有事件日志"
+        wl.reset_events()
+        assert not os.path.exists(wl.log_path), "reset_events 应删除 work_log.jsonl"
+        assert wl.events() == [], "重置后不应读到任何历史事件"
+        assert "暂无历史工作日志" in wl.brief(), "重置后状态卡应从空白开始"
+        assert os.path.exists(audit_path), "reset_events 不能删 human_audit.jsonl（事后审计）"
+        # 重复调用不应报错（首次 run_test 前服务端 checkout 也会再删一次）
+        wl.reset_events()
 
     print("worklog selftest: OK")
 

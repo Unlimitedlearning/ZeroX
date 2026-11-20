@@ -230,10 +230,12 @@ def extract_fail_info(match):
 
 
 def locate_failing_tests(detail_text, workdir, limit=3):
-    """本地把失败用例的类名/方法名解析成源文件位置，不消耗模型一轮对话。
+    """本地把失败用例解析成 (类名, 方法, 相对路径, 行号, 方法体)，不耗模型对话轮。
 
-    类名 grep 到测试文件，再扫方法定义行；任一步失败就跳过，不把猜测交给模型。
+    类名 grep 到测试文件，扫方法定义行，再按花括号配平抽出方法体（断言原文就在里面）；
+    任一步失败就跳过对应字段，不把猜测交给模型。
     limit 默认 3：多用例往往是同一根因，列太多只会挤掉真正的报错。
+    方法体是「顺手代劳读取」，仅供本次返回，调用方不得写进持久 work_log。
     """
     located = []
     try:
@@ -254,7 +256,12 @@ def locate_failing_tests(detail_text, workdir, limit=3):
                 continue
             line_no = code_search.locate_method_line(src.stdout, method)
             rel = posixpath.relpath(path, workdir) if workdir else path
-            located.append((cls, method, rel, line_no))
+            body = ""
+            if line_no:
+                body, _lines, _cut = code_search.extract_method_body(
+                    src.stdout, line_no, max_lines=50, max_chars=1200
+                )
+            located.append((cls, method, rel, line_no, body))
     except Exception as err:
         # 本地解析是「省一轮搜索」的优化，任何异常都不能打断 run_test 主返回。
         logging.warning(f"失败用例本地定位跳过: {str(err)}")
@@ -513,7 +520,14 @@ async def call_tool(name: str, arguments: dict):
 
             fail_match = FAIL_RE.search(content)
             if exit_code not in (None, 0) and fail_match is None:
-                compile_msg = f"【编译失败】退出码 {exit_code}。请根据日志修复错误：\n{content[-2500:]}"
+                # 【本地代劳】先给结构化的「文件:行号: 错误」清单，模型不必从几百行 javac
+                # 输出里自己找错误行；提取不到时回退原文尾部，保证任何格式都有可操作信息。
+                errors_text, err_count = code_search.extract_compile_errors(content)
+                compile_msg = f"【编译失败】退出码 {exit_code}。"
+                if err_count:
+                    compile_msg += f"\n{errors_text}\n\n以下为编译日志尾部（原文）：\n{content[-1200:]}"
+                else:
+                    compile_msg += f"\n请根据日志修复错误：\n{content[-2500:]}"
                 save_test_result("CompileError", None, compile_msg)
                 return [types.TextContent(type="text", text=compile_msg)]
 
@@ -529,14 +543,20 @@ async def call_tool(name: str, arguments: dict):
                 # 因此只放稳定的失败事实；stderr 尾部是一次性调试信息，只随本次返回给模型。
                 fail_msg = f"【测试失败】共 {count_text} 个用例失败。\n以下是报错信息：\n{combined}"
 
-                # 【本地代劳】失败用例的源文件/方法行由服务端解析，模型不必 search_code 再找一遍。
-                # 失败信息里本来就有类名，grep 一次 + 扫方法定义行，只读、不耗测试次数。
+                # 【本地代劳】失败用例的源文件/方法行/方法体由服务端解析，模型不必再发
+                # search_code + get_file_internal_structure + read_specific_code 三轮工具。
+                # 失败信息里本来就有类名，grep 一次 + 扫方法定义行 + 配平抽方法体，只读、不耗测试次数。
                 located = locate_failing_tests(failing_info, workspace)
+                bodies = []
                 if located:
                     loc_lines = [f"- {cls}::{method} → {rel}" + (f":{no}" if no else "")
-                                 for cls, method, rel, no in located]
+                                 for cls, method, rel, no, _body in located]
                     fail_msg += ("\n\n【失败用例位置（本地解析，行号可直接用 read_specific_code 读）】\n"
                                  + "\n".join(loc_lines))
+                    # 方法体只进一次性 surface，不写进持久 detail：
+                    # worklog.brief() 取 detail 末行当「最近报错」，塞入源码会污染压缩后的状态卡。
+                    bodies = [(f"{cls}::{method}", body)
+                              for cls, method, _rel, _no, body in located if body]
                 fail_msg += "\n\n请分析并修复。"
                 save_test_result("Failed", fail_count, fail_msg)
 
@@ -544,6 +564,10 @@ async def call_tool(name: str, arguments: dict):
                 # 旧版只回 Failing tests 段，把探针写进 System.err 的输出整段丢掉，逼模型改用
                 # 「探针写文件再读回」。这里补一段失败段之前的日志尾，含 stderr 与探针输出。
                 surface = fail_msg
+                # 【失败用例方法体（断言原文）】直接附上，省去模型自己定位再读文件。
+                if bodies:
+                    surface += "\n\n【失败用例方法体（本地代劳读取，断言原文见此）】\n"
+                    surface += "\n\n".join(f"--- {name} ---\n{body}" for name, body in bodies)
                 fail_pos = content.find(fail_match.group(0))
                 prefix = content[max(0, fail_pos - 1200):fail_pos].strip() if fail_pos > 0 else ""
                 if prefix:

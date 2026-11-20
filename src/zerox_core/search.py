@@ -1,4 +1,4 @@
-"""search_code 的纯逻辑：grep 命令构造与结果整理。
+"""search_code / run_test 的纯解析逻辑：grep 构造、结果整理、失败定位与编译错误提取。
 
 不接触文件系统、目标环境或全局状态，便于离线单测。
 server 只负责注入当前工作区与配置，解析/排序规则都在这里。
@@ -124,3 +124,135 @@ def format_results(stdout, keyword, workdir, include, max_results=DEFAULT_MAX_RE
     if len(entries) > len(shown):
         header += f"；缩小 file_pattern 或换更具体的关键字可查看其余 {len(entries) - len(shown)} 条"
     return header + "\n" + body
+
+
+# 编译器报错行：javac / ant / maven 常见形态，抓 file:line 与后面的错误描述。
+# 只认带 .java:<数字> 的行，避免把普通日志/路径当错误；文件名允许 /、\ 与 $。
+_COMPILE_ERROR = re.compile(
+    r"(?P<path>[^\s:]+\.java):(?P<line>\d+)"
+    r"(?:,\d+)?:?\s*(?:error:\s*)?(?P<msg>.+?)\s*$"
+)
+
+
+def extract_compile_errors(log, max_errors=8, msg_chars=200):
+    """把编译器输出里的 `文件:行号: 错误` 提取成去重清单，返回 (文本, 条数)。
+
+    编译失败时日志动辄几百行，模型却只需要「哪个文件第几行报什么」。纯文本解析，
+    提取不到就返回空文本 / 0，让调用方回退原文。路径压成 basename，避免刷屏。
+    """
+    found, seen = [], set()
+    for raw in str(log or "").splitlines():
+        match = _COMPILE_ERROR.search(raw)
+        if not match:
+            continue
+        path = match.group("path").replace("\\", "/").rsplit("/", 1)[-1]
+        line = match.group("line")
+        msg = match.group("msg").strip()
+        key = (path, line, msg[:40])
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(msg) > msg_chars:
+            msg = msg[:msg_chars] + "…"
+        found.append(f"- {path}:{line}: {msg}")
+        if len(found) >= max_errors:
+            break
+    if not found:
+        return "", 0
+    return ("【编译错误（本地提取）】\n" + "\n".join(found), len(found))
+
+
+# 方法体抽取：从声明行起，靠花括号配平找到方法末尾；忽略字符串/字符/注释里的括号。
+_LINE_COMMENT = "//"
+_BLOCK_START = "/*"
+_BLOCK_END = "*/"
+
+
+def _mask_java_line(line, in_block):
+    """把一行 Java 里的字符串/字符字面量与注释替换成空格，返回 (掩码行, 是否仍在块注释)。
+
+    只用于花括号配平：被掩码的位置不会贡献 `{` / `}`，但保留原长度与其余字符。
+    覆盖行注释、块注释（可跨行）、双引号/单引号及其转义。
+    """
+    out = []
+    i, n = 0, len(line)
+    while i < n:
+        if in_block:
+            end = line.find(_BLOCK_END, i)
+            if end == -1:
+                out.append(" " * (n - i))
+                return "".join(out), True
+            out.append(" " * (end + 2 - i))
+            i = end + 2
+            in_block = False
+            continue
+        if line.startswith(_LINE_COMMENT, i):
+            out.append(" " * (n - i))
+            break
+        if line.startswith(_BLOCK_START, i):
+            in_block = True
+            out.append(" " * 2)
+            i += 2
+            continue
+        if line[i] in ('"', "'"):
+            quote = line[i]
+            out.append(" ")
+            i += 1
+            while i < n:
+                out.append(" ")
+                if line[i] == "\\":
+                    i += 1
+                    if i < n:
+                        out.append(" ")
+                        i += 1
+                    continue
+                if line[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        out.append(line[i])
+        i += 1
+    return "".join(out), in_block
+
+
+def extract_method_body(source, start_line, max_lines=60, max_chars=1600):
+    """从 start_line（1-based，方法声明行）抽取方法体，返回 (带行号文本, 提取行数, 截断标记)。
+
+    server 已经定位到失败用例的方法声明行，这里顺手把方法体读出来附上，
+    模型就不必再发 get_file_internal_structure + read_specific_code 两轮工具调用。
+    花括号配平保证只取一个方法；掩码处理避免字符串/注释里的括号提前收尾。
+    """
+    if not start_line or start_line < 1:
+        return "", 0, False
+    lines = str(source or "").splitlines()
+    idx = start_line - 1
+    if idx >= len(lines):
+        return "", 0, False
+
+    picked, depth, in_block, started = [], 0, False, False
+    for offset in range(max_lines):
+        pos = idx + offset
+        if pos >= len(lines):
+            break
+        raw = lines[pos]
+        picked.append((pos + 1, raw))
+        masked, in_block = _mask_java_line(raw, in_block)
+        for ch in masked:
+            if ch == "{":
+                depth += 1
+                started = True
+            elif ch == "}":
+                depth -= 1
+        # 声明行可能不带 '{'（如泛型/换行签名）；遇到第一个 '{' 后才允许配平收尾
+        if started and depth <= 0:
+            break
+
+    truncated = len(picked) >= max_lines and (started and depth > 0 or not started)
+    numbered = "\n".join(f"{no}: {text}" for no, text in picked)
+    body = numbered
+    body_truncated = False
+    if len(body) > max_chars:
+        body = body[:max_chars] + f"\n…（方法体截断，原长 {len(numbered)} 字；完整内容用 read_specific_code 读）"
+        body_truncated = True
+    return body, len(picked), (truncated or body_truncated)
