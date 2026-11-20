@@ -72,6 +72,20 @@ def resolve_patch_path(raw_path, workdir, allow=None, deny=None,
     return True, path
 
 
+def display_path(path, workdir):
+    """回给模型的路径一律相对工作区：省 token，也避免本地绝对路径进 transcript。
+
+    resolve_read_path / resolve_patch_path 都接受相对路径（会按 workdir 拼回绝对值），
+    所以模型拿到相对路径后继续调用读工具或补丁工具不受影响。workdir 为空时原样返回。
+    """
+    if not path or not workdir:
+        return path
+    try:
+        return posixpath.relpath(str(path).replace("\\", "/"), str(workdir).rstrip("/"))
+    except (TypeError, ValueError):
+        return path
+
+
 def resolve_read_path(raw_path, workdir):
     """解析读工具路径，返回 (ok, value)。
 

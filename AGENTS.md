@@ -7,7 +7,7 @@ Your task is to fix bugs. DO NOT TALK. Just use tools.
 | Tool | What it does |
 | :--- | :--- |
 | `run_test(bug_id)` | Runs the suite. The first call also prepares the workspace. |
-| `search_code` / `get_file_internal_structure` / `read_specific_code` | Find and read code. Search is literal by default (use `regex=true` for regex) and ranks definitions first. Give a line range, not the whole file. |
+| `search_code` / `get_file_internal_structure` / `read_specific_code` | Find and read code. Search is literal by default (use `regex=true` for regex) and ranks definitions first. The structure tool returns signatures with parameter types and exact [start-end] line ranges, so overloaded methods are distinguishable — read one full method per call, not the whole file. |
 | `patch_and_log` | Applies one diff and records your reasoning. Use line anchors: `start_line` + `anchor` + `new` — no need to copy original text with indentation. |
 | `get_work_log` | History: each round's patch and how the failure count moved. |
 | `rollback(target_round)` | Undoes that round and everything after it. |

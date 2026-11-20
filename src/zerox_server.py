@@ -147,6 +147,11 @@ def resolve_read_path(raw_path):
     return core_paths.resolve_read_path(raw_path, CURRENT_WORKDIR)
 
 
+def display_path(wsl_path):
+    """回给模型的路径转相对（纯逻辑在 zerox_core.paths，便于离线单测）。"""
+    return core_paths.display_path(wsl_path, CURRENT_WORKDIR)
+
+
 def write_target_file(target_path: str, content: str):
     """把内容写进目标环境路径（target_path 是目标环境里的绝对路径）。
     Linux 原生：直接 open 写入，不经临时文件中转；
@@ -693,12 +698,12 @@ async def call_tool(name: str, arguments: dict):
             if start_line < 1 or end_line < start_line:
                 return [types.TextContent(type="text", text=(
                     f"行号无效：start_line={start_line}, end_line={end_line}。"
-                    f"{wsl_path} 共 {total_lines} 行，请传 1 ≤ start_line ≤ end_line ≤ {total_lines}。"
+                    f"{display_path(wsl_path)} 共 {total_lines} 行，请传 1 ≤ start_line ≤ end_line ≤ {total_lines}。"
                 ), isError=True)]
 
             if start_line > total_lines:
                 return [types.TextContent(type="text", text=(
-                    f"起始行超出文件末尾：{wsl_path} 共 {total_lines} 行，start_line={start_line}。"
+                    f"起始行超出文件末尾：{display_path(wsl_path)} 共 {total_lines} 行，start_line={start_line}。"
                     f"请改读 1-{total_lines} 之间的范围，或改用 search_code 定位。"
                 ), isError=True)]
 
@@ -709,7 +714,7 @@ async def call_tool(name: str, arguments: dict):
             # 带行号输出
             formatted_lines = [f"{start_idx + i + 1}: {line}" for i, line in enumerate(selected_lines)]
 
-            header = f"文件 {wsl_path} 第 {start_idx + 1}-{end_idx} 行（共 {total_lines} 行）内容如下："
+            header = f"文件 {display_path(wsl_path)} 第 {start_idx + 1}-{end_idx} 行（共 {total_lines} 行）内容如下："
             if end_line > total_lines:
                 header += f"\n（end_line={end_line} 超出末尾，已截断到 {total_lines}）"
             return [types.TextContent(type="text", text=header + "\n" + "\n".join(formatted_lines))]
@@ -727,37 +732,28 @@ async def call_tool(name: str, arguments: dict):
             if result.returncode != 0:
                 return [types.TextContent(type="text", text=f"读取失败: {result.stderr}")]
             
-            lines = result.stdout.splitlines()
-            structure_info = []
-            
-            # 正则匹配类名和方法名
-            # 匹配类：public class Foo / interface Foo / enum Foo
-            class_pattern = re.compile(r'^\s*(?:public|protected|private)?\s*(?:static)?\s*(?:final)?\s*(?:abstract)?\s*(class|interface|enum)\s+(\w+)')
-            # 匹配方法：public void foo() / private String bar(int a)
-            method_pattern = re.compile(r'^\s*(?:public|protected|private)\s+(?:static\s+)?(?:final\s+)?(?:synchronized\s+)?[\w<>\[\]]+\s+(\w+)\s*\(')
-
-            for i, line in enumerate(lines):
-                class_match = class_pattern.search(line)
-                method_match = method_pattern.search(line)
-                
-                if class_match:
-                    structure_info.append(f"[第 {i+1} 行] {class_match.group(1).capitalize()}: {class_match.group(2)}")
-                elif method_match:
-                    # 过滤掉 if/for/while 等控制语句，只保留方法定义
-                    if method_match.group(1) not in ["if", "for", "while", "switch", "catch"]:
-                        structure_info.append(f"[第 {i+1} 行] 方法: {method_match.group(1)}")
-
-            if not structure_info:
+            items, truncated = code_search.extract_java_structure(result.stdout)
+            if not items:
                 return [types.TextContent(type="text", text="未在文件中找到明显的类或方法结构。可先用 read_specific_code 读取前 80 行，或用 search_code 定位具体方法名后再读该范围。")]
-            
-            # 行为约束：让模型按行读、别读全文件（schema 里的建议此前从未真正生效）
-            # 措辞刻意不说「权威/完全信任」——结构来自简单正则，会漏构造函数、泛型方法，
-            # 给出可操作的信任度即可，最终以实际代码为准。
+
+            kind_names = {"class": "类", "interface": "接口", "enum": "枚举", "record": "记录",
+                          "method": "方法", "constructor": "构造函数"}
+            structure_info = []
+            for it in items:
+                lo, hi = it["line_start"], it["line_end"]
+                span = str(lo) if lo == hi else f"{lo}-{hi}"
+                kind = kind_names.get(it["kind"], it["kind"])
+                structure_info.append(f"[第 {span} 行] {kind}: {it['signature']}")
+            if truncated:
+                structure_info.append("…（条目过多已截断，请用 search_code 缩小范围）")
+
+            # 输出签名（含参数类型）+ 起止行：重载可区分，模型一次 read 就能覆盖完整方法。
+            # 措辞仍不承诺绝对权威——源码扫描会漏匿名类等边缘结构，最终以实际代码为准。
             header = (
-                f"【结构索引】{wsl_path} 的类/方法起始行（由源码扫描得到，"
-                "行号可作定位起点，最终以实际代码为准）：\n"
+                f"【结构索引】{display_path(wsl_path)} 的类/方法签名与行范围（由源码扫描得到，"
+                "含包级私有方法与构造函数；行号可作定位起点，最终以实际代码为准）：\n"
                 "请用 read_specific_code 按 start_line/end_line 只读取需要的那几段，"
-                "不要读取全文件；若这些位置没有要找的逻辑，再扩大行范围。\n"
+                "不要读取全文件；同名方法用参数类型区分，起止行可直接作为锚点补丁的范围。\n"
             )
 
             return [types.TextContent(type="text", text=header + "\n".join(structure_info))]
@@ -820,7 +816,7 @@ async def call_tool(name: str, arguments: dict):
             try:
                 res = execute_in_target(f"cat {shlex.quote(wsl_path)}")
                 if res.returncode != 0:
-                    return [types.TextContent(type="text", text=f"修改失败：找不到文件 {wsl_path}", isError=True)]
+                    return [types.TextContent(type="text", text=f"修改失败：找不到文件 {display_path(wsl_path)}", isError=True)]
                 content = res.stdout.replace("\r\n", "\n")  # 顺手解决 CRLF 问题
                 original = res.stdout  # 留给备份和失败还原
             except Exception as e:
@@ -829,7 +825,7 @@ async def call_tool(name: str, arguments: dict):
             # 行号锚点：一次处理该文件的所有 change，对原始内容校验锚点后倒序替换。
             after, err = code_search.apply_line_patches(content, pds)
             if err:
-                return [types.TextContent(type="text", text=f"补丁未应用：{wsl_path} —— {err}。本轮修改未落盘。", isError=True)]
+                return [types.TextContent(type="text", text=f"补丁未应用：{display_path(wsl_path)} —— {err}。本轮修改未落盘。", isError=True)]
 
             staged_writes[wsl_path] = {"content": after, "original": original}
 

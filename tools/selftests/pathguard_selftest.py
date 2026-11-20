@@ -12,6 +12,7 @@
   7. 未初始化 / 空路径 -> 拒绝
   8. search_code 传入的相对前缀（src/main/java）-> 通过
   9. patch 的 allow/deny globs 匹配的是归一化后的绝对路径，不能被 .. 绕过
+  10. display_path 回显相对路径，且该相对路径能被 resolve_read_path 原样读回
 
 已知不在覆盖内：符号链接指向工作区外（见 README 的路径约束说明）。
 """
@@ -24,6 +25,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from zerox_core.paths import (  # noqa: E402
+    display_path,
     normalize_under_workspace,
     resolve_patch_path,
     resolve_read_path,
@@ -110,6 +112,17 @@ def main():
                                      allow=["*/src/main/*"])
     check(not good and "patch_allow_globs" in value,
           "白名单外的路径应拒绝")
+
+    # 回显路径相对化：不能泄露 /home/<user>/...，且模型拿它继续调用读工具必须可用
+    shown = display_path(f"{WORK}/src/main/java/Foo.java", WORK)
+    check(shown == "src/main/java/Foo.java", f"应回显相对路径: {shown}")
+    check("/home/" not in shown, f"不应含本地绝对路径: {shown}")
+    good, value = resolve_read_path(shown, WORK)
+    check(good and value == f"{WORK}/src/main/java/Foo.java",
+          f"相对路径应能原样解析回同一文件: {value}")
+    check(display_path("/home/user/other/Foo.java", "") == "/home/user/other/Foo.java",
+          "未初始化工作区时应原样返回")
+    check(display_path(None, WORK) is None, "空路径应原样返回")
 
     print("pathguard selftest: OK")
 

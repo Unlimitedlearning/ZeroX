@@ -121,7 +121,7 @@ def build_tools():
         ),
         types.Tool(
             name="get_file_internal_structure",
-            description="获取 Java 文件的代码结构（包含类名和方法名及其起始行号）。在你使用 search_code 找到文件后，强烈建议先调用此工具，再精准定位需要读取的行范围。",
+            description="获取 Java 文件的结构索引：类/接口/枚举、方法、构造函数的签名（含参数类型）与 [起始行-结束行] 范围。包含包级私有方法，同名方法靠参数类型区分，起止行可直接作为 read_specific_code 的读取范围或锚点补丁的行号。用 search_code 找到文件后建议先调用此工具。路径用相对路径或绝对路径均可。",
             inputSchema={
                 "type": "object",
                 "properties": {
