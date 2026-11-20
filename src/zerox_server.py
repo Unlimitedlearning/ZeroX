@@ -17,6 +17,8 @@ from zerox_core import config as config_mod
 from zerox_core import schemas
 # 读工具的工作区边界：纯解析逻辑在 zerox_core.paths，server 只传 CURRENT_WORKDIR
 from zerox_core import paths as core_paths
+# search_code 的命令构造与结果整理是纯函数，离线可单测
+from zerox_core import search as code_search
 from zerox_core.config import compile_or_fail
 from zerox_core.config import resolve_bug as _resolve_bug
 # 命令执行器已外迁：事后审计（audit.py）要用同一条 test_cmd 复跑，不能各写一份 WSL 转发逻辑
@@ -122,19 +124,6 @@ def _glob_list(value):
     if isinstance(value, str):
         value = [value]
     return [str(v).strip() for v in value if str(v).strip()]
-
-
-def run_grep(scope: str, include: str, keyword: str):
-    """在指定目录下 grep 一次，返回 CompletedProcess。
-
-    grep 的 --include 只匹配 basename，带路径的模式必须由调用方先拆开，
-    否则它会静默地一条也搜不到（既不报错也不提示）。
-    """
-    cmd = (
-        f"grep -rn --include={shlex.quote(include)} {shlex.quote(keyword)} "
-        f"{shlex.quote(scope)} 2>/dev/null | head -n 20"
-    )
-    return execute_in_target(cmd)
 
 
 def check_patch_path(raw_path: str):
@@ -535,7 +524,9 @@ async def call_tool(name: str, arguments: dict):
         
         keyword = arguments.get("keyword")
         pattern = arguments.get("file_pattern") or TARGET["source_glob"]
-        
+        regex = bool(arguments.get("regex", False))
+        max_results = arguments.get("max_results", code_search.DEFAULT_MAX_RESULTS)
+
         # 工作区统一用 resolve_bug 解析出来的 CURRENT_WORKDIR，不按测试工具命名推导
         workdir = CURRENT_WORKDIR
         if not workdir:
@@ -562,19 +553,52 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text=scope_or_err, isError=True)]
         scope = scope_or_err
 
-        res = run_grep(scope, include, keyword)
-        note = ""
-        if not res.stdout.strip() and scope != workdir:
-            res = run_grep(workdir, include, keyword)
-            note = f"\n（{scope} 下没有命中，已改为在整个工作区搜索）"
+        cmd, arg_err = code_search.build_grep_command(scope, include, keyword, regex=regex)
+        if arg_err:
+            return [types.TextContent(type="text", text=arg_err, isError=True)]
+        res = execute_in_target(cmd)
 
-        if res.returncode != 0 or not res.stdout.strip():
+        # grep: 0=有命中, 1=无命中, 2=命令出错。旧实现把 stderr 丢掉且把 2 当 1，
+        # 搜 'public int[] add' 时 grep 报未闭合字符类，却回「未找到」，模型连搜两次。
+        # 但 exit 2 也可能只是个别子目录不可读而 stdout 已有命中，此时不能丢结果。
+        def grep_failed(result):
+            return result.returncode not in (0, 1)
+
+        if grep_failed(res) and not res.stdout.strip():
+            detail = (res.stderr or res.stdout or "").strip()[-500:]
             return [types.TextContent(type="text", text=(
-                f"未找到关键字 '{keyword}'（过滤条件：--include={include}）。"
-                "请换个词，或直接用 read_specific_code 读取文件。"
+                f"【搜索失败】命令执行出错（退出码 {res.returncode}）：{detail}。"
+                "若要按正则搜索，请传 regex=true；否则关键字按字面处理。"
+            ), isError=True)]
+
+        note = ""
+        if grep_failed(res):
+            note = "\n（部分目录读取失败，以上为已扫到的结果）"
+        elif res.returncode == 1 and scope != workdir:
+            res = execute_in_target(
+                code_search.build_grep_command(workdir, include, keyword, regex=regex)[0]
+            )
+            if grep_failed(res) and not res.stdout.strip():
+                detail = (res.stderr or res.stdout or "").strip()[-500:]
+                return [types.TextContent(type="text", text=(
+                    f"【搜索失败】命令执行出错（退出码 {res.returncode}）：{detail}",
+                ), isError=True)]
+            note = (f"\n（{scope} 下没有命中，已改为在整个工作区搜索）"
+                    if not grep_failed(res) else
+                    "\n（部分目录读取失败，以上为已扫到的结果；已改为在整个工作区搜索）")
+
+        if res.returncode == 1 or not res.stdout.strip():
+            return [types.TextContent(type="text", text=(
+                f"未找到关键字 '{keyword}'（过滤条件：--include={include}，"
+                f"{'正则' if regex else '字面'}匹配）。"
+                "请换更短的词，或确认 file_pattern 是否写对（只匹配文件名，如 *.java）；"
+                "也可直接用 read_specific_code 读取文件。"
             ))]
-            
-        return [types.TextContent(type="text", text=f"搜索结果：\n{res.stdout}{note}")]
+
+        body = code_search.format_results(
+            res.stdout, keyword, workdir, include, max_results=max_results, regex=regex
+        )
+        return [types.TextContent(type="text", text=body + note)]
 
     elif name == "read_specific_code":
         ok_path, path_or_err = resolve_read_path(arguments.get("wsl_file_path"))

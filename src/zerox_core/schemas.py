@@ -21,12 +21,14 @@ def build_tools():
         ),
         types.Tool(
             name="search_code",
-            description="在代码库中搜索关键字（类名、方法名、变量名、报错信息），返回匹配的文件路径和行号。",
+            description="在代码库中搜索关键字（类名、方法名、变量名、报错信息），返回文件路径和行号。默认按字面匹配（[] . () 无需转义），结果按定义行优先排序、路径相对工作区。",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "keyword": {"type": "string", "description": "要搜索的关键字，例如 'toLocale'"},
-                    "file_pattern": {"type": "string", "description": "可选，只匹配文件名（不含目录），例如 '*.java'"}
+                    "keyword": {"type": "string", "description": "要搜索的关键字，按字面文本解释，例如 'public int[] add'；需要正则时传 regex=true"},
+                    "file_pattern": {"type": "string", "description": "可选，只匹配文件名（如 '*.java'），也可带工作区内目录前缀（如 'src/main/java/*.java'）"},
+                    "regex": {"type": "boolean", "description": "可选，默认 false 按字面匹配；传 true 时 keyword 按扩展正则解释"},
+                    "max_results": {"type": "integer", "description": "可选，最多返回多少条结果（1-100，默认 20）"}
                 },
                 "required": ["keyword"]
             }
