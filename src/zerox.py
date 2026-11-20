@@ -25,7 +25,7 @@ from zerox_core import PASSED_RESULT_MARKER
 from zerox_core import config as config_mod
 # 上下文裁剪的纯函数抽到 zerox_core，便于离线单测（import 本文件会初始化 client）
 from zerox_core.context import (
-    keep_valuable_turns, trim_tool_outputs, context_chars, split_turns,
+    keep_valuable_turns, trim_tool_outputs, context_chars, split_turns, thought_notice,
 )
 
 CONFIG_FILE = "config.json"
@@ -77,7 +77,13 @@ COMPACT_KEEP_DECISIONS = 4
 COMPACT_KEEP_MSG_CHARS = 4000
 # 【滚动摘要】压缩时从 work_log 生成一段受控长度的状态快照，随压缩提示一起常驻注入，
 # 让模型一睁眼就看到「当前推断 / 最近测试 / 已排除方向」，不再只靠它主动调 get_work_log。
-COMPACT_BRIEF_CHARS = 1200
+# 含最近三条 think 的节选，故比最初的 1200 略宽（每条 think 节选 180 字）。
+COMPACT_BRIEF_CHARS = 1800
+# 压缩时回传的 think 原文条数与单条上限：补丁前形成的假设只在 think 里，
+# 不回传就会出现 Chart_13 那种「上下文被压缩，之前想通的全没了，重新推一遍」。
+# 选 3 条是覆盖「正在验证的假设 + 刚排除的方向」，再多会把压缩出来的窗口重新撑满。
+COMPACT_THOUGHTS = 3
+COMPACT_THOUGHT_CHARS = 1600
 
 # 上下文压缩的两个阈值都来自 config.json 的 agent 段落：
 #   compact_context_chars  体量触发（窗口会不会爆）
@@ -195,13 +201,51 @@ def transcript_path(bug_id: str) -> str:
     return os.path.join(LOG_DIR, canonical_bug_id(bug_id), "transcript.md")
 
 
+def l1_state_path(bug_id: str) -> str:
+    """每次 API 请求实际注入的 L1 状态卡：logs/<规范名>/l1_state.jsonl。
+
+    transcript 只记压缩动作本身，看不到「模型这一轮到底收到了什么」；这里一行一次请求，
+    使压缩后的假设是否真的传达到模型变成可核对的事实，而不是靠提示词描述猜。
+    """
+    return os.path.join(LOG_DIR, canonical_bug_id(bug_id), "l1_state.jsonl")
+
+
+def append_l1_state(bug_id: str, turn: int, content: str, compacted: bool = False,
+                    notice: str = ""):
+    """把一条状态卡快照追加到 l1_state.jsonl；写盘失败不影响主循环。
+
+    notice 是本轮保留下来的压缩提示原文（含回传的 think），它与状态卡一起构成
+    模型实际收到的恢复信息；不记它就只能看到状态卡，无法核对假设是否传达到位。
+    """
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "turn": turn,
+        "compacted": compacted,
+        "chars": len(content),
+        "content": content,
+        "notice": notice,
+    }
+    try:
+        path = l1_state_path(bug_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as err:
+        print(f"  ⚠️ [{bug_id}] 写 l1_state 失败: {err}")
+
+
 def reset_transcript(bug_id: str):
-    """每个 bug 开跑时重写一份（与服务端 checkout 时清空 work_log 同一时机）。"""
+    """每个 bug 开跑时重写 transcript，并清空 think / 状态卡的逐轮归档（同一时机）。"""
     path = transcript_path(bug_id)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"# {bug_id} agent transcript\n\n开始时间：{datetime.now().isoformat(timespec='seconds')}\n")
+        for aux in (l1_state_path(bug_id), os.path.join(os.path.dirname(path), "thoughts.jsonl")):
+            try:
+                os.remove(aux)
+            except FileNotFoundError:
+                pass
     except OSError as err:
         print(f"  ⚠️ [{bug_id}] 建 transcript 失败: {err}")
 
@@ -243,6 +287,11 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     print(f"🚀 开始测试 Bug: {bug_id}")
     print("="*50)
     
+    # think 与状态卡的落盘入口：和 MCP Server 共用同一个 logs/<bug>/ 目录，但写的是
+    # 独立的 thoughts.jsonl / l1_state.jsonl，不碰 work_log.jsonl 的事件协议。
+    log_home = os.path.join(LOG_DIR, canonical_bug_id(bug_id))
+    wl = worklog.WorkLog(log_home)
+
     # 【L1 活状态卡】不进入 messages 正文，仅在每次 API 调用时临时拼到末尾。
     # 这样 system + 逐轮累积的历史构成稳定前缀，可被服务端前缀缓存命中；
     # 每轮变化的状态卡位于末尾，不会让前面的缓存前缀失效。
@@ -292,6 +341,8 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     turn = -1
     while True:
         turn += 1
+        compacted_this_turn = False
+        compaction_notice = ""
 
         # 按体量触发压缩：读代码的轮次几乎不涨上下文，一次 3MB 的测试日志却能一把撑爆窗口，
         # 所以看的是上下文正文字数，不是轮数。阈值：config.json 的 agent.compact_context_chars
@@ -328,14 +379,26 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                 "Your current state is in the LIVE STATE message at the end — it is refreshed "
                 "from the work log every turn and already reflects all patches, test "
                 "results and ruled-out directions, so continue directly from it. "
+                "The recent thinking below is verbatim from before compaction; use it to "
+                "resume the hypothesis you were testing instead of re-deriving it. "
                 "Call `get_work_log` only if you need a detail the LIVE STATE does not show."
             )
+
+            # 【think 原文回传】补丁形成前的假设只存在于 think 里，状态卡里的节选只有 180 字。
+            # 压缩时把最近 3 条原文放进保留下来的 reset_prompt，模型压缩后第一眼就能接着思考，
+            # 而不是在空状态上从头推导（Chart_13 turn18 的 "I need to re-derive. Ugh."）。
+            recent_thoughts = wl.thoughts(COMPACT_THOUGHTS)
+            notice, thought_chars = thought_notice(recent_thoughts, COMPACT_THOUGHT_CHARS)
+            if notice:
+                reset_content += "\n\n" + notice
+            compacted_this_turn = True
 
             if recent_tool_output:
                 # 只留尾部：测试报错的关键信息都在最后，也能避免单条输出再次撑爆上下文
                 reset_content += "\n\n--- Most recent tool output (tail) ---\n" + recent_tool_output[-COMPACT_TOOL_TAIL_CHARS:]
             
             reset_prompt = {"role": "user", "content": reset_content}
+            compaction_notice = reset_content
 
             # 重新组装：主 system + 提示词(user) + 价值裁剪后的轮次。
             # 状态卡不进 messages，每轮请求时单独拼到末尾（见下方 api_messages）。
@@ -345,6 +408,7 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                               f"上下文 {ctx_chars} 字 → {context_chars(messages)} 字；"
                               f"价值裁剪保留 {len(kept)} 条消息（最近 {COMPACT_KEEP_TURNS} 轮 + "
                               f"最近 {COMPACT_KEEP_DECISIONS} 个决策轮，单条 ≤{COMPACT_KEEP_MSG_CHARS} 字）；"
+                              f"回传最近 {len(recent_thoughts)} 条 think 原文（{thought_chars} 字）；"
                               f"状态卡按请求拼接")
             # 注意：messages 末尾可能是 tool 消息（保留轮次带的），API 同样接受，模型会接着回复
 
@@ -366,6 +430,9 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                 tools=openai_tools,
                 temperature=0.0
             )
+            # 只在请求成功后记：l1_state 要回答「模型这一轮实际收到了什么」
+            append_l1_state(bug_id, turn + 1, state_card["content"],
+                            compacted=compacted_this_turn, notice=compaction_notice)
             response_msg = response.choices[0].message
 
             messages.append(response_msg)
@@ -381,7 +448,10 @@ async def run_single_bug(bug_id: str, session: ClientSession):
             # 安全提取文本（解决了 UnboundLocalError）
             text = response_msg.content.strip() if response_msg.content else ""
             # 模型自己的思考过程（deepseek-flash 一般没有，reasoner 类才有）
-            append_transcript(bug_id, turn + 1, "think", reasoning_text(response_msg), limit=4000)
+            think = reasoning_text(response_msg)
+            append_transcript(bug_id, turn + 1, "think", think, limit=4000)
+            # 原文单独落盘：压缩时要把最近 3 条回传；空思考不记
+            wl.note(turn + 1, think)
             append_transcript(bug_id, turn + 1, "AI", text)
 
             # 如果 AI 输出了文本，简单打印并检查是否通关
