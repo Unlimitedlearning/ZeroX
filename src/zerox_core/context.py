@@ -7,6 +7,7 @@ AsyncOpenAI client、读取 config.json，带来副作用）。
     trim_tool_outputs   对称截断工具输出与补丁参数（防大 diff 二次撑爆窗口）
     keep_valuable_turns 按价值裁剪：保最近轮 + 最近决策轮，丢纯搜索闲聊轮
     context_chars       统计上下文体积，作为压缩触发的代理值
+    thought_notice      压缩后回传的 think 原文段（可离线单测顺序与截断）
 
 依赖方向：被 src/zerox.py 依赖；本模块只依赖标准库 json。
 """
@@ -104,6 +105,37 @@ def trim_tool_outputs(msgs, limit):
         base["tool_calls"] = new_calls
         out.append(base)
     return out
+
+
+THOUGHT_NOTICE_HEADER = "--- Your recent thinking before compaction (verbatim, oldest first) ---"
+THOUGHT_NOTICE_FOOTER = "--- End of recent thinking ---"
+
+
+def thought_notice(thoughts, per_thought_chars=1600):
+    """把最近几条 think 原文拼成压缩后保留的提示段，返回 (notice, 正文总字数)。
+
+    补丁前的假设只存在于 think 中；brief() 只给节选，所以压缩提示里要带原文，
+    否则模型会在空状态上重新推导（Chart_13 turn18 实测）。按输入顺序（旧→新）拼接，
+    超长单条留头并注明原长，完整内容仍在 thoughts.jsonl 里。
+    """
+    blocks = []
+    body_chars = 0
+    for ev in thoughts or []:
+        raw = (ev.get("text") or "").strip() if isinstance(ev, dict) else str(ev).strip()
+        if not raw:
+            continue
+        if len(raw) > per_thought_chars:
+            shown = (raw[:per_thought_chars]
+                     + f"\n…（截断，原长 {len(raw)} 字；完整内容见 thoughts.jsonl）")
+        else:
+            shown = raw
+        turn = ev.get("turn") if isinstance(ev, dict) else ""
+        blocks.append(f"[turn {turn}]\n{shown}")
+        body_chars += len(shown)
+    if not blocks:
+        return "", 0
+    notice = "\n\n".join([THOUGHT_NOTICE_HEADER] + blocks + [THOUGHT_NOTICE_FOOTER])
+    return notice, body_chars
 
 
 def context_chars(messages):

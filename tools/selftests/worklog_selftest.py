@@ -60,6 +60,18 @@ def main():
         assert len(wl.brief(max_chars=80)) <= 90, "brief 必须尊重 max_chars 上限"
         assert "暂无历史工作日志" in worklog.WorkLog(os.path.join(tmp, "empty")).brief()
 
+        # 【think 原文】压缩时回传的最近三条：独立文件、只增不删、brief 里给节选
+        wl.note(1, "假设一：边界判断错了，先查 >= 与 >")
+        wl.note(2, "假设二：换个方向，从测试方法的 expected 反推")
+        assert [e["turn"] for e in wl.thoughts()] == [1, 2], wl.thoughts()
+        assert [e["turn"] for e in wl.thoughts(limit=1)] == [2], "只取最近一条"
+        assert os.path.exists(os.path.join(tmp, "logs", "thoughts.jsonl")), "think 应单独落盘"
+        b_think = wl.brief(title="Demo_1b")
+        assert "最近思考" in b_think and "假设二" in b_think, b_think
+        assert "当前推断（轮 2）" in b_think, b_think
+        assert len(wl.brief(max_chars=120)) <= 130, "think 节选也要受 max_chars 约束"
+        assert wl.note(3, "   ") is None, "空 think 不应落盘"
+
         # 【未验证补丁】打完补丁还没跑测试时，状态卡不能让旧结果看起来像新结果：
         # Lang_10 上模型把单次测试的「2 → 2」读成「刚打的补丁仍失败」，转去写探针，多花了两倍 token。
         tmp2 = os.path.join(tmp, "case2")
@@ -96,6 +108,7 @@ def main():
         assert len(rb_events) == 1, rb_events
         assert rb_events[0]["kind"] == "probe" and rb_events[0]["target_round"] == 1, rb_events[0]
         assert wl.stats()["rollbacks"] == 1 and wl.stats()["probe_rollbacks"] == 1, wl.stats()
+        assert [e["turn"] for e in wl.thoughts()] == [1, 2], "回滚重写 work_log 不应删掉 think 原文"
         digest_after = wl.digest(limit=5, title="Demo_1b")
         assert "[回滚]" in digest_after and "撤销到第 1 轮（探针）" in digest_after, digest_after
         # 压缩后的摘要必须带上「已排除方向」，否则模型会重复走死路

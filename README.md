@@ -28,7 +28,7 @@ ZeroX 是一个基于模型上下文协议（MCP）的自动程序修复（APR�
 - **价值裁剪（L2）**：超过 `compact_context_chars` 或连续只读达到 `compact_idle_reads` 时触发，保留最近若干轮与最近若干决策轮（`patch_and_log` / `run_test` / `rollback`），优先丢弃纯搜索与读代码的轮次，使早期 `reasoning` 中的假设得以保留。裁剪在 `assistant` 边界切分，避免孤立 `tool` 消息导致接口报错；超长输出与补丁参数对称截断（补丁参数以合法 JSON 占位）。
 - **完整日志（L3）**：`work_log.jsonl` 不变；`get_work_log` 降级为可选，仅在状态卡不足时调用。
 
-状态全部来自工具调用的参数与结果，不产生额外模型开销；恢复仅发生在同一进程内，见「局限性」。
+状态全部来自工具调用的参数与结果，不产生额外模型开销；恢复仅发生在同一进程内，见「局限性」。压缩时从 `thoughts.jsonl` 取最近 3 条 think 原文回传模型，每轮实际注入的状态卡写入 `l1_state.jsonl`，见 [`docs/logs.md`](docs/logs.md)。
 
 ## 初步实验（Defects4J）
 

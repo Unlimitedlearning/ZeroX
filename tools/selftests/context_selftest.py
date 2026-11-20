@@ -8,6 +8,7 @@
   - 未超限的消息原样保留（不误伤）
   - context_chars 把 tool 参数计入体积，且截断后体积确实下降
   - keep_valuable_turns 保留早期决策轮 + 最近轮，丢弃中间闲聊轮，且无孤立 tool 消息
+  - thought_notice 按旧→新顺序回传 think 原文，超长单条截断并标原长
 """
 import json
 import os
@@ -17,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 from zerox_core.context import (  # noqa: E402
-    keep_valuable_turns, trim_tool_outputs, context_chars, split_turns,
+    keep_valuable_turns, trim_tool_outputs, context_chars, split_turns, thought_notice,
 )
 
 
@@ -97,6 +98,20 @@ def main():
     prefix, turns = split_turns(msgs)
     assert len(prefix) == 2 and all(p["role"] == "system" for p in prefix), prefix
     assert len(turns) == 8, len(turns)
+
+    # 5. think 原文回传：顺序旧→新，空文本跳过，超长单条截断且注明原长
+    notes = [
+        {"turn": 7, "text": "先怀疑边界条件"},
+        {"turn": 8, "text": "   "},
+        {"turn": 9, "text": "X" * 120},
+    ]
+    notice, chars = thought_notice(notes, per_thought_chars=40)
+    assert notice.index("[turn 7]") < notice.index("[turn 9]"), "think 必须按旧→新顺序回传"
+    assert "[turn 8]" not in notice, "空 think 不应回传"
+    assert "原长 120 字" in notice and "X" * 40 in notice, notice
+    assert notice.startswith("--- Your recent thinking") and notice.endswith("--- End of recent thinking ---")
+    assert chars < 120, "超长单条必须被截断"
+    assert thought_notice([], 40) == ("", 0), "没有 think 时不应插入空段"
 
     print("context selftest: OK")
 

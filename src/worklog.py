@@ -11,6 +11,9 @@
      所以 test 事件永不覆盖。
   3. patch 事件自带 before/after 的 blob 引用：before=null 表示新建文件，回滚即删除。
 
+模型的 think 原文单独放在 thoughts.jsonl（一行一条），不进 work_log.jsonl：
+它不是版本事件，回滚不该删掉它——被撤销方向的思考恰恰是压缩后要保留的线索。
+
 日志格式（work_log.jsonl，一行一条）。正常路径只追加、永不覆盖写；唯一的例外是
 rollback()：它先把被撤销的事件抄进 human_audit.jsonl，再重写 work_log.jsonl（见下方 rollback）：
   {"t":"patch","ts":"2026-11-17T14:12:05","round":3,"status":"PATCHED",
@@ -127,10 +130,26 @@ class WorkLog:
         self.blob_dir = os.path.join(home, "blobs")
         self.log_path = os.path.join(home, "work_log.jsonl")
         self.audit_path = os.path.join(home, "human_audit.jsonl")
+        self.thought_path = os.path.join(home, "thoughts.jsonl")
         self.io = io or LocalIO()
         self.test_tail = test_tail
 
     # ---------------- 写 ----------------
+
+    def note(self, turn, text):
+        """把模型本轮 think 原文落盘（客户端唯一持有，压缩后据此恢复当时假设）。
+
+        只在客户端调用；服务端不写这个文件，所以 rollback 重写 work_log 时不会碰到它。
+        空文本不落盘：没思考就没有可恢复的假设，写一行空记录只会稀释后续读取。
+        """
+        text = str(text or "").strip()
+        if not text:
+            return None
+        event = {"t": "thought", "ts": _now(), "turn": turn, "text": text}
+        os.makedirs(self.home, exist_ok=True)
+        with open(self.thought_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        return event
 
     def apply(self, round, status, reasoning, summary, writes):
         """提交一轮 patch。
@@ -245,6 +264,27 @@ class WorkLog:
         return restored, broken
 
     # ---------------- 读 ----------------
+
+    def thoughts(self, limit=3):
+        """按写入顺序返回最近 limit 条 think 原文（压缩后回传给模型的那几条）。
+
+        坏行跳过；文件不存在时视为空。不在这里截断 text —— 调用方决定给模型多少字。
+        """
+        if not os.path.exists(self.thought_path):
+            return []
+        events = []
+        with open(self.thought_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict) and event.get("t") == "thought":
+                    events.append(event)
+        return events[-limit:] if limit and limit > 0 else events
 
     def events(self):
         """按写入顺序读出 patch/test/rollback 事件；坏行和已废弃事件跳过。"""
@@ -369,7 +409,8 @@ class WorkLog:
         """
         events = self.events()
         who = f"当前 Bug（{title}）" if title else "当前任务"
-        if not events:
+        thoughts = self.thoughts(3)
+        if not events and not thoughts:
             return f"{who}：暂无历史工作日志。"
 
         patches = [e for e in events if e["t"] == "patch"]
@@ -378,6 +419,13 @@ class WorkLog:
 
         lines = [f"{who}·状态摘要（共 {len(patches)} 轮补丁 / {len(tests)} 次测试"
                  + (f" / {len(rollbacks)} 次回滚" if rollbacks else "") + "）"]
+
+        # 最近三条 think 的原文节选。补丁前的假设只存在于 think 里，压缩若把它们丢掉，
+        # 模型会在空状态上重新推理一遍（Chart_13 实测）。完整原文由客户端在压缩提示中回传。
+        if thoughts:
+            lines.append("最近思考（原文节选，完整见 thoughts.jsonl）：")
+            for note in thoughts:
+                lines.append(f"  [轮 {note.get('turn')}] " + _clip(note.get("text"), 180))
 
         # 当前假设：最后一条存活补丁的推理（回滚掉的已不在 events 里）
         latest = next((e for e in reversed(patches)), None)
