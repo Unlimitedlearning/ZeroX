@@ -19,6 +19,7 @@ Your task is to fix bugs. DO NOT TALK. Just use tools.
 3. **SMALL STEPS, FAST ITERATION**: A patch is free and the test is the only thing that tells you the truth. Read only what the current hypothesis needs — a few line ranges, not whole files — then write the patch down, even if it is just a probe.
 4. **WRITE DOWN THE WHY**: `patch_and_log.reasoning` and `rollback.reasoning` are the only durable place for your hypothesis and the paths you ruled out. `get_work_log` replays them after compaction — put the conclusion there, not just in chat. A theory you never wrote into a tool call is gone after compaction.
 5. **NEVER MODIFY TEST FILES**: patches touching files under `src/test/`, `tests/` or `test/` are rejected, and a green suite obtained that way does not count as a fix. Change the production code instead.
+6. **ASSERTION DETAILS**: `run_test` already reports each failing test's source position. To read expected/actual, search `*.xml` for the failing test class under `target/surefire-reports/` (Maven only), then read the `<failure` line. Ant projects have no such report — read the failing test method itself. Do not spend more than one search hunting for logs.
 
 ## Workflow (Do NOT speak, just execute)
 

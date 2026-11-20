@@ -21,6 +21,37 @@ _METHOD_DECL = re.compile(
 _FIELD_DECL = re.compile(
     r"^(?:public|protected|private|static|final)\s+[\w<>\[\], ?]+\s+\w+\s*(?:=|;)"
 )
+# Defects4J 的 Failing tests 段形如 "- org.apache.Foo::testBar"
+_TEST_REF = re.compile(
+    r"\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)::([A-Za-z_$][\w$]*)\b"
+)
+_METHOD_DECL_LINE = re.compile(
+    r"^\s*(?:public|protected|private)\s+[\w<>\[\], ?]+\s+(\w+)\s*\("
+)
+
+
+def parse_failing_tests(detail):
+    """从 Failing tests 段提取 (类全名, 方法名)，去重保序。
+
+    只认 `Class::method` 这种 Defects4J 格式；返回空列表时调用方跳过定位，
+    不猜测测试名，避免把无关的类塞给模型。
+    """
+    out, seen = [], set()
+    for match in _TEST_REF.finditer(str(detail or "")):
+        pair = (match.group(1), match.group(2))
+        if pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+    return out
+
+
+def locate_method_line(source, method):
+    """返回方法定义所在行号（1-based）；仅认带访问修饰符的声明，找不到返回 None。"""
+    for number, line in enumerate(str(source or "").splitlines(), 1):
+        match = _METHOD_DECL_LINE.match(line)
+        if match and match.group(1) == method:
+            return number
+    return None
 
 
 def build_grep_command(scope, include, keyword, regex=False):

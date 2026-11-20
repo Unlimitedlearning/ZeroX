@@ -229,6 +229,38 @@ def extract_fail_info(match):
     return fail_count, (detail or "").strip()
 
 
+def locate_failing_tests(detail_text, workdir, limit=3):
+    """本地把失败用例的类名/方法名解析成源文件位置，不消耗模型一轮对话。
+
+    类名 grep 到测试文件，再扫方法定义行；任一步失败就跳过，不把猜测交给模型。
+    limit 默认 3：多用例往往是同一根因，列太多只会挤掉真正的报错。
+    """
+    located = []
+    try:
+        for cls, method in code_search.parse_failing_tests(detail_text)[:limit]:
+            simple = cls.rsplit(".", 1)[-1]
+            cmd, err = code_search.build_grep_command(workdir, "*.java", f"class {simple}")
+            if err:
+                continue
+            res = execute_in_target(cmd)
+            if res.returncode not in (0, 1) or not res.stdout.strip():
+                continue
+            path = res.stdout.splitlines()[0].split(":", 2)[0]
+            ok, readable = resolve_read_path(path)
+            if not ok:
+                continue
+            src = execute_in_target(f"cat {shlex.quote(readable)}")
+            if src.returncode != 0:
+                continue
+            line_no = code_search.locate_method_line(src.stdout, method)
+            rel = posixpath.relpath(path, workdir) if workdir else path
+            located.append((cls, method, rel, line_no))
+    except Exception as err:
+        # 本地解析是「省一轮搜索」的优化，任何异常都不能打断 run_test 主返回。
+        logging.warning(f"失败用例本地定位跳过: {str(err)}")
+    return located
+
+
 def wait_for_previous_process():
     """统一阻塞等待函数：如果有测试在跑，最多等TEST_TIMEOUT秒。"""
     global current_process
@@ -493,21 +525,34 @@ async def call_tool(name: str, arguments: dict):
                 else:
                     combined = failing_info or "无详细堆栈"
                 count_text = fail_count if fail_count is not None else "若干"
-                fail_msg = f"【测试失败】共 {count_text} 个用例失败。\n以下是报错信息：\n{combined}\n\n请分析并修复。"
+                # fail_msg 是持久化的 detail（进 work_log → brief 的「最近报错」取末行），
+                # 因此只放稳定的失败事实；stderr 尾部是一次性调试信息，只随本次返回给模型。
+                fail_msg = f"【测试失败】共 {count_text} 个用例失败。\n以下是报错信息：\n{combined}"
+
+                # 【本地代劳】失败用例的源文件/方法行由服务端解析，模型不必 search_code 再找一遍。
+                # 失败信息里本来就有类名，grep 一次 + 扫方法定义行，只读、不耗测试次数。
+                located = locate_failing_tests(failing_info, workspace)
+                if located:
+                    loc_lines = [f"- {cls}::{method} → {rel}" + (f":{no}" if no else "")
+                                 for cls, method, rel, no in located]
+                    fail_msg += ("\n\n【失败用例位置（本地解析，行号可直接用 read_specific_code 读）】\n"
+                                 + "\n".join(loc_lines))
+                fail_msg += "\n\n请分析并修复。"
                 save_test_result("Failed", fail_count, fail_msg)
-                # L0：D4J 的 test_cmd 只回「哪些用例失败」，断言原文（expected/actual、出错行）
-                # 只在 maven 项目的 target/surefire-reports/ 里；实测 ant 项目（Lang）workspace 的
-                # build/ 下只有 classes 和 tests，没有任何报告文件，所以只给一条路径 + 一次止损。
-                # 提示只进本次返回、不写进 work_log —— 否则 digest 的 1200 字尾部窗口会被提示挤掉真实报错。
-                # 取法是 search_code + read_specific_code，两步都只读，不消耗测试次数。
-                hint = (
-                    "\n\n[提示] 需要断言原文（expected/actual、出错行）时：只有 maven 项目有 —— "
-                    "search_code(keyword='<失败测试的类名>', file_pattern='*.xml')，"
-                    "命中 target/surefire-reports/ 后用 read_specific_code 读含 <failure 的行。"
-                    "搜不到一次就别再找日志（ant 项目的 build/ 下只有 classes 和 tests，没有报告），"
-                    "直接去读失败的测试方法本身。"
-                )
-                return [types.TextContent(type="text", text=fail_msg + hint)]
+
+                # 【stderr 一并给出】测试进程的 stderr 自启动起就合并进 TEST_LOG_FILE（STDOUT），
+                # 旧版只回 Failing tests 段，把探针写进 System.err 的输出整段丢掉，逼模型改用
+                # 「探针写文件再读回」。这里补一段失败段之前的日志尾，含 stderr 与探针输出。
+                surface = fail_msg
+                fail_pos = content.find(fail_match.group(0))
+                prefix = content[max(0, fail_pos - 1200):fail_pos].strip() if fail_pos > 0 else ""
+                if prefix:
+                    surface += "\n\n【测试日志尾部（含 stderr）】\n" + prefix[-1200:]
+
+                # 固定取法说明已移入 AGENTS.md（system prompt，前缀缓存只付一次），
+                # 不再每条失败重发 237 字；这里只留一句极简指引。
+                surface += "\n\n[提示] 断言原文（expected/actual）的取法见系统提示。"
+                return [types.TextContent(type="text", text=surface)]
 
             tail_msg = f"最新日志如下（退出码 {exit_code}）:\n{content[-2000:]}"
             save_test_result("Unknown", None, tail_msg)

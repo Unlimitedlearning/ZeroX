@@ -21,6 +21,8 @@ from zerox_core.search import (  # noqa: E402
     build_grep_command,
     definition_score,
     format_results,
+    locate_method_line,
+    parse_failing_tests,
 )
 
 WORK = "/home/user/zerox_workdir/d4j_Time_14b"
@@ -80,8 +82,36 @@ def test_format():
     check("扫描到 0 条命中" in empty and "正则匹配" in empty, empty)
 
 
+def test_failing_tests():
+    detail = (
+        "  - org.apache.commons.codec.net.QuotedPrintableCodecTest::testSkipNotEncodedCRLF\n"
+        "  - org.apache.commons.codec.net.QuotedPrintableCodecTest::testTrailingSpecial\n"
+        "  - org.apache.commons.codec.net.QuotedPrintableCodecTest::testTrailingSpecial\n"
+        "  - plain text without a method\n"
+    )
+    pairs = parse_failing_tests(detail)
+    check(len(pairs) == 2 and pairs[0] == (
+        "org.apache.commons.codec.net.QuotedPrintableCodecTest", "testSkipNotEncodedCRLF"
+    ), f"应提取且去重: {pairs}")
+    check(parse_failing_tests("no test refs here") == [], "无类名时不猜")
+
+    source = "\n".join([
+        "public class FooTest {",
+        "    public void setUp() {",
+        "    }",
+        "    public void testTrailingSpecial() {",
+        "        assertEquals(1, 2);",
+        "    }",
+        "    // public void testTrailingSpecial() commented",
+        "}",
+    ])
+    check(locate_method_line(source, "testTrailingSpecial") == 4, "应定位到方法声明行")
+    check(locate_method_line(source, "absent") is None, "找不到应返回 None")
+
+
 if __name__ == "__main__":
     test_command()
     test_scoring()
     test_format()
+    test_failing_tests()
     print("search selftest: OK")
