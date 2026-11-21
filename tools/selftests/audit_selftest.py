@@ -136,6 +136,39 @@ def main():
         verdict = audit.audit_bug_dir(dirty_dir, test_globs=[])
         check(verdict["audit"] == "clean", "明显空 globs 时不应把测试文件判成违规")
 
+        # ---- 9. 复跑预检：工作区不存在 -> verified=false + 明确原因，且不执行复跑 ----
+        # 用注入的 checker 模拟「默认 Defects4J 配置解析出不存在的 d4j_* 工作区」，
+        # 不连 WSL、不起进程；checker 被调用即记录，确认短路在起进程之前。
+        calls = []
+
+        def missing_ws(ws):
+            calls.append(ws)
+            return False
+
+        outcome = audit.verify_fixed(
+            bug_dir=None,
+            workspace="/home/user/zerox_workdir/d4j_List_999b",
+            test_cmd="defects4j test -w /home/user/zerox_workdir/d4j_List_999b",
+            passed_pattern="Failing tests:\\s*0",
+            workspace_checker=missing_ws,
+        )
+        check(outcome["verified"] is False, "工作区不存在时必须 verified=false")
+        check("工作区不存在" in outcome["reason"], f"原因应点明工作区不存在：{outcome['reason']}")
+        check(len(calls) == 1, "工作区检查应恰好调用一次")
+
+        # 工作区存在时继续走后续逻辑（这里用恒 true 的 checker；passed_pattern 合法、无违规，
+        # 会尝试起进程，所以传入一个必然失败的 popen 不可行——只确认不会被预检短路即可）。
+        exists_calls = []
+        outcome2 = audit.verify_fixed(
+            bug_dir=None,
+            workspace="/ws/exists",
+            test_cmd="true",
+            passed_pattern="",  # 空 pattern 在最前面短路，不会走到 checker
+            workspace_checker=lambda ws: exists_calls.append(ws) or True,
+        )
+        check(outcome2["verified"] is False, "空 passed_pattern 必须 verified=false")
+        check(len(exists_calls) == 0, "空 passed_pattern 应在工作区检查之前短路")
+
         print("audit selftest: OK")
         return 0
     finally:

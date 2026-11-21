@@ -129,7 +129,7 @@ ZeroX/
 ├── src/zerox_core/         # 无状态纯函数：配置/schema/命令执行 + 各工具底层（搜索/诊断/结构/补丁）
 ├── src/worklog.py          # 独立版本控制模块（blob + append-only 事件 + 回滚）
 ├── src/audit.py            # 事后审计：Fixed 与 Verified Fixed，运行时不修改文件
-├── case/                   # 不依赖 Defects4J 的 Java 单文件样例：config.json + pristine/ + work/
+├── case/                   # 不依赖 Defects4J 的 Java 样例：config.json + bugs/{id}/{src,test}/ + work/
 ├── tools/                  # new_run.py（归档批次）、selftests/（离线自测，无需 WSL）
 └── logs/                   # 运行日志、工作日志、blob 存储及基准指标
 ```
@@ -178,7 +178,7 @@ python src/zerox_server.py
 python src/zerox.py
 ```
 
-运行自带单文件样例时指向对应配置（`--config` 会通过 `ZEROX_CONFIG` 转发给服务端，相对路径按项目根目录解析）：
+运行自带样例时指向对应配置（`--config` 会通过 `ZEROX_CONFIG` 转发给服务端，相对路径按项目根目录解析）：
 
 ```bash
 python src/zerox.py --config case/config.json
@@ -197,25 +197,38 @@ python src/audit.py --verify      # 第二步：复跑 test_cmd，每个Bug 2–
 python src/audit.py --verify --bug Lang_1   # 只验证单个Bug（前缀匹配）
 ```
 
+审计自建样例时须显式传 `--config case/config.json`（或设 `ZEROX_CONFIG`）：默认配置是 Defects4J，其 `bug_id_pattern` 也能匹配 `List_999` 这类名字，但工作区指向不存在的 `d4j_*` 目录。审计脚本会打印实际使用的配置路径，并在复跑前检查工作区是否存在，配置失配时直接给出原因而非误报「复跑未通过」。
+
 `--verify` 在 `invalid` 时先还原被改动的测试文件（`git checkout --` / `rm -f`）再复跑，`clean` 时原样复跑；命中 `passed_pattern` 才记为 `Verified Fixed`。输出写入 `logs/<bug>/verify.log`（可 `tail -f`），结果追加至 `logs/audit.jsonl`，`--no-write` 只读不写。复跑是**在当前工作区**上重放 `test_cmd`，不重新 apply 补丁：它回答「这份工作区现在是否通过」，而非「从干净代码能否复现这次修复」；残留改动（如未回滚的探针）不会被识别，故探针必须走 `rollback`。
 
 > Windows 下需保证 PATH 中存在 `wsl` 且 WSL 内已装好 Defects4J，否则复跑会报 `WinError 5 拒绝访问` 并记为未复现 —— 这不代表修复失败，只是验证环境不可用。
 
-**5. 单文件样例（`case/`）**
+**5. 自建 Java 样例（`case/`）**
 
-一个自带测试的 Java 程序，使用同一套工具链但不依赖 Defects4J：单次测试仅需数秒，是修改工具后最快的回归检查。
+使用同一套工具链但不依赖 Defects4J：单次测试仅需数秒，是修改工具后最快的回归检查。每个 bug 一个自包含文件夹，源码与测试分置：
 
 ```text
 case/
-├── config.json               # target.workspace_root = "work"（相对路径，不含绝对路径）
-├── pristine/List_999.java    # 基线文件；agent不可见
-└── work/List_999/            # 工作区：由 setup_cmd 重建，git 忽略
+├── config.json                    # target.workspace_root = "work"（相对路径，不含绝对路径）
+├── bugs/{bug_id}/src/*.java       # 生产代码；setup_cmd 复制进工作区，agent 改这里
+├── bugs/{bug_id}/test/*Test.java  # 测试代码；工作区外，agent 读不到也改不到
+└── work/{bug_id}/                 # 工作区：由 setup_cmd 重建，git 忽略
 ```
 
-- `pristine/List_999.java` 是一个 `SortedInts` 容器（二分边界、计数、区间复制、批量删除、有序插入、最近查找）及 `main` 中的测试驱动程序；每条用例输出 `[PASS]` / `[FAIL]`，末行输出 `All tests passed` 或 `FAILED (n)`。
-- 基线为 `7/10`：三个与重复元素相关的用例（`count duplicates`、`last index of duplicates`、`remove all duplicates`）失败 —— 单一根因对应多个表象。代码不含注释，测试输出是唯一判定依据。
-- 每条用例运行于守护线程，3 秒 join 超时，异常或死循环仅影响该条用例。基线文件位于工作区**外部**，agent无法读写，故无需维护 `pristine.bak` 或配置 `patch_deny_globs`；如需修改样例，编辑 `case/pristine/<name>.java` 后执行 `rm -rf case/work`。
-- 新增样例：将 `case/pristine/<Name>.java` 放入目录并把 `<Name>` 加入 `case/config.json` 的 `benchmark_bugs`，`setup_cmd` / `test_cmd` 使用 `{bug_id}`，其余配置不变。多文件与 Maven 项目见 `case/README.md`。
+- 已落地三个样例：`List_999`（单文件生产类 `SortedInts`，基线 `7/10`，单一根因对应多个表象）、`SessionStore_11`（3 生产 + 3 干扰，双根因，只修一处仍失败）、`RenderService_7`（4 生产 + 3 干扰，空引用异常类，测试打印堆栈，只修表层仍失败）。
+- 测试输出契约统一：每条用例打印 `[PASS]` / `[FAIL]`，末行输出 `All tests passed` 或 `FAILED (n)`；判定以输出正则为准，不依赖进程退出码。
+- 源码与测试都在工作区**外部**，agent 只能改 `work/{bug_id}/` 里的副本，故无需 `patch_deny_globs`。`setup_cmd` 每次先清空工作区再复制，避免陈旧文件干扰。
+- 新增样例：按 `bugs/{bug_id}/src` 与 `bugs/{bug_id}/test` 放好文件，把 `{bug_id}` 加入 `case/config.json` 的 `benchmark_bugs` 即可，`setup_cmd` / `test_cmd` 无需改动。细节见 `case/README.md` 与 `case/MULTIFILE_DESIGN.md`。
+
+本批次结果（`deepseek-flash`，`temperature=0`，审计与复跑均 clean / Verified Fixed）：
+
+| Bug | 状态 | 耗时（秒）| Tokens | 轮次 | 对话轮数 | 审计 | 验证 |
+| :-- | :-- | --: | --: | --: | --: | :-- | :-- |
+| List_999 | Fixed | 17.54 | 46,341 | 3 | 10 | clean | Verified Fixed |
+| SessionStore_11 | Fixed | 16.81 | 44,969 | 2 | 10 | clean | Verified Fixed |
+| RenderService_7 | Fixed | 12.47 | 35,167 | 1 | 9 | clean | Verified Fixed |
+
+合计 3/3 修复、126,477 tokens、52.88 秒。`SessionStore_11` 的双根因（组合条件 + touch 重置生命周期）须两处同改，`RenderService_7` 的堆栈指向中层解引用点、根因在深层初始化循环——仅加 null 检查仍失败。
 
 **6. 性能说明（WSL）：将 `workspace_root` 置于 ext4 而非 `/mnt/...`**
 

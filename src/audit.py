@@ -184,7 +184,7 @@ def _decode(output):
 
 
 def verify_fixed(bug_dir, workspace, test_cmd, passed_pattern,
-                 verdict=None, timeout=None):
+                 verdict=None, timeout=None, workspace_checker=None):
     """把测试文件还原成原始状态后重跑一遍：还过 -> verified。
 
     只有 audit 结论是 invalid（动过测试）时才需要还原；audit 干净也照样复跑一次，
@@ -196,6 +196,18 @@ def verify_fixed(bug_dir, workspace, test_cmd, passed_pattern,
     if not str(passed_pattern or "").strip():
         return {"verified": False, "reason": "config 没有 passed_pattern，无法判定",
                 "reverted": [], "notes": []}
+
+    # 复跑前确认工作区真实存在。配错 config 时（典型：审计自建 bug 却用了默认 Defects4J
+    # 配置），bug_id 仍可能解析成功，但 workspace 指向不存在的 d4j_* 目录；不预检就会
+    # 让复跑命令报「不是有效工作目录」，最后被误记成「复跑未通过」，掩盖真正的配置错误。
+    if workspace:
+        check = workspace_checker or (
+            lambda ws: execute_in_target(
+                f"test -d {shlex.quote(str(ws))}").returncode == 0)
+        if not check(workspace):
+            return {"verified": False,
+                    "reason": f"工作区不存在：{workspace}（config 与本次 run 不匹配？）",
+                    "reverted": [], "notes": []}
 
     reverted, notes = [], []
     violations = (verdict or {}).get("violations") or []
@@ -318,6 +330,10 @@ def main(argv=None):
     project_root = os.path.dirname(base_dir)
     logs_dir = args.logs or os.path.join(project_root, "logs")
     config_file = args.config or os.getenv("ZEROX_CONFIG") or os.path.join(project_root, "config.json")
+    print(f"审计配置：{config_file}", flush=True)
+    if not args.config and not os.getenv("ZEROX_CONFIG"):
+        print("未显式指定 --config，使用默认配置；审计自建样例请传 --config case/config.json",
+              flush=True)
 
     target = None
     config = None

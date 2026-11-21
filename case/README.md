@@ -7,15 +7,27 @@ ZeroX 不是 Defects4J 专用工具：任何「一条 bash 命令能编译并跑
 
 ```text
 case/
-├── config.json               # 案例专用配置（git 跟踪，workspace_root 写相对路径 "work"）
-├── pristine/List_999.java    # 基线：没被改坏的原始版本
-└── work/List_999/            # 工作区（.gitignore 忽略，每次 setup_cmd 重建）
+├── config.json                        # 案例专用配置（git 跟踪，workspace_root 写相对路径 "work"）
+├── bugs/{bug_id}/                     # 每个 bug 一个自包含文件夹
+│   ├── src/                           # 生产代码：setup_cmd 复制进工作区
+│   │   └── *.java
+│   └── test/                          # 测试代码：工作区外，agent 读不到改不到
+│       └── {bug_id}Test.java
+├── work/{bug_id}/                     # 工作区（.gitignore 忽略，每次 setup_cmd 重建）
+├── MULTIFILE_DESIGN.md
+└── README.md
 ```
 
-**为什么基线放在 `work/` 外面**
+三个样例已按此结构落地：`List_999`（单文件生产类 `SortedInts`，7/10 基线）、
+`SessionStore_11`（3 生产 + 3 干扰，双根因）、`RenderService_7`（4 生产 + 3 干扰，
+空引用异常类）。测试均外置到 `test/`；异常类的测试会打印完整堆栈。
+bug_id 一律用业务中性名，不在 id 中暴露根因类型。
+
+**为什么源码 / 测试放在 `work/` 外面**
 
 - agent 只能改 `{workspace}` 里的文件（`patch_must_be_under_workspace`），基线它既看不到也改不到，
   所以不需要 `patch_deny_globs` 这种「防自己」的配置；
+- 测试外置后 agent 读不到期望值、改不到测试，`audit_test_globs` 可留 `[]`，测试天然受保护；
 - 不再需要「手工保证两份文件一模一样」——那条约定的失败方式很隐蔽：改了 A 忘了同步 B，
   下一次 run 就会把新改的代码当成 pristine 覆盖掉，现象是「明明回滚了，测试却还是失败」。
 
@@ -28,14 +40,23 @@ python src/audit.py  --config case/config.json    # 事后审计 clean / invalid
 
 `--config` 会通过 `ZEROX_CONFIG` 传给 server，两边读同一份配置；相对路径按项目根目录解析。
 
-## 怎么加第二个单文件案例
+## 怎么加新案例
 
-1. 放一个自包含的 Java 文件：`case/pristine/QuixBugs_Foo.java`（同一个文件里有 main 和测试）；
-2. 保证它「坏」的时候会打印 `FAILED (n)`，修好后打印 `All tests passed`；
-3. 把名字加进 `case/config.json` 的 `benchmark_bugs`：`["List_999", "QuixBugs_Foo"]`。
+`setup_cmd` / `test_cmd` 对结构统一处理，新增案例不用改命令：
 
-`setup_cmd` / `test_cmd` 里的 `{bug_id}` 会自动展开，命令一个字都不用改。
-（编译产物落在 `/tmp/zerox_{bug_id}`，多个案例不会互相踩。）
+1. 生产文件放 `bugs/{bug_id}/src/*.java`（单文件、多文件都适用；多文件时调用链分层、根因在底层）；
+2. 测试放 `bugs/{bug_id}/test/{bug_id}Test.java`（默认包，内嵌 main，末行打印
+   `All tests passed` 或 `FAILED (n)`，失败用例行以 `[FAIL]` 开头）；
+3. 把 `{bug_id}` 加进 `case/config.json` 的 `benchmark_bugs`。
+
+`setup_cmd` 先清空工作区，再把 `src/` 下全部 `.java` 复制进去；`test_cmd` 编译时把工作区生产文件与
+工作区外的 `{bug_id}Test.java` 一起交给 javac，再运行 `{bug_id}Test`。测试文件始终在工作区外，
+agent 无法读写。编译产物落在 `/tmp/zerox_{bug_id}`，多个案例不会互相踩。
+
+已落地的 `SessionStore_11` 是双根因样例：`Session.isExpired` 的过期条件（`||` 写成 `&&`）
+与 `SessionStore.touch` 用当前时间覆盖 `createdAt`；只修一处仍有测试失败。`src/` 另含 3 个共享
+关键词但语义无关的干扰类（`CacheEntry` / `TokenBucket` / `RateWindow`），用于稀释关键词搜索。
+设计与覆盖矩阵见 `MULTIFILE_DESIGN.md`。
 
 ## 换成别的项目（多文件、Maven / Gradle、原生 javac）
 
@@ -52,6 +73,5 @@ python src/audit.py  --config case/config.json    # 事后审计 clean / invalid
 
 ## 已知盲区
 
-单文件案例里「被测代码」和「测试代码」在同一个文件，审计无法区分，所以 `audit_test_globs` 是 `[]`：
-所有 patch 都判 `clean`，唯一的约束是 `agent.user_prompt_template` 里那句「不要改 main / 测试期望值」。
-想验证审计功能本身，用 Defects4J 那套配置（`config.example.json`）。
+测试已外置到工作区外，`patch_must_be_under_workspace` 使 agent 改不到测试，所以 `audit_test_globs` 写 `[]`
+即可，所有 patch 判 `clean`。想验证审计对测试改动的识别能力，用 Defects4J 那套配置（`config.example.json`）。
