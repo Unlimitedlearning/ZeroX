@@ -10,6 +10,7 @@
 | :--- | :--- |
 | `bug_id` / `bug_id_requested` | `benchmark_bugs` 中的标识符（如 `Lang_1`）；磁盘目录用规范名（`Lang_1b`），`audit.py` 自行映射 |
 | `status` | `Fixed` / `Failed` / `Error`。`MaxTurns` 已随 `agent.max_turns` 移除，收敛条件为测试上限 |
+| `resumed` | 该行是否来自 `--resume-bug` 续跑段（见 `docs/resume.md`）；同一 bug 多行时取最后一行统计 |
 | `total_time_seconds` | 端到端墙钟时间 |
 | `prompt_tokens` / `completion_tokens` / `total_tokens` | 该Bug全部模型调用的用量之和 |
 | `api_calls` / `turns` | 模型请求次数 / 对话轮数 |

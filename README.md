@@ -95,7 +95,7 @@ ZeroX/
 ├── .gitignore              # 忽略 venv、__pycache__、logs、真实配置和本地草稿区
 ├── local/                  # 本地草稿区：调试 / 实验 / 临时产物，整目录被 git 忽略
 ├── AGENTS.md               # 系统提示词：工具、上限、工作流（核心资产）
-├── docs/                   # config.md（配置字段与示例）、logs.md（指标与记录格式）
+├── docs/                   # config.md（配置）、logs.md（记录格式）、resume.md（中断续跑）
 ├── config.example.json     # 配置模板
 ├── requirements.txt        # 固定版本的运行依赖
 ├── src/zerox.py            # agent入口：大模型循环、上限计数、指标（唯一写入方）
@@ -160,6 +160,8 @@ python src/audit.py --config case/config.json
 ```
 
 每批运行前应归档上一批：`python tools/new_run.py` 将 `logs/` 全部内容移至 `logs/archive/<timestamp>/`（含 `manifest.json`），清除 `__pycache__` 并打印待运行列表；归档批次仍可审计（`--logs logs/archive/<timestamp>`）。
+
+中断续跑：批量中跳过已完成用 `--skip-done`；单个 bug 内续跑用 `--resume-bug <id>`（从 `work_log` 恢复进度，不重新 checkout）。两者的用法与前提见 `docs/resume.md`。
 
 **事后审计与验证。** 第一步只读 `work_log.jsonl`，不运行测试，给出 `clean` / `invalid`；第二步复跑测试，确认修复不是 flaky pass：
 

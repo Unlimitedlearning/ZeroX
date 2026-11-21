@@ -2,6 +2,8 @@
 
     python src/zerox.py                       # 跑 config.json 里的 benchmark_bugs
     python src/zerox.py --config case/config.json
+    python src/zerox.py --skip-done            # 跳过 metrics 里已完成的 bug（L0 断点跳过）
+    python src/zerox.py --resume-bug Math_2    # L1 bug 内续跑：只续这一个，从 work_log 恢复进度
 
 本文件是 Agent 本体，不是「基准测试脚本」：循环、计数与指标都在这层
 （服务端看不到 token，也看不到终态）。
@@ -23,6 +25,7 @@ import worklog
 # 内部包在 src/zerox_core/：包名不能叫 zerox，否则会盖住本文件（src/zerox.py）
 from zerox_core import PASSED_RESULT_MARKER
 from zerox_core import config as config_mod
+from zerox_core import resume as resume_mod
 # 上下文裁剪的纯函数抽到 zerox_core，便于离线单测（import 本文件会初始化 client）
 from zerox_core.context import (
     keep_valuable_turns, trim_tool_outputs, context_chars, split_turns, thought_notice,
@@ -127,6 +130,31 @@ if api_key.startswith("${") and api_key.endswith("}"):
     api_key = os.getenv(api_key[2:-1])
 
 BUGS_TO_TEST = CONFIG.get("benchmark_bugs", ["Lang_1"])
+# 【L0 断点跳过】--skip-done：读 metrics 剔除已落指标的 bug，避免中断后重跑烧掉已完成的那几个。
+# 显式开关而非默认：默认全跑，重跑/复测同一批时不会被悄悄跳过。归档工具会清空 logs/，
+# 所以归档后天然是干净起点，不需要额外状态文件。
+SKIP_DONE = "--skip-done" in sys.argv[1:]
+SKIPPED_BUGS = []
+if SKIP_DONE:
+    completed = resume_mod.read_completed(METRICS_FILE)
+    BUGS_TO_TEST, SKIPPED_BUGS = resume_mod.filter_pending(BUGS_TO_TEST, completed)
+
+# 【L1 bug 内续跑】--resume-bug <id>：只续这一个 bug，从它的 work_log 恢复进度。
+# 与 --skip-done 互斥：续跑是「我知道这个没跑完、要接着跑」，跳过是「跑完的别再碰」，语义不同。
+# 续跑不 checkout、不清 work_log；一致性由人按说明文档检查，服务端不做自动校验。
+RESUME_BUG = None
+for _i, _arg in enumerate(sys.argv[1:]):
+    if _arg == "--resume-bug" and _i + 1 < len(sys.argv[1:]):
+        RESUME_BUG = sys.argv[_i + 2]
+        break
+    if _arg.startswith("--resume-bug="):
+        RESUME_BUG = _arg.split("=", 1)[1]
+        break
+if RESUME_BUG:
+    if SKIP_DONE:
+        print("⚠️ --resume-bug 与 --skip-done 不能同时使用，已忽略 --skip-done。")
+    BUGS_TO_TEST = [RESUME_BUG]
+    SKIPPED_BUGS = []
 # 轮次没有上限：唯一的强制限制是服务端的 max_tests（见 run_single_bug 的循环）
 # 上下文超过这么多字符就压缩（阈值写在 config.json 的 agent.compact_context_chars）
 COMPACT_CONTEXT_CHARS = int(AGENT_CONF.get("compact_context_chars") or 160000)
@@ -234,26 +262,35 @@ def append_l1_state(bug_id: str, turn: int, content: str, compacted: bool = Fals
         print(f"  ⚠️ [{bug_id}] 写 l1_state 失败: {err}")
 
 
-def reset_transcript(bug_id: str):
-    """每个 bug 开跑时重置全部逐轮归档，保证首轮状态卡从空白开始。
+def reset_transcript(bug_id: str, keep_events: bool = False):
+    """每个 bug 开跑时重置逐轮归档，保证首轮状态卡从空白开始。
 
     必须包括 work_log.jsonl：首次 API 请求在 run_test 之前发出，服务端要到 checkout 才清日志，
     若不在这里先清，状态卡会读到上一次运行的补丁与「测试全部通过」，等于把答案喂给模型。
     human_audit.jsonl（事后审计）与 blobs/ 保留，不受本次重置影响。
+
+    keep_events=True（L1 续跑）：反其道而行 —— 这正是要保留的历史。work_log 与 thoughts
+    都不能清（状态卡要靠它们恢复进度与最近假设），只把给人看的 transcript 与 l1_state
+    追加一段续跑分隔标记，便于复盘时区分两段运行。
     """
     path = transcript_path(bug_id)
     home = os.path.dirname(path)
     try:
         os.makedirs(home, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f"# {bug_id} agent transcript\n\n开始时间：{datetime.now().isoformat(timespec='seconds')}\n")
-        for aux in (l1_state_path(bug_id), os.path.join(home, "thoughts.jsonl")):
-            try:
-                os.remove(aux)
-            except FileNotFoundError:
-                pass
-        # 事件日志也归零；用 WorkLog 的方法清，避免和它的路径约定各写一份
-        worklog.WorkLog(home).reset_events()
+        mode = "a" if keep_events else "w"
+        header = (f"\n\n--- 续跑开始：{datetime.now().isoformat(timespec='seconds')} "
+                  f"（work_log / thoughts 保留，工作区保持原样）---\n\n") if keep_events else (
+            f"# {bug_id} agent transcript\n\n开始时间：{datetime.now().isoformat(timespec='seconds')}\n")
+        with open(path, mode, encoding="utf-8") as f:
+            f.write(header)
+        if not keep_events:
+            for aux in (l1_state_path(bug_id), os.path.join(home, "thoughts.jsonl")):
+                try:
+                    os.remove(aux)
+                except FileNotFoundError:
+                    pass
+            # 事件日志也归零；用 WorkLog 的方法清，避免和它的路径约定各写一份
+            worklog.WorkLog(home).reset_events()
     except OSError as err:
         print(f"  ⚠️ [{bug_id}] 建 transcript 失败: {err}")
 
@@ -290,9 +327,9 @@ def reasoning_text(msg) -> str:
     return ""
 
 
-async def run_single_bug(bug_id: str, session: ClientSession):
+async def run_single_bug(bug_id: str, session: ClientSession, resume: bool = False):
     print(f"\n" + "="*50)
-    print(f"🚀 开始测试 Bug: {bug_id}")
+    print(f"{'🔄 续跑' if resume else '🚀 开始测试'} Bug: {bug_id}")
     print("="*50)
     
     # think 与状态卡的落盘入口：和 MCP Server 共用同一个 logs/<bug>/ 目录，但写的是
@@ -304,7 +341,13 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     # 压缩会丢掉上下文里的历史，但这份文件留着，复盘时不用去翻 LLM 的 window。
     # 【顺序关键】必须先于 state_card_content：后者要读刚被清空的 work_log，
     # 晚一步就会把上一次运行的补丁和通过结论当成当前状态注入首轮请求。
-    reset_transcript(bug_id)
+    reset_transcript(bug_id, keep_events=resume)
+
+    # 【L1 续跑】从磁盘 work_log 恢复内存态：状态卡读它、计数器与终态标志也从它重建。
+    # messages 故意全新 —— 恢复靠的是末尾注入的状态卡 + 最近 think，不序列化对话。
+    resumed_state = None
+    if resume:
+        resumed_state = resume_mod.state_from_events(wl.events())
 
     # 【L1 活状态卡】不进入 messages 正文，仅在每次 API 调用时临时拼到末尾。
     # 这样 system + 逐轮累积的历史构成稳定前缀，可被服务端前缀缓存命中；
@@ -330,8 +373,18 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     start_time = time.time()
     usage_totals = {"prompt": 0, "completion": 0, "total": 0, "calls": 0, "turns": 0}
     # 补丁数/轮次/测试次数由客户端在循环里自己数（它就在现场），token 也只有它知道，
-    # 所以服务端不重吐日志、客户端也不解析它的日志
-    counters = {"patches": 0, "tests": 0, "round": 0}
+    # 所以服务端不重吐日志、客户端也不解析它的日志。
+    # 续跑时从 work_log 重建：轮次/补丁/测试用磁盘值，token 无法从日志反推（故不计入续跑段）。
+    if resumed_state is not None:
+        counters = {
+            "patches": resumed_state["attempts"],
+            "tests": resumed_state["tests"],
+            "round": resumed_state["round"],
+        }
+        print(f"  ↻ [{bug_id}] 已从 work_log 恢复：轮次={counters['round']}、"
+              f"补丁={counters['patches']}、测试={counters['tests']}")
+    else:
+        counters = {"patches": 0, "tests": 0, "round": 0}
     # 连续只读调用计数：patch_and_log / run_test / rollback 会把它清零
     free_streak = 0
     # 「到点强制压缩」的预约（0-based 的 turn 号）：只读 streak 到 COMPACT_IDLE_READS 时
@@ -342,9 +395,14 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     # 出口只有三个：「测试通过」「明确失败」「异常」
     final_status = "Error"
     # 【指标完整性】只在服务端真的报过「测试全部通过」后，才承认 agent 的 [FIXED]
-    saw_passing_test = False
-    # 本 bug 的第一次 run_test 显式声明全量 checkout（任务边界由客户端决定，见下方注入）
-    fresh_task = True
+    # 续跑时从 work_log 恢复：若中断前已经有 Passed 事件，续跑后 agent 报 [FIXED] 应被承认。
+    saw_passing_test = bool(resumed_state and resumed_state["saw_passing"])
+    # 【首轮 run_test 标志】不管新任务还是续跑，第一次 run_test 都要由客户端注入一个
+    # 控制参数：新任务传 force_checkout=true（全量准备），续跑传 resume=true（不 checkout、
+    # 不删日志、按 work_log 恢复）。它表示「首轮还没发出」，与 resume 是两件事——
+    # 曾经写成 fresh_task = not resume，导致续跑时本标志为 False、resume=true 永远注入不进去，
+    # 服务端遂当新任务清空 work_log。调用后置 False，见下方 run_test 分支。
+    first_run_test = True
 
     # 轮次没有上限：唯一的强制限制是服务端的测试次数上限，用尽时 run_test 返回【任务失败】强制循环退出。
     # 只读轮次不消耗测试次数，所以纯只读的循环（一次测试都不跑）只能人工中断。
@@ -505,17 +563,17 @@ async def run_single_bug(bug_id: str, session: ClientSession):
                 try:
                     # 【单一策略源】服务端只负责执行与记账，不做任何调用去重 / 免费重跑判定；
                     # 客户端也不缓存结果——两边各持一套策略必然打架。
-                    # 新任务的第一跑由客户端显式传 force_checkout：服务端从不自己决定「重置工作区」，
-                    # 所以也不会在任务中途把已经打好的补丁冲掉。
-                    if fn_name == "run_test" and fresh_task:
-                        fn_args["force_checkout"] = True
+                    # 新任务的第一跑由客户端显式传 force_checkout；续跑第一跑传 resume=true。
+                    # 服务端从不自己决定「重置工作区」，所以也不会在任务中途把已打好的补丁冲掉。
+                    if fn_name == "run_test" and first_run_test:
+                        fn_args[resume_mod.first_run_control(resume)] = True
 
                     # 归档写在注入之后：记录的是实际发出去的那份参数
                     append_transcript(bug_id, turn + 1, f"call:{fn_name}",
                                       json.dumps(fn_args, ensure_ascii=False))
                     result = await session.call_tool(fn_name, arguments=fn_args)
                     if fn_name == "run_test":
-                        fresh_task = False
+                        first_run_test = False
                     result_text = "".join([c.text for c in result.content if c.type == "text"])
 
                     if fn_name == "patch_and_log":
@@ -583,6 +641,12 @@ async def run_single_bug(bug_id: str, session: ClientSession):
     return final_status, elapsed, usage_totals, counters
 
 async def main():
+    if SKIPPED_BUGS:
+        print(f"⏭️ 已跳过 {len(SKIPPED_BUGS)} 个完成的 bug: {', '.join(SKIPPED_BUGS)}")
+    if not BUGS_TO_TEST:
+        print("全部 bug 均已完成，无需重跑。若要开新一轮，请先归档：python tools/new_run.py")
+        return
+
     server_params = StdioServerParameters(
         command=sys.executable,
         args=[SERVER_SCRIPT],
@@ -600,9 +664,11 @@ async def main():
             total_start_time = time.time()
             
             for bug in BUGS_TO_TEST:
-                # 【修复 Bug 2】接收 3 个返回值
+                # 【修复 Bug 2】接收 3 个返回值；resume 只对 --resume-bug 指定的那个生效
                 try:
-                    status, elapsed, usage, counters = await run_single_bug(bug, session)
+                    status, elapsed, usage, counters = await run_single_bug(
+                        bug, session, resume=(bug == RESUME_BUG)
+                    )
                 except Exception:
                     # 批量跑一晚上，最怕「进程带着一份只存在于终端里的 traceback 直接死掉」。
                     # while 顶部（上下文计数 / 压缩判定）不在 run_single_bug 内部那层 try 里，
@@ -627,6 +693,9 @@ async def main():
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                     "bug_id": bug,
                     "bug_id_requested": bug,
+                    # 续跑段追加一行，与中断前的行同属一个 bug：统计时应按 bug_id 取最后一行。
+                    # token / 耗时只计续跑段，无法与中断前合并（日志里没有 token）。
+                    "resumed": bool(RESUME_BUG and bug == RESUME_BUG),
                     "status": status,
                     "total_time_seconds": round(elapsed, 2),
                     "prompt_tokens": usage["prompt"],

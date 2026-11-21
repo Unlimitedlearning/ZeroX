@@ -15,6 +15,7 @@ from mcp import types
 from zerox_core import PASSED_RESULT_MARKER
 from zerox_core import config as config_mod
 from zerox_core import schemas
+from zerox_core import resume as resume_mod
 # 读工具的工作区边界：纯解析逻辑在 zerox_core.paths，server 只传 CURRENT_WORKDIR
 from zerox_core import paths as core_paths
 # search_code 的命令构造与结果整理是纯函数，离线可单测
@@ -196,6 +197,50 @@ def reset_task_state(status: str):
     
     # 复位计时器和锁状态，准备好下一个 Bug（锁就是 START_TIME：置空即「未就绪」）
     START_TIME = None
+
+
+def resume_from_worklog(bug_id, workspace, max_tests):
+    """【L1 续跑】服务进程重启后，从 work_log 重建这个 bug 的内存状态。
+
+    客户端在续跑的第一轮 run_test 传 resume=true（不传 force_checkout）。本函数
+    取代原本的「全量 checkout + 删日志」路径：工作区保持中断时的原样，计数器按
+    磁盘事件流恢复，START_TIME 重新计时。不改 work_log 一个字节。
+
+    边界一致性（工作区文件是否与最后一条 patch 匹配）不在服务端自动校验 ——
+    续跑是容错兜底而非实验主路径，依赖人先按说明检查工作区，避免把自动校验写成
+    一道既慢又可能误拒绝的关卡。
+
+    返回 (ok, message)：work_log 不存在或为空时 ok=False，调用方回退到全新任务。
+    """
+    global CURRENT_BUG, CURRENT_WORKDIR, WORK_JSON_FILE, TEST_LOG_FILE
+    global START_TIME, CURRENT_ROUND, TOTAL_ATTEMPTS, TOTAL_TESTS
+
+    bug_dir = os.path.join(LOG_DIR, bug_id)
+    log_file = os.path.join(bug_dir, "work_log.jsonl")
+    if not os.path.exists(log_file):
+        return False, f"续跑失败：{bug_id} 没有 work_log.jsonl，无法重建进度。请先正常跑一次该 bug。"
+
+    events = worklog.WorkLog(bug_dir).events()
+    state = resume_mod.state_from_events(events, max_tests=max_tests)
+    if not events:
+        return False, f"续跑失败：{bug_id} 的 work_log 没有可解析事件，无法重建进度。"
+
+    CURRENT_BUG = bug_id
+    CURRENT_WORKDIR = workspace
+    TEST_LOG_FILE = os.path.join(bug_dir, "test.log")
+    WORK_JSON_FILE = log_file
+    CURRENT_ROUND = state["round"]
+    TOTAL_ATTEMPTS = state["attempts"]
+    TOTAL_TESTS = state["tests"]
+    START_TIME = time.time()  # 续跑段单独计时，不与中断前合并
+
+    msg = (f"【续跑已恢复】{bug_id}：从 work_log 重建 轮次={CURRENT_ROUND}、"
+           f"补丁={TOTAL_ATTEMPTS}、测试={TOTAL_TESTS}；工作区保持原样，未重新 checkout。")
+    logging.info(msg)
+    if state.get("at_limit"):
+        msg += (f"\n【注意】历史测试次数已达上限 {max_tests}，本次 run_test 将按上限判定失败。"
+                "若确认上次是误中断，请人工核对 work_log 后再决定是否需要归档重跑。")
+    return True, msg
 
 
 # ==========================================
@@ -413,6 +458,8 @@ async def call_tool(name: str, arguments: dict):
     if name == "run_test":
         bug_id = arguments.get("bug_id", "Lang_1")
         force_checkout = arguments.get("force_checkout", False)
+        # 【L1 续跑】客户端首轮显式传 resume=true：不 checkout、不删日志，按 work_log 恢复进度。
+        resume = bool(arguments.get("resume", False))
 
         # 校验格式：解析规则来自 config.json 的 target.bug_id_pattern
         bug_ctx = resolve_bug(bug_id)
@@ -423,6 +470,13 @@ async def call_tool(name: str, arguments: dict):
         workspace = bug_ctx["workspace"]
         setup_cmd = bug_ctx["setup_cmd"]
         test_cmd = bug_ctx["test_cmd"]
+
+        # 【续跑优先】恢复到「已有进度」的状态后再走下面的通用判定：此时 START_TIME 非 None、
+        # TOTAL_ATTEMPTS/TOTAL_TESTS 为磁盘重建值，自然跳过重新 checkout，也不会被次数上限误判为新任务。
+        if resume:
+            ok, msg = resume_from_worklog(new_bug_id, workspace, MAX_TESTS)
+            if not ok:
+                return [types.TextContent(type="text", text=msg, isError=True)]
 
         # 【测试次数上限】测试次数达到上限即终止任务 —— 这是服务端唯一的强制限制。
         # 放在 checkout 之前有两个理由：
