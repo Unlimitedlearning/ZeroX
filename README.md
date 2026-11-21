@@ -7,7 +7,7 @@
 ZeroX 是一个基于模型上下文协议（MCP）的自动程序修复（APR）实验框架。工具链限定为 7 个，要求agent将推理写入外部工作日志 `work_log.jsonl`；该日志每轮被重建为常驻的「活状态卡」，使上下文压缩后的恢复不依赖agent主动读取历史。
 
 - **未提出新的修复算法。** 原子化修改、回滚与事后审计在既有agent与版本控制工具中已广泛存在，不构成创新点。
-- **不声称达到当前最优水平。** 下文 4/4 的结果基于 4 个样本、单一模型与 `temperature=0`，属于初步观察，不足以支撑对修复率的一般化结论。
+- **不声称达到当前最优水平。** 下文 26/26 的结果受训练数据泄漏影响（见「初步实验」），不能作为修复率或成本的依据。
 - **定位是可配置、可开关功能的对照实验平台。** 通过修改配置、批量运行Bug并比较指标，观察各组件的独立作用。
 
 ## 设计取舍
@@ -34,16 +34,42 @@ ZeroX 是一个基于模型上下文协议（MCP）的自动程序修复（APR�
 
 实验环境：Defects4J 3.0.1（`v3.0.1-7-g8c16da82`）、Java 11、工作区位于 ext4、模型为 DeepSeek `deepseek-flash`、`temperature=0`。数据来自当前批次的 `benchmark_metrics.jsonl`；`审计` 与 `验证` 分别为 `python src/audit.py` 与 `python src/audit.py --verify` 的输出。历史批次归档于 `logs/archive/`，不计入本表。
 
-| Bug编号          | 状态      | 耗时（秒） | Tokens | 轮次 | 对话轮数 | 补丁请求 | 测试次数 | 审计      | 验证 |
-| :------------ | :------ | :------ | :----- | :- | :--- | :--- | :--- | :------ | :--- |
-| **Math_2b**     | ✅ Fixed | 88.65   | 53.0K  | 1  | 8    | 1    | 2    | `clean` | ✅ `Verified Fixed` |
-| **Codec_11b**   | ✅ Fixed | 196.15  | 431.2K | 2  | 16   | 3    | 3    | `clean` | ✅ `Verified Fixed` |
-| **Lang_10b**    | ✅ Fixed | 236.69  | 427.4K | 1  | 23   | 2    | 2    | `clean` | ✅ `Verified Fixed` |
-| **Chart_26b**   | ✅ Fixed | 165.89  | 819.5K | 1  | 30   | 5    | 4    | `clean` | ✅ `Verified Fixed` |
+| Bug编号 | 状态 | 耗时（秒）| Tokens | 轮次 | 对话轮数 | 补丁请求 | 测试次数 | 审计 | 验证 |
+| :--- | :--- | :--- | :--- | :- | :- | :- | :- | :--- | :--- |
+| **Lang_1b** | ✅ Fixed | 81.8 | 66.5K | 1 | 7 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Codec_5b** | ✅ Fixed | 32.5 | 116.7K | 1 | 10 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Csv_1b** | ✅ Fixed | 18.5 | 53.2K | 1 | 9 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Cli_5b** | ✅ Fixed | 15.7 | 28.6K | 1 | 6 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Chart_1b** | ✅ Fixed | 25.8 | 31.5K | 1 | 7 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Time_4b** | ✅ Fixed | 85.8 | 171.1K | 1 | 12 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Compress_7b** | ✅ Fixed | 26.8 | 63.0K | 1 | 11 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Math_30b** | ✅ Fixed | 170.6 | 185.5K | 3 | 12 | 3 | 3 | `clean` | ✅ `Verified Fixed` |
+| **Lang_4b** | ✅ Fixed | 70.8 | 39.9K | 2 | 8 | 2 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Cli_13b** | ✅ Fixed | 39.1 | 99.7K | 1 | 11 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Chart_13b** | ✅ Fixed | 116.5 | 386.0K | 3 | 18 | 3 | 3 | `clean` | ✅ `Verified Fixed` |
+| **Csv_9b** | ✅ Fixed | 20.9 | 55.1K | 1 | 10 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Time_11b** | ✅ Fixed | 98.3 | 320.5K | 1 | 17 | 2 | 3 | `clean` | ✅ `Verified Fixed` |
+| **Compress_25b** | ✅ Fixed | 68.4 | 234.9K | 1 | 16 | 2 | 3 | `clean` | ✅ `Verified Fixed` |
+| **Math_63b** | ✅ Fixed | 77.9 | 51.2K | 1 | 8 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Lang_43b** | ✅ Fixed | 81.7 | 85.3K | 1 | 10 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Time_19b** | ✅ Fixed | 69.9 | 114.0K | 1 | 10 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Compress_38b** | ✅ Fixed | 963.6 | 209.5K | 3 | 15 | 3 | 4 | `clean` | ✅ `Verified Fixed` |
+| **Cli_28b** | ✅ Fixed | 18.3 | 60.6K | 3 | 11 | 3 | 3 | `clean` | ✅ `Verified Fixed` |
+| **Math_70b** | ✅ Fixed | 26.3 | 32.6K | 1 | 7 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Lang_51b** | ✅ Fixed | 31.5 | 29.9K | 1 | 6 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Time_14b** | ✅ Fixed | 204.5 | 885.7K | 1 | 50 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Compress_45b** | ✅ Fixed | 62.1 | 66.1K | 1 | 7 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Math_73b** | ✅ Fixed | 38.2 | 76.3K | 1 | 9 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Lang_60b** | ✅ Fixed | 28.7 | 24.9K | 1 | 6 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
+| **Math_95b** | ✅ Fixed | 36.4 | 73.8K | 1 | 11 | 1 | 2 | `clean` | ✅ `Verified Fixed` |
 
-> **4/4 Fixed · 4/4 `clean` · 4/4 `Verified Fixed`。** 三个Bug一轮收敛，仅 `Codec_11b` 用了两轮；耗时 89–237 秒，合计 1.73M tokens，覆盖四个项目。列的含义：`轮次` 为回滚后留存的补丁轮次；`对话轮数` 为模型请求次数；`补丁请求` / `测试次数` 取 metrics 的 `total_attempts` / `tests`，含已回滚的诊断探针（归档于 `human_audit.jsonl`）。`audit.jsonl` 与上方 verify 输出只统计留存事件（如 `Codec_11b` 为 2 / 3，metrics 记 3 / 3；`Chart_26b` 为 1 / 2，metrics 记 5 / 4）；归档批次仍可审计，但不与本表比较。
+> **26/26 Fixed · 26/26 `clean` · 26/26 `Verified Fixed`。** 覆盖 BENCH30 中除上批已修的 4 个之外的全部 26 个Bug、8 个项目；合计 3.56M tokens，墙钟约 42 分钟。列的含义：`轮次` 为回滚后留存的补丁轮次（`current_round`）；`对话轮数` 为模型请求次数（`turns`）；`补丁请求` / `测试次数` 取 metrics 的 `total_attempts` / `tests`，含已回滚的诊断探针。
 >
-> 结果不应作为修复率的依据。**成本由返工轮次与探针主导，而非Bug规模**：`Math_2b` 一轮收敛仅 53.0K；`Chart_26b` 因两轮探针（先打印堆栈、再写 `probe.txt`）达 819.5K，为本批最高。`Lang_10b` 上批曾因探针打进 `FastDateParser.parse()` 的热路径、每解析日期都打印超长正则，产生 451MB 日志并触发 JVM OOM；本批重跑后未复现，耗时与 token 属正常范围。探针一律走 `rollback`，不会留在工作区（见「配置参考」）。文件系统对墙钟时间影响显著（见「性能说明」）；跨环境稳定的只有 `Status` 与 `Audit`。
+> **这批结果不能作为修复率或成本的依据——存在明显的训练数据泄漏。** 26 个Bug中 21 个的执行记录在 think 原文里直接出现 "known bug" / "I recall" / "Defects4J `<id>` fix" 等措辞：模型认出这些是公开基准中的已知Bug，并从训练记忆中回忆官方修复，而非从失败测试与源码现场推理。补丁与官方 developer fix 高度吻合（如 `Chart_1` 的 `dataset != null → == null`、`Lang_51` 补一个 `break`、`Math_70` 的 `solve(min,max) → solve(f,min,max)`）。19/26 一个补丁即命中，全批 2 元成本、6–50 轮，均显著低于真实未知Bug的预期。因此 100% 的 fix rate 与低成本是**记忆效应，不是修复能力的证据**；`Verified Fixed` 只说明补丁使测试通过且未改测试文件，这一结论仍然成立。
+>
+> 若要评估真实能力，需使用训练数据中未出现过的Bug（如自建 `case/` 样例或非公开项目）。工具链本身不依赖 Defects4J 特定语义，配置中的 `setup_cmd` / `test_cmd` / `passed_pattern` 可指向任意 Java 项目，适配其他Java只是替换工作区与测试脚本；但"能运行"与"能修复"是两个问题，后者仍需无泄漏的评测集验证。
+>
+> 单Bug耗时受文件系统影响显著（`Compress_38b` 的 963.6 秒主要为 checkout 与测试等待，token 仅 209.5K，见「性能说明」）；跨环境稳定的只有 `Status` 与 `Audit`。上批 4 个Bug的数据已归档于 `logs/archive/`，不计入本表。
 
 指标文件 `logs/benchmark_metrics.jsonl` 的字段定义、执行记录 `logs/<bug>/transcript.md` 的格式与 `logs/` 的版本控制范围，见 [`docs/logs.md`](docs/logs.md)。
 
@@ -71,7 +97,7 @@ ZeroX 不受该设置影响：服务端在应用锚点补丁前会归一化 `\r\
 | **B — 主要评估区间**（14） | 需跨方法追踪或特定不变量；真实修复率主要体现在该层级（30–70% 属正常区间）     | `Lang_43` `Lang_51` `Lang_60` `Chart_1` `Chart_13` `Chart_26` `Time_4` `Time_11` `Time_19` `Csv_9` `Compress_7` `Compress_25` `Compress_38` `Cli_28` |
 | **C — 压力测试**（8）    | 数值语义与二进制格式；0–2/8 属正常结果                        | `Math_2` `Math_30` `Math_63` `Math_70` `Math_73` `Math_95` `Time_14` `Compress_45`                                                                   |
 
-分层为**人工标注**（依据项目与常见补丁规模），未逐条核对开发者补丁，因此不可复现，也不应视为难度事实：本批 `Chart_26`（B 层）因两轮探针消耗 819.5K，为最高；`Math_2`（C 层压力测试）反而一轮收敛仅 53.0K，为最低。该表只说明采样覆盖的形态，不预测成本；若作为难度标签使用，应先按元数据校准（`defects4j` 需在 `PATH` 中）：
+分层为**人工标注**（依据项目与常见补丁规模），未逐条核对开发者补丁，因此不可复现，也不应视为难度事实。实测中成本与层级并无稳定对应：早期批次里 B 层的 `Chart_26` 因两轮探针消耗 819.5K 为最高，而 C 层压力测试的 `Math_2` 一轮收敛仅 53.0K 为最低。该表只说明采样覆盖的形态，不预测成本；若作为难度标签使用，应先按元数据校准（`defects4j` 需在 `PATH` 中）：
 
 ```bash
 defects4j info -p Lang -b 1     # 查看修改的类与方法

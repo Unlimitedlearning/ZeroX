@@ -10,17 +10,10 @@ build/
 dist/
 
 # ZeroX specific
-# logs/ holds scratch space except the published audit trail:
-#   logs/benchmark_metrics.jsonl  one line per finished bug
-#   logs/audit.jsonl              post-hoc verdict (clean / invalid, Verified Fixed)
-#   logs/<bug>/human_audit.jsonl  discarded patches + rollback history
+# logs/ 整体为运行产物，不入库。benchmark_metrics.jsonl / audit.jsonl /
+# <bug>/human_audit.jsonl 均为本机运行结果，结果以 README 表格为准；
+# archive/ 为历史归档，同样不入库。
 logs/**
-!logs/**/
-!logs/benchmark_metrics.jsonl
-!logs/audit.jsonl
-!logs/*/human_audit.jsonl
-# archive/ 是项目尚未定稿时的历史运行归档，不作为正式数据提交
-logs/archive/
 
 # 仅忽略项目根目录的 config.json（本机配置）。
 # 规则必须带前导斜杠：无斜杠的规则会在任意层级生效，从而误伤 case/config.json

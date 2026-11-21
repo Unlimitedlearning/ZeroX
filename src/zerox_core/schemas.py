@@ -83,7 +83,7 @@ def build_tools():
         ),
         types.Tool(
             name="get_work_log",
-            description="读取工作日志：每轮改了什么、失败用例数的变化、已撤销方向的原因。上下文被压缩后用它恢复状态。",
+            description="可选的详细历史视图：每轮的完整推理、最近一次测试详情。每轮注入的 LIVE STATE 状态卡已覆盖轮次、失败数趋势、当前推断与已排除方向——仅当状态卡缺少你需要的具体细节时才调用它。",
             inputSchema={
                 "type": "object",
                 "properties": {"limit": {"type": "integer", "description": "读取最近几轮的日志，默认3"}},

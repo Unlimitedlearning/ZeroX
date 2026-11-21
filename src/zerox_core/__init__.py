@@ -7,6 +7,7 @@
     exec_env.py  命令执行器：把 WSL 转发 / 原生 bash 的差异收在一个地方
     context.py   上下文裁剪纯函数：对称截工具输出/补丁参数、按价值裁剪轮次、数体积
     PASSED_RESULT_MARKER  服务端通过文案 / 客户端正样本判定共用的协议常量
+    TASK_FAILED_MARKER    服务端测试次数用尽时的强制终止文案 / 客户端退出判定共用
 
 依赖方向是单向的：入口（src/zerox.py）、src/zerox_server.py、src/audit.py 都依赖本包，
 本包不依赖它们任何一个，也不持有任何全局状态 —— 运行期状态在 server 里，
@@ -19,3 +20,7 @@
 # 服务端 run_test 在 passed_pattern 命中时回这句话；客户端只在见到它之后才承认 [FIXED]。
 # 两边必须共用同一个常量：以前各写一份字面量，改漏一处就会把所有结果记成 Failed。
 PASSED_RESULT_MARKER = "【测试全部通过】"
+
+# 服务端 max_tests 用尽时回这句话并要求 agent 输出 [FAILED]；客户端见到它就强制退出循环。
+# 与 PASSED_RESULT_MARKER 同理：两端必须共用，改漏一处会让超限任务卡死在主循环里。
+TASK_FAILED_MARKER = "【任务失败】"

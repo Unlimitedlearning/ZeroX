@@ -23,7 +23,7 @@ from mcp.client.stdio import stdio_client
 import audit
 import worklog
 # 内部包在 src/zerox_core/：包名不能叫 zerox，否则会盖住本文件（src/zerox.py）
-from zerox_core import PASSED_RESULT_MARKER
+from zerox_core import PASSED_RESULT_MARKER, TASK_FAILED_MARKER
 from zerox_core import config as config_mod
 from zerox_core import resume as resume_mod
 # 上下文裁剪的纯函数抽到 zerox_core，便于离线单测（import 本文件会初始化 client）
@@ -108,11 +108,9 @@ def resolve_path(path: str) -> str:
 
 
 def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        print(f"❌ 找不到配置文件 {CONFIG_FILE}")
-        sys.exit(1)
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    # 复用 core 的加载器：读文件 + 必填项/类型校验与服务端同一套，避免两端校验强度不一致。
+    # CONFIG_FILE 已在 resolve_config_file() 里绝对化，这里直接传入即可。
+    return config_mod.load_config(CONFIG_FILE)
 
 CONFIG = load_config()
 LLM_CONF = CONFIG["llm_config"]
@@ -608,7 +606,7 @@ async def run_single_bug(bug_id: str, session: ClientSession, resume: bool = Fal
                     if fn_name == "run_test" and PASSED_RESULT_MARKER in result_text:
                         saw_passing_test = True
 
-                    if "【任务失败】" in result_text:
+                    if TASK_FAILED_MARKER in result_text:
                         print(f"  💀 [{bug_id}] 服务端测试次数达到上限，任务结束。")
                         final_status = "Failed"
                         break

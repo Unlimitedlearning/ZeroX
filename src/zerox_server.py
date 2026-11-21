@@ -12,7 +12,7 @@ from mcp.server.stdio import stdio_server
 from mcp import types
 
 # 项目内模块（解耦第一步：配置与工具 schema 已外迁）
-from zerox_core import PASSED_RESULT_MARKER
+from zerox_core import PASSED_RESULT_MARKER, TASK_FAILED_MARKER
 from zerox_core import config as config_mod
 from zerox_core import schemas
 from zerox_core import resume as resume_mod
@@ -487,7 +487,7 @@ async def call_tool(name: str, arguments: dict):
         if not is_new_bug and TOTAL_TESTS >= MAX_TESTS:
             reset_task_state("MaxTests")
             return [types.TextContent(type="text", text=(
-                f"【任务失败】已达到最大测试次数（{MAX_TESTS} 次）。请立刻停止修复并输出 [FAILED]。\n"
+                f"{TASK_FAILED_MARKER}已达到最大测试次数（{MAX_TESTS} 次）。请立刻停止修复并输出 [FAILED]。\n"
                 f"本任务共提交 {TOTAL_ATTEMPTS} 个补丁。"
             ), isError=True)]
         

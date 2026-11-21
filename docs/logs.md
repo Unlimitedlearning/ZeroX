@@ -38,4 +38,4 @@
 
 ## 版本控制范围
 
-`logs/` 下 git 仅跟踪 `logs/benchmark_metrics.jsonl`、`logs/audit.jsonl` 与 `logs/<bug>/human_audit.jsonl`（被回滚的补丁与丢弃轨迹），使已发布的数字可审计，同时避免提交全部临时日志。其余文件与 `logs/archive/` 均被忽略。
+`logs/` 整体不入库：包括 `benchmark_metrics.jsonl`、`audit.jsonl` 与 `logs/<bug>/human_audit.jsonl` 在内的全部运行产物均为本机数据，发布数字以 README 结果表为准。需要保留某批结果时，先按「运行流程」用 `new_run.py` 归档到 `logs/archive/<timestamp>/`，归档同样不入库，仅留本机备查。
