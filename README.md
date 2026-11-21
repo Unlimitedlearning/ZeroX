@@ -73,9 +73,9 @@ ZeroX 是一个基于模型上下文协议（MCP）的自动程序修复（APR�
 
 指标文件 `logs/benchmark_metrics.jsonl` 的字段定义、执行记录 `logs/<bug>/transcript.md` 的格式与 `logs/` 的版本控制范围，见 [`docs/logs.md`](docs/logs.md)。
 
-## 基准测试集（BENCH30）
+## 历史基准（Defects4J / BENCH30）
 
-`config.example.json` 附带一份公开的 Defects4J 子集：30 个Bug、8 个项目、三个先验分层，用于低成本、可重复的冒烟测试。该文件的 `benchmark_bugs` 数组为权威列表。
+> **该测试集已弃用，不再作为推荐评测集。** 30 个 Bug 均为公开基准，模型在训练数据中已见过其修复，26/26 的结果存在明显泄漏（见「初步实验」），无法反映真实修复能力。后续评测以自建样例（`case/`）为主。本节仅保留历史背景与复现方法；`config.example.json` 中的 `benchmark_bugs` 数组是 Defects4J 的配置示例，不代表推荐测试集。
 
 ### 复现步骤
 
@@ -89,30 +89,11 @@ git config --global apply.ignoreWhitespace change
 
 ZeroX 不受该设置影响：服务端在应用锚点补丁前会归一化 `\r\n`；但不设置该项，Defects4J 无法检出 `Csv_*`。
 
-### 30 个Bug
-
-| 层级                 | 设计意图                                          | Bug                                                                                                                                                   |
-| :----------------- | :-------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **A — 底线探测**（8）    | 预期为单类、小改动（多数 1–5 行）。若低于 ≥6/8，应首先排查工具链或提示词，而非归因于Bug本身 | `Lang_1` `Lang_4` `Lang_10` `Csv_1` `Codec_5` `Codec_11` `Cli_5` `Cli_13`                                                                            |
-| **B — 主要评估区间**（14） | 需跨方法追踪或特定不变量；真实修复率主要体现在该层级（30–70% 属正常区间）     | `Lang_43` `Lang_51` `Lang_60` `Chart_1` `Chart_13` `Chart_26` `Time_4` `Time_11` `Time_19` `Csv_9` `Compress_7` `Compress_25` `Compress_38` `Cli_28` |
-| **C — 压力测试**（8）    | 数值语义与二进制格式；0–2/8 属正常结果                        | `Math_2` `Math_30` `Math_63` `Math_70` `Math_73` `Math_95` `Time_14` `Compress_45`                                                                   |
-
-分层为**人工标注**（依据项目与常见补丁规模），未逐条核对开发者补丁，因此不可复现，也不应视为难度事实。实测中成本与层级并无稳定对应：早期批次里 B 层的 `Chart_26` 因两轮探针消耗 819.5K 为最高，而 C 层压力测试的 `Math_2` 一轮收敛仅 53.0K 为最低。该表只说明采样覆盖的形态，不预测成本；若作为难度标签使用，应先按元数据校准（`defects4j` 需在 `PATH` 中）：
-
-```bash
-defects4j info -p Lang -b 1     # 查看修改的类与方法
-defects4j bids -p Time         # 列出实际存在的Bug编号
-```
-
-### 有意排除的项目
-
-Closure、JacksonDatabind、Mockito 与 Gson：单Bug测试耗时（Closure 在 ext4 上每次仍需数分钟）、JDK 敏感性（Mockito）与过大的测试集会拖慢 30 个Bug的扫描并引入环境噪声，留待第二阶段。
-
 ### 建议报告的内容
 
 除 `benchmark_metrics.jsonl` 外，报告应区分 **plausible 与 correct**（测试全通过仅为 plausible，需与 `active-bugs.csv` 中的 `revision.id.fixed` 对照，并以 `--verify` 重放测试，通过方可称为 `Verified Fixed`）；给出**方差**（每个Bug至少重复 3 次，报告均值 ± 标准差）；并按**项目与改动量档**分别统计，而非只给一个汇总数字。
 
-若某一分层的结果显著高于文献值，应先运行 `python src/audit.py` 并检查 `invalid` 记录。
+若结果显著高于文献值，应先运行 `python src/audit.py` 并检查 `invalid` 记录，确认没有改测试文件或泄漏。
 
 ## 目录结构
 
