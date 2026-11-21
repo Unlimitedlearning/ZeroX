@@ -8,7 +8,8 @@
 """
 import re
 
-from zerox_core.search import parse_failing_tests, extract_java_structure
+from zerox_core.test_output_parser import parse_failing_tests
+from zerox_core.java_structure import extract_java_structure
 
 
 # 高频调用路径的方法名片段（小写比对）：改动落在这里且新增了打印，输出会被放大。

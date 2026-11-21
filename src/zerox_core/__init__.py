@@ -2,10 +2,15 @@
 
 这里只放「零运行期状态、可被多处复用」的东西：
 
-    config.py    配置默认值 / 合并 / 校验 / 正则编译 / resolve_bug（纯函数）
-    schemas.py   MCP 工具 schema（纯数据，改描述文案只改这里）
-    exec_env.py  命令执行器：把 WSL 转发 / 原生 bash 的差异收在一个地方
-    context.py   上下文裁剪纯函数：对称截工具输出/补丁参数、按价值裁剪轮次、数体积
+    config.py            配置默认值 / 合并 / 校验 / 正则编译 / resolve_bug（纯函数）
+    schemas.py           MCP 工具 schema（纯数据，改描述文案只改这里）
+    exec_env.py          命令执行器：把 WSL 转发 / 原生 bash 的差异收在一个地方
+    context.py           上下文裁剪纯函数：对称截工具输出/补丁参数、按价值裁剪轮次、数体积
+    search_code.py       search_code 的 grep 构造 / 命中排序 / 结果整理
+    test_output_parser.py  run_test 失败诊断：失败定位/编译错误/断言原文/方法体/日志截断
+    java_structure.py    get_file_internal_structure 的 Java 类/方法结构索引
+    source_lex.py         C 系通用词法掩码（字符串/字符/注释），被诊断/结构/补丁三个模块共用
+    patcher.py           行号锚点补丁 + 落盘前括号配平自检（patch_and_log 的底层纯函数）
     PASSED_RESULT_MARKER  服务端通过文案 / 客户端正样本判定共用的协议常量
     TASK_FAILED_MARKER    服务端测试次数用尽时的强制终止文案 / 客户端退出判定共用
 

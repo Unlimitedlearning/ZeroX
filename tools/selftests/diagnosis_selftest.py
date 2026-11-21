@@ -18,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from zerox_core.search import extract_assertions, cap_log_text  # noqa: E402
+from zerox_core.test_output_parser import extract_assertions, cap_log_text  # noqa: E402
 from diagnosis import build_failure_card, detect_stall, detect_hotspot  # noqa: E402
 
 

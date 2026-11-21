@@ -1,3 +1,18 @@
+"""MCP 服务端：注册并分派 7 个工具，注入工作区 / 配置 / 运行期状态。
+
+工具 → 实现位置（改某个工具时按此查找；纯逻辑都在 zerox_core/，可离线单测）：
+  run_test                   本文件分派 + zerox_core.test_output_parser（失败/编译/断言/日志解析）
+                             + diagnosis（归因卡/停滞/热点）+ worklog（test 事件）
+  search_code                zerox_core.search_code（grep 构造 / 打分 / 结果整理）
+  read_specific_code         本文件（路径边界 + 带行号格式化，逻辑太薄未外迁）
+  get_file_internal_structure  zerox_core.java_structure（结构索引）+ 本文件文本拼装
+  patch_and_log              zerox_core.patcher（行号锚点补丁 / 配平自检）+ 本文件记账
+  get_work_log               worklog.digest + 本文件文本拼装
+  rollback                   worklog.rollback + 本文件轮次回退
+
+共享模块在 zerox_core/：config / paths / context / resume / schemas / exec_env / source_lex。
+命名按「能力 / 领域」而非工具名：一个工具会跨多个模块，一个模块也会服务多个工具。
+"""
 import asyncio
 import subprocess
 import logging
@@ -18,8 +33,12 @@ from zerox_core import schemas
 from zerox_core import resume as resume_mod
 # 读工具的工作区边界：纯解析逻辑在 zerox_core.paths，server 只传 CURRENT_WORKDIR
 from zerox_core import paths as core_paths
-# search_code 的命令构造与结果整理是纯函数，离线可单测
-from zerox_core import search as code_search
+# run_test 诊断 / search_code / 结构索引的纯逻辑，各自成模块，离线可单测
+from zerox_core import java_structure
+from zerox_core import search_code
+from zerox_core import test_output_parser
+# patch_and_log 的行号锚点补丁与落盘前配平自检（纯函数）
+from zerox_core import patcher as code_patcher
 from zerox_core.config import compile_or_fail
 from zerox_core.config import resolve_bug as _resolve_bug
 # 命令执行器已外迁：事后审计（audit.py）要用同一条 test_cmd 复跑，不能各写一份 WSL 转发逻辑
@@ -291,9 +310,9 @@ def locate_failing_tests(detail_text, workdir, limit=3):
     """
     located = []
     try:
-        for cls, method in code_search.parse_failing_tests(detail_text)[:limit]:
+        for cls, method in test_output_parser.parse_failing_tests(detail_text)[:limit]:
             simple = cls.rsplit(".", 1)[-1]
-            cmd, err = code_search.build_grep_command(workdir, "*.java", f"class {simple}")
+            cmd, err = search_code.build_grep_command(workdir, "*.java", f"class {simple}")
             if err:
                 continue
             res = execute_in_target(cmd)
@@ -306,11 +325,11 @@ def locate_failing_tests(detail_text, workdir, limit=3):
             src = execute_in_target(f"cat {shlex.quote(readable)}")
             if src.returncode != 0:
                 continue
-            line_no = code_search.locate_method_line(src.stdout, method)
+            line_no = test_output_parser.locate_method_line(src.stdout, method)
             rel = posixpath.relpath(path, workdir) if workdir else path
             body = ""
             if line_no:
-                body, _lines, _cut = code_search.extract_method_body(
+                body, _lines, _cut = test_output_parser.extract_method_body(
                     src.stdout, line_no, max_lines=50, max_chars=1200
                 )
             located.append((cls, method, rel, line_no, body))
@@ -346,7 +365,7 @@ def locate_assertion_details(workspace, max_files=3, chars_per_file=6000):
                 corpus.append(res.stdout)
         if not corpus:
             return ""
-        text, _n = code_search.extract_assertions("\n".join(corpus))
+        text, _n = test_output_parser.extract_assertions("\n".join(corpus))
         return text
     except Exception as err:
         # 与失败用例定位同理：报告读取是优化，任何异常都不能打断 run_test。
@@ -373,7 +392,7 @@ def read_test_log(path):
         head = f.read(LOG_HEAD_BYTES).decode("utf-8", "replace")
         f.seek(-tail_bytes, os.SEEK_END)
         tail = f.read(tail_bytes).decode("utf-8", "replace")
-    return code_search.cap_log_text(head, tail, size), True
+    return test_output_parser.cap_log_text(head, tail, size), True
 
 
 def wait_for_previous_process():
@@ -646,7 +665,7 @@ async def call_tool(name: str, arguments: dict):
             if exit_code not in (None, 0) and fail_match is None:
                 # 【本地代劳】先给结构化的「文件:行号: 错误」清单，模型不必从几百行 javac
                 # 输出里自己找错误行；提取不到时回退原文尾部，保证任何格式都有可操作信息。
-                errors_text, err_count = code_search.extract_compile_errors(content)
+                errors_text, err_count = test_output_parser.extract_compile_errors(content)
                 compile_msg = f"【编译失败】退出码 {exit_code}。"
                 if err_count:
                     compile_msg += f"\n{errors_text}\n\n以下为编译日志尾部（原文）：\n{content[-1200:]}"
@@ -700,7 +719,7 @@ async def call_tool(name: str, arguments: dict):
 
                 # 【断言原文】先从已读入的 test.log 提取；stdout 没有堆栈时再查工作区报告文件
                 # （surefire-reports / test-results）。两者都提取不到才退回取法指引。
-                assertion_text, _n = code_search.extract_assertions(content)
+                assertion_text, _n = test_output_parser.extract_assertions(content)
                 if not assertion_text:
                     assertion_text = locate_assertion_details(workspace)
                 if assertion_text:
@@ -744,7 +763,7 @@ async def call_tool(name: str, arguments: dict):
         keyword = arguments.get("keyword")
         pattern = arguments.get("file_pattern") or TARGET["source_glob"]
         regex = bool(arguments.get("regex", False))
-        max_results = arguments.get("max_results", code_search.DEFAULT_MAX_RESULTS)
+        max_results = arguments.get("max_results", search_code.DEFAULT_MAX_RESULTS)
 
         # 工作区统一用 resolve_bug 解析出来的 CURRENT_WORKDIR，不按测试工具命名推导
         workdir = CURRENT_WORKDIR
@@ -772,7 +791,7 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text=scope_or_err, isError=True)]
         scope = scope_or_err
 
-        cmd, arg_err = code_search.build_grep_command(scope, include, keyword, regex=regex)
+        cmd, arg_err = search_code.build_grep_command(scope, include, keyword, regex=regex)
         if arg_err:
             return [types.TextContent(type="text", text=arg_err, isError=True)]
         res = execute_in_target(cmd)
@@ -795,7 +814,7 @@ async def call_tool(name: str, arguments: dict):
             note = "\n（部分目录读取失败，以上为已扫到的结果）"
         elif res.returncode == 1 and scope != workdir:
             res = execute_in_target(
-                code_search.build_grep_command(workdir, include, keyword, regex=regex)[0]
+                search_code.build_grep_command(workdir, include, keyword, regex=regex)[0]
             )
             if grep_failed(res) and not res.stdout.strip():
                 detail = (res.stderr or res.stdout or "").strip()[-500:]
@@ -814,7 +833,7 @@ async def call_tool(name: str, arguments: dict):
                 "也可直接用 read_specific_code 读取文件。"
             ))]
 
-        body = code_search.format_results(
+        body = search_code.format_results(
             res.stdout, keyword, workdir, include, max_results=max_results, regex=regex
         )
         return [types.TextContent(type="text", text=body + note)]
@@ -877,7 +896,7 @@ async def call_tool(name: str, arguments: dict):
             if result.returncode != 0:
                 return [types.TextContent(type="text", text=f"读取失败: {result.stderr}")]
             
-            items, truncated = code_search.extract_java_structure(result.stdout)
+            items, truncated = java_structure.extract_java_structure(result.stdout)
             if not items:
                 return [types.TextContent(type="text", text="未在文件中找到明显的类或方法结构。可先用 read_specific_code 读取前 80 行，或用 search_code 定位具体方法名后再读该范围。")]
 
@@ -907,7 +926,7 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text=f"结构解析异常: {str(e)}")]
 
     # ==========================================
-    # 下面是合并后的核心工具：记录日志 + 应用补丁
+    # 事务类工具：补丁写入 / 日志查看 / 回滚
     # ==========================================
     elif name == "patch_and_log":
         # 先初始化
@@ -968,7 +987,7 @@ async def call_tool(name: str, arguments: dict):
                 return [types.TextContent(type="text", text=f"读取文件失败: {str(e)}", isError=True)]
 
             # 行号锚点：一次处理该文件的所有 change，对原始内容校验锚点后倒序替换。
-            after, err = code_search.apply_line_patches(content, pds)
+            after, err = code_patcher.apply_line_patches(content, pds)
             if err:
                 return [types.TextContent(type="text", text=f"补丁未应用：{display_path(wsl_path)} —— {err}。本轮修改未落盘。", isError=True)]
 
