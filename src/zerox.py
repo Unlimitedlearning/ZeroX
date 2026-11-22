@@ -30,6 +30,11 @@ from zerox_core import resume as resume_mod
 from zerox_core.context import (
     keep_valuable_turns, trim_tool_outputs, context_chars, split_turns, thought_notice,
 )
+# 【首轮裁剪工具】仅第一次请求少发 6 个 schema：该次请求的缓存必然为空，裁剪无额外成本。
+# 取得测试结论后固定发送全量，避免中途修改 tools 数组导致服务端前缀缓存自断点失效。
+from zerox_core.phases import (
+    INIT as PHASE_INIT, READY as PHASE_READY, next_phase, tools_for,
+)
 
 CONFIG_FILE = "config.json"
 
@@ -356,17 +361,20 @@ async def run_single_bug(bug_id: str, session: ClientSession, resume: bool = Fal
         {"role": "user", "content": AGENT_CONF["user_prompt_template"].replace("{bug_id}", bug_id)}
     ]
     
+    # 工具 schema 是固定前缀中占比最高的一段（7 个约 3.2K 字符），故按名字收成 dict，由阶段
+    # 决定本轮发送哪几个（见 zerox_core/phases.py）。裁剪仅作用于首轮：INIT 只发 run_test，
+    # 之后固定全量，避免修改 tools 数组使服务端前缀缓存失效。
     mcp_tools = await session.list_tools()
-    openai_tools = []
+    tools_by_name = {}
     for tool in mcp_tools.tools:
-        openai_tools.append({
+        tools_by_name[tool.name] = {
             "type": "function",
             "function": {
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.inputSchema
             }
-        })
+        }
 
     start_time = time.time()
     usage_totals = {"prompt": 0, "completion": 0, "total": 0, "calls": 0, "turns": 0}
@@ -401,6 +409,11 @@ async def run_single_bug(bug_id: str, session: ClientSession, resume: bool = Fal
     # 曾经写成 fresh_task = not resume，导致续跑时本标志为 False、resume=true 永远注入不进去，
     # 服务端遂当新任务清空 work_log。调用后置 False，见下方 run_test 分支。
     first_run_test = True
+    # 【阶段】决定本轮发送的 tools 数组（见 zerox_core/phases.py）：
+    # INIT 仅 run_test；取得测试结论后进入 READY，此后固定为全量七工具。
+    phase = PHASE_INIT
+    # 连续「未调用工具」的轮数：INIT 阶段的收敛阀，见下方 no tool_calls 分支。
+    empty_turns = 0
 
     # 轮次没有上限：唯一的强制限制是服务端的测试次数上限，用尽时 run_test 返回【任务失败】强制循环退出。
     # 只读轮次不消耗测试次数，所以纯只读的循环（一次测试都不跑）只能人工中断。
@@ -486,6 +499,11 @@ async def run_single_bug(bug_id: str, session: ClientSession, resume: bool = Fal
         # 【L1】每轮请求前把活状态卡刷到最新，并临时拼到消息末尾：
         # 前缀（system + 历史）保持稳定以命中服务端缓存，变化只发生在末尾这一条。
         # 状态卡不写入 messages，因此压缩裁剪不会碰到它，上下文计数也不含它。
+        # 【按阶段裁剪工具】仅发送当前阶段可用的 schema（首轮 run_test，之后全量）。
+        # allowed 同时用于拦截越阶段调用：模型可能发来本轮未提供的工具名，
+        # 服务端仍会照单执行，故须在客户端拦截。
+        allowed = tools_for(phase)
+        api_tools = [tools_by_name[name] for name in allowed if name in tools_by_name]
         state_card["content"] = state_card_content(bug_id)
         api_messages = messages + [state_card]
 
@@ -493,7 +511,7 @@ async def run_single_bug(bug_id: str, session: ClientSession, resume: bool = Fal
             response = await client.chat.completions.create(
                 model=LLM_CONF["model_name"],
                 messages=api_messages,
-                tools=openai_tools,
+                tools=api_tools,
                 temperature=0.0
             )
             # 只在请求成功后记：l1_state 要回答「模型这一轮实际收到了什么」
@@ -537,15 +555,34 @@ async def run_single_bug(bug_id: str, session: ClientSession, resume: bool = Fal
 
             # 如果 AI 没调用工具，直接给系统警告，强制它继续
             if not response_msg.tool_calls:
+                empty_turns += 1
+                # 【收敛阀】INIT 阶段仅暴露 run_test，模型可能输出自然语言而未调用工具
+                # （服务端 search / read 同样要求先完成 run_test）。连续两轮未调用工具即
+                # 恢复全量工具集：轮次无上限，缺少该保护会导致批量运行静默阻塞。
+                if empty_turns >= 2 and phase != PHASE_READY:
+                    phase = PHASE_READY
                 messages.append({
                     "role": "user", 
                     "content": "SYSTEM WARNING: Do NOT output natural language. You MUST call a tool immediately to proceed."
                 })
                 continue # 直接进入下一轮，不用打印乱七八糟的警告了
 
+            empty_turns = 0
             for tool_call in response_msg.tool_calls:
                 fn_name = tool_call.function.name
                 print(f"  [{bug_id}] Turn {turn+1} Call: {fn_name}")
+                # 越阶段调用：本轮 tools 数组里没有它，模型却硬发了一个名字。
+                # 直接回一条 tool 消息把可用集合告诉它，比让服务端执行后产生副作用安全。
+                if fn_name not in allowed:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": fn_name,
+                        "content": (f"工具 {fn_name} 在当前阶段不可用。"
+                                    f"当前可用：{', '.join(allowed)}。"),
+                    })
+                    append_transcript(bug_id, turn + 1, f"result:{fn_name}", "[阶段拒绝]")
+                    continue
                 try:
                     fn_args = json.loads(tool_call.function.arguments)
                 except json.JSONDecodeError as e:
@@ -558,6 +595,7 @@ async def run_single_bug(bug_id: str, session: ClientSession, resume: bool = Fal
                     })
                     continue # 直接进入下一轮对话，放弃执行本次工具
 
+                call_ok = True
                 try:
                     # 【单一策略源】服务端只负责执行与记账，不做任何调用去重 / 免费重跑判定；
                     # 客户端也不缓存结果——两边各持一套策略必然打架。
@@ -572,6 +610,7 @@ async def run_single_bug(bug_id: str, session: ClientSession, resume: bool = Fal
                     result = await session.call_tool(fn_name, arguments=fn_args)
                     if fn_name == "run_test":
                         first_run_test = False
+                    call_ok = not getattr(result, "isError", False)
                     result_text = "".join([c.text for c in result.content if c.type == "text"])
 
                     if fn_name == "patch_and_log":
@@ -611,6 +650,7 @@ async def run_single_bug(bug_id: str, session: ClientSession, resume: bool = Fal
                         final_status = "Failed"
                         break
                 except Exception as e:
+                    call_ok = False
                     result_text = f"Tool execution error: {str(e)}"
                     print(f"  ❌ Tool Error: {result_text}")
 
@@ -623,6 +663,10 @@ async def run_single_bug(bug_id: str, session: ClientSession, resume: bool = Fal
 
                 # 工具返回同样是「AI 看到的东西」，一起归档（内部按 limit 截断）
                 append_transcript(bug_id, turn + 1, f"result:{fn_name}", result_text)
+
+                # 阶段推进：全流程仅一次——INIT 中成功的 run_test 进入 READY，此后不再变化。
+                # setup 失败 / 执行异常时 call_ok 为 False，停留于 INIT 重跑测试。
+                phase = next_phase(phase, fn_name, call_ok)
             
             if final_status in ("Fixed", "Failed"):
                 break

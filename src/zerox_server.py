@@ -84,6 +84,10 @@ CONFIG_FILE = os.getenv("ZEROX_CONFIG") or os.path.join(PROJECT_ROOT, "config.js
 # 基准测试指标（logs/benchmark_metrics.jsonl）由 Agent（src/zerox.py）负责写入：
 # token 用量只有调用 LLM 的客户端才知道，服务端这一侧只留耗时日志
 
+# read_specific_code 单次返回超过这个行数时追加一句收窄提示：内容照旧全给（不截断），
+# 只提醒可以按声明范围分段读。历史执行记录里 28-32% 的单次读取超过 100 行。
+LARGE_READ_HINT_LINES = 200
+
 os.makedirs(LOG_DIR, exist_ok=True)
 
 handler = RotatingFileHandler(
@@ -172,6 +176,46 @@ def resolve_read_path(raw_path):
 def display_path(wsl_path):
     """回给模型的路径转相对（纯逻辑在 zerox_core.paths，便于离线单测）。"""
     return core_paths.display_path(wsl_path, CURRENT_WORKDIR)
+
+
+def load_sources_for_search(rels):
+    """为 search_code 的声明范围标注回读源码，返回 {工作区相对路径: 源码}。
+
+    一次 awk 取回全部文件、用 '@@@ZEROXFILE <绝对路径>' 行分隔：逐个 cat 会退化成
+    N 次跨环境往返（Windows 下每次都是新起一个 wsl.exe），而单次搜索通常命中
+    1-3 个文件。只取前 RANGE_SCAN_LINES 行，超长文件既不必整份穿过管道、也不参与
+    标注（结构截断会让行范围算错）。解析不了的路径按越界拒绝，与其它读工具共用
+    resolve_read_path，不因「只是标个行号」放宽边界。
+    """
+    targets = {}
+    for rel in list(rels)[:search_code.MAX_RANGE_FILES]:
+        ok, abs_path = resolve_read_path(rel)
+        if ok:
+            targets[abs_path] = rel
+    if not targets:
+        return {}
+    # 分隔行带固定前缀，避免与源码里恰好以 '@@@' 开头的字符串撞车
+    marker = "@@@ZEROXFILE "
+    cmd = (
+        f"awk 'FNR==1{{print \"{marker}\" FILENAME}} FNR<="
+        f"{search_code.RANGE_SCAN_LINES}' "
+        + " ".join(shlex.quote(p) for p in targets)
+    )
+    res = execute_in_target(cmd)
+    if res.returncode != 0 and not res.stdout.strip():
+        return {}
+
+    chunks, cur = {}, None
+    for line in res.stdout.splitlines():
+        if line.startswith(marker):
+            cur = targets.get(line[len(marker):].strip())
+            if cur:
+                chunks[cur] = []
+        elif cur:
+            chunks[cur].append(line)
+    # 取满 RANGE_SCAN_LINES 行说明只读到文件前段：结构可能被截断，范围会算错，宁可标不出来
+    return {rel: "\n".join(lines) for rel, lines in chunks.items()
+            if len(lines) < search_code.RANGE_SCAN_LINES}
 
 
 def write_target_file(target_path: str, content: str):
@@ -500,8 +544,9 @@ async def call_tool(name: str, arguments: dict):
         # 【测试次数上限】测试次数达到上限即终止任务 —— 这是服务端唯一的强制限制。
         # 放在 checkout 之前有两个理由：
         #   1. 次数已经用尽时，没必要再花时间准备一个不会跑测试的工作区；
-        #   2. 只有「换了 bug」才算新任务并复位 TOTAL_TESTS。否则 agent 自己传一个
-        #      force_checkout=true 就能把次数重置成满额，这道限制即可被绕过。
+        #   2. 只有「换了 bug」才算新任务并复位 TOTAL_TESTS。force_checkout 来自客户端
+        #      （每次任务的首跑注入一次，见 resume.first_run_control），不放进工具 schema，
+        #      模型无法用它把次数重置成满额。
         is_new_bug = CURRENT_BUG != new_bug_id
         if not is_new_bug and TOTAL_TESTS >= MAX_TESTS:
             reset_task_state("MaxTests")
@@ -518,11 +563,13 @@ async def call_tool(name: str, arguments: dict):
         if not need_checkout:
             if CURRENT_BUG != new_bug_id:
                 if TOTAL_ATTEMPTS > 0:
-                    # 带着未验证的补丁换 Bug：重置会直接把它丢掉，让 agent 自己做决定
+                    # 带着未验证的补丁换 Bug：重置会直接把它丢掉，让 agent 自己做决定。
+                    # force_checkout 已从工具 schema 移除（模型无权重置工作区），所以这里
+                    # 不能再说「请传 force_checkout=true」——那会指一条走不通的路。
                     return [types.TextContent(type="text", text=(
                         f"【拒绝切换】当前工作区属于 {CURRENT_BUG}，还有 {TOTAL_ATTEMPTS} 个未收敛的补丁"
                         f"（{new_bug_id} 是另一个 Bug）。切换会全量重置并丢弃这些改动。\n"
-                        f"要继续 {new_bug_id}，请显式传 force_checkout=true；要留在 {CURRENT_BUG}，请传正确的 bug_id。"
+                        f"请继续修复 {CURRENT_BUG}（bug_id={CURRENT_BUG}）。"
                     ), isError=True)]
                 need_checkout = True
             elif START_TIME is None and TOTAL_ATTEMPTS == 0:
@@ -834,7 +881,8 @@ async def call_tool(name: str, arguments: dict):
             ))]
 
         body = search_code.format_results(
-            res.stdout, keyword, workdir, include, max_results=max_results, regex=regex
+            res.stdout, keyword, workdir, include, max_results=max_results, regex=regex,
+            source_loader=load_sources_for_search,
         )
         return [types.TextContent(type="text", text=body + note)]
 
@@ -881,6 +929,12 @@ async def call_tool(name: str, arguments: dict):
             header = f"文件 {display_path(wsl_path)} 第 {start_idx + 1}-{end_idx} 行（共 {total_lines} 行）内容如下："
             if end_line > total_lines:
                 header += f"\n（end_line={end_line} 超出末尾，已截断到 {total_lines}）"
+            # 大范围读取：内容照旧全给，只在开头提一句可分段——模型此时往往不知道
+            # 这段代码由哪些成员构成，拿到范围后能自己收窄，不必等下一次全量读取
+            span = end_idx - start_idx
+            if span > LARGE_READ_HINT_LINES:
+                header += (f"\n（本次 {span} 行已全部返回；若只需其中个别成员，"
+                           "可先用 get_file_internal_structure 取 [起-止] 再按范围读）")
             return [types.TextContent(type="text", text=header + "\n" + "\n".join(formatted_lines))]
         except Exception as e:
             return [types.TextContent(type="text", text=f"异常: {str(e)}")]

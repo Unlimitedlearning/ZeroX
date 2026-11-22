@@ -1,4 +1,4 @@
-"""search_code 纯逻辑自检：grep 命令构造、定义优先排序、结果整理；不连 WSL。
+"""search_code 纯逻辑自检：grep 命令构造、定义优先排序、结果整理、声明范围标注；不连 WSL。
 
     python tools/selftests/search_code_selftest.py
 """
@@ -9,7 +9,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from zerox_core.search_code import SCAN_LIMIT, build_grep_command, definition_score, format_results  # noqa: E402
+from zerox_core.search_code import (  # noqa: E402
+    MAX_RANGE_FILES, SCAN_LIMIT, build_grep_command, definition_score, format_results, parse_hits,
+)
 
 
 def check(cond, message):
@@ -69,8 +71,75 @@ def test_format():
     check("扫描到 0 条命中" in empty and "正则匹配" in empty, empty)
 
 
+SOURCE = "\n".join([
+    "package p;",                        # 1
+    "",                                  # 2
+    "public final class Foo {",          # 3
+    "    private int n;",                # 4
+    "",                                  # 5
+    "    public Foo(int n) {",           # 6
+    "        this.n = n;",               # 7
+    "    }",                             # 8
+    "",                                  # 9
+    "    public int add(int a) {",       # 10
+    "        if (a > n) {",              # 11
+    "            return a;",             # 12
+    "        }",                         # 13
+    "        return n + a;",             # 14
+    "    }",                             # 15
+    "}",                                 # 16
+])
+FOO = "src/main/java/Foo.java"
+
+
+def test_ranges():
+    stdout = "\n".join([
+        f"{WORK}/{FOO}:10:    public int add(int a) {{",
+        f"{WORK}/{FOO}:12:            return a;",
+        f"{WORK}/{FOO}:3:public final class Foo {{",
+        f"{WORK}/{FOO}:6:    public Foo(int n) {{",
+        f"{WORK}/src/main/java/Zed.java:7:    public void run() {{",
+    ])
+    asked = []
+
+    def loader(rels):
+        asked.append(list(rels))
+        return {FOO: SOURCE}  # Zed.java 回读失败
+
+    text = format_results(stdout, "a", WORK, "*.java", source_loader=loader)
+    lines = text.splitlines()
+    check("声明" in lines[0] and "[起-止]" in lines[0], f"表头应说明标注含义: {lines[0]}")
+    check(len(lines) == 6, f"应保留全部 5 条命中，得 {len(lines)} 行")
+    # 排序：类(3) > 方法/构造(2) > 引用(0)
+    check(lines[1].endswith("public final class Foo {"), f"类声明不做标注: {lines[1]}")
+    check(lines[2].endswith("[6-8]"), f"构造声明应附构造体范围: {lines[2]}")
+    check(lines[3].endswith("[10-15]"), f"方法声明应附方法体范围: {lines[3]}")
+    check(not lines[4].endswith("]"), f"回读失败的文件不应标注: {lines[4]}")
+    check(not lines[5].endswith("]"), f"普通引用不应标注: {lines[5]}")
+    check(asked == [[FOO, "src/main/java/Zed.java"]], f"应一次问回全部文件: {asked}")
+
+    # 无 loader / loader 抛错 / 回读为空：退化成不带标注的原始格式，不影响结果
+    plain = format_results(stdout, "a", WORK, "*.java")
+    check("[起-止]" not in plain.splitlines()[0], "无 loader 时不应声称有标注")
+    check("[10-15]" not in plain, plain)
+    safe = format_results(stdout, "a", WORK, "*.java",
+                          source_loader=lambda rels: (_ for _ in ()).throw(RuntimeError("x")))
+    check(safe == plain, "loader 抛错应与无 loader 等价")
+    check(format_results(stdout, "a", WORK, "*.java", source_loader=lambda rels: {}) == plain,
+          "回读为空应与无 loader 等价")
+
+    # 文件数超过上限时只问前 MAX_RANGE_FILES 个，且顺序稳定
+    many = "\n".join(f"{WORK}/src/F{i}.java:{10 + i}:    public void f{i}() {{" for i in range(9))
+    asked.clear()
+    format_results(many, "f", WORK, "*.java", source_loader=loader)
+    check(len(asked[0]) == MAX_RANGE_FILES, f"应按上限截断回读文件数: {asked}")
+
+    check(len(parse_hits(stdout, WORK)) == 5, "parse_hits 应与 format_results 口径一致")
+
+
 if __name__ == "__main__":
     test_command()
     test_scoring()
     test_format()
+    test_ranges()
     print("search_code selftest: OK")

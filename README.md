@@ -30,9 +30,13 @@ ZeroX 是一个基于模型上下文协议（MCP）的自动程序修复（APR�
 
 状态全部来自工具调用的参数与结果，不产生额外模型开销；恢复仅发生在同一进程内，见「局限性」。压缩时从 `thoughts.jsonl` 取最近 3 条 think 原文回传模型，每轮实际注入的状态卡写入 `l1_state.jsonl`，见 [`docs/logs.md`](docs/logs.md)。
 
+**6. 首轮裁剪工具集（固定前缀）。** 工具的 JSON Schema 随每次请求重发，是固定前缀中占比最高的一段（7 个工具合计 3.2K 字符）。客户端仅在第一轮裁剪：`INIT` 只发送 `run_test`，取得测试结论后进入 `READY` 并固定为全量七工具，此后不再变化。之所以只分两阶段、不按动作细分，是因为 `tools` 数组一旦改变，服务端前缀缓存即自断点失效——同一段对话实测，工作集固定时第 3 次请求命中 2,432 token，按动作交替工作集时仅命中 1,536 token、切换后的首次请求仅 8%；26 题批次共 92 次切换，其重算成本高于裁剪 schema 的收益。首轮裁剪无此代价：该次请求缓存必然为空，且 `INIT_TOOLS` 是 `READY_TOOLS` 的前缀，首轮的 tools 段可在次轮继续命中。实测前缀（system + user + tools）由 2,670 token/次降至首轮 708、其后 1,691，全批 3.56M → 3.24M（−9.1%）。越阶段调用在客户端拦下并回传可用工具清单；连续两轮未调用工具则恢复全量，避免窄工具集阻塞批量运行。逻辑见 `src/zerox_core/phases.py`（纯函数、离线可测）。
+
+**7. 搜索命中直接给出声明范围。** `search_code` 在方法/构造函数的命中行尾附上该声明的 `[起-止]` 行号，模型不必再查一次文件结构即可按范围读取。结构解析复用 `get_file_internal_structure` 同一份索引（`java_structure.py`）；源码由服务端一次批量回读（单次搜索最多 5 个文件、每个只取前 4000 行，用固定前缀分隔行拼接），回读失败、越界或文件过大时该条不标注，结果照常返回。依据是此前执行记录中读取区间中位 71 行而所在方法中位 20 行、83% 的读取越出方法边界：标注只增加十余字符和一次回读，减少的是方法外的代码。尚未做批次对照，收益幅度待测。
+
 ## 初步实验（Defects4J）
 
-实验环境：Defects4J 3.0.1（`v3.0.1-7-g8c16da82`）、Java 11、工作区位于 ext4、模型为 DeepSeek `deepseek-flash`、`temperature=0`。数据来自当前批次的 `benchmark_metrics.jsonl`；`审计` 与 `验证` 分别为 `python src/audit.py` 与 `python src/audit.py --verify` 的输出。历史批次归档于 `logs/archive/`，不计入本表。
+实验环境：Defects4J 3.0.1（`v3.0.1-7-g8c16da82`）、Java 11、工作区位于 ext4、模型为 DeepSeek `deepseek-flash`、`temperature=0`。数据来自当前批次的 `benchmark_metrics.jsonl`；`审计` 与 `验证` 分别为 `python src/audit.py` 与 `python src/audit.py --verify` 的输出。历史批次归档于 `logs/archive/`，不计入本表。表中 `Tokens` 由引入首轮裁剪之前的版本测得（固定前缀 2,670 token/次），同批重跑时该部分约低 9%，其余指标不受影响。
 
 | Bug编号 | 状态 | 耗时（秒）| Tokens | 轮次 | 对话轮数 | 补丁请求 | 测试次数 | 审计 | 验证 |
 | :--- | :--- | :--- | :--- | :- | :- | :- | :- | :--- | :--- |
@@ -107,7 +111,7 @@ ZeroX/
 ├── requirements.txt        # 固定版本的运行依赖
 ├── src/zerox.py            # agent入口：大模型循环、上限计数、指标（唯一写入方）
 ├── src/zerox_server.py     # MCP 服务端：访问工作区的 7 个工具
-├── src/zerox_core/         # 无状态纯函数：配置/schema/命令执行 + 各工具底层（搜索/诊断/结构/补丁）
+├── src/zerox_core/         # 无状态纯函数：配置 / schema / 阶段 / 命令执行 + 各工具底层（搜索/诊断/结构/补丁）
 ├── src/worklog.py          # 独立版本控制模块（blob + append-only 事件 + 回滚）
 ├── src/audit.py            # 事后审计：Fixed 与 Verified Fixed，运行时不修改文件
 ├── case/                   # 不依赖 Defects4J 的 Java 样例：config.json + bugs/{id}/{src,test}/ + work/
@@ -205,11 +209,11 @@ case/
 
 | Bug | 状态 | 耗时（秒）| Tokens | 轮次 | 对话轮数 | 审计 | 验证 |
 | :-- | :-- | --: | --: | --: | --: | :-- | :-- |
-| List_999 | Fixed | 17.54 | 46,341 | 3 | 10 | clean | Verified Fixed |
-| SessionStore_11 | Fixed | 16.81 | 44,969 | 2 | 10 | clean | Verified Fixed |
-| RenderService_7 | Fixed | 12.47 | 35,167 | 1 | 9 | clean | Verified Fixed |
+| List_999 | Fixed | 14.64 | 24,606 | 2 | 8 | clean | Verified Fixed |
+| SessionStore_11 | Fixed | 14.18 | 35,665 | 2 | 11 | clean | Verified Fixed |
+| RenderService_7 | Fixed | 9.24 | 23,750 | 1 | 8 | clean | Verified Fixed |
 
-合计 3/3 修复、126,477 tokens、52.88 秒。`SessionStore_11` 的双根因（组合条件 + touch 重置生命周期）须两处同改，`RenderService_7` 的堆栈指向中层解引用点、根因在深层初始化循环——仅加 null 检查仍失败。
+合计 3/3 修复、84,021 tokens、38.06 秒，均为引入首轮裁剪工具集之后测得（固定前缀首轮 708 token、其后 1,691）。`SessionStore_11` 的双根因（组合条件 + touch 重置生命周期）须两处同改，`RenderService_7` 的堆栈指向中层解引用点、根因在深层初始化循环——仅加 null 检查仍失败。
 
 **6. 性能说明（WSL）：将 `workspace_root` 置于 ext4 而非 `/mnt/...`**
 
@@ -231,7 +235,7 @@ case/
 
 1. **运行期唯一的路径约束是「位于 `{workspace}` 内」**，是否改动测试文件由 `audit.py` 事后判定；早期版本的 `src/main/java` 白名单与测试树 `md5` 基线已移除，原因见 [`docs/config.md`](docs/config.md)。
 2. **唯一的硬性上限是每个Bug的测试执行次数**（`agent.max_tests`，默认 12），且不向agent报告剩余次数 —— 把测试描述为需要节省的资源会使agent回避验证，与「补丁免费、测试是唯一可靠信号」的提示词相矛盾。补丁数量与读取次数不受限制。
-3. **`run_test` 不会自行重置工作区**，仅当显式传入 `force_checkout: true`（基准客户端在每个Bug首次调用时设置）或Bug变化且无待处理补丁时才检出；存在待处理补丁时切换Bug会被拒绝而非静默清除。
+3. **`run_test` 不会自行重置工作区**，仅当基准客户端在任务首跑注入 `force_checkout: true`（该参数不在工具 schema 中，模型无法主动要求重置，见 [`docs/config.md`](docs/config.md)）或Bug变化且无待处理补丁时才检出；存在待处理补丁时切换Bug会被拒绝而非静默清除。
 
 ## 局限性
 
