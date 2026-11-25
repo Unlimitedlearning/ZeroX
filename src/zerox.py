@@ -706,7 +706,8 @@ async def main():
             total_start_time = time.time()
             
             for bug in BUGS_TO_TEST:
-                # 【修复 Bug 2】接收 3 个返回值；resume 只对 --resume-bug 指定的那个生效
+                # 【返回值】run_single_bug 给出 (status, elapsed, usage, counters)；
+                # resume 只对 --resume-bug 指定的那个 Bug 生效。
                 try:
                     status, elapsed, usage, counters = await run_single_bug(
                         bug, session, resume=(bug == RESUME_BUG)

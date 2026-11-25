@@ -71,7 +71,7 @@
 
 **`run_test` 不会自行重置工作区。** 仅当调用方注入 `force_checkout: true`（基准客户端在任务首跑注入一次；该参数不在工具 schema 里，模型无法主动要求重置），或Bug标识符变化且无待处理补丁时才执行检出；存在待处理补丁时切换Bug会被拒绝而非静默清除 —— 旧规则（`reset_task_state` 翻转 `IS_TASK_INITIALIZED` 触发重新检出）正是agent「停滞在 `run_test`」的原因：每次重试都运行在刚检出、仍含Bug的代码上。
 
-> **已知盲点：** 单文件样例（`case/config.json`）将被测代码与测试驱动程序置于同一文件，`audit_test_globs` 无法区分二者，故该配置中设为 `[]`，所有补丁均审计为 `clean`，仅依靠提示词约束。
+> **已知盲点：** `case/config.json` 的测试文件放在工作区之外，`patch_must_be_under_workspace` 已经让 agent 改不到它；`audit_test_globs` 因而设为 `[]`，所有补丁一律判 `clean`。也就是说，这套配置下审计只起「没有越界改动」的兜底作用，真正的保护来自工作区边界，而非审计规则。
 
 ## `agent` —— 行为参数与提示词
 

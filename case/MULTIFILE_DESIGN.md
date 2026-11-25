@@ -39,7 +39,7 @@ case/bugs/{bug_id}/
 `printStackTrace` 把堆栈写入 `[FAIL]` 详情，agent 能看到抛出点与调用链。
 bug_id 用业务中性名（如 `RenderService_7`），避免 `NullRef` 之类词直接剧透异常类型。
 
-## 样例规格（6 个）
+## 首批样例规格
 
 ### SessionStore_11 · 会话状态机（已落地）
 
@@ -70,51 +70,19 @@ bug_id 用业务中性名（如 `RenderService_7`），避免 `NullRef` 之类�
 - 根因类型：初始化遗漏导致的空引用；考察能力：异常堆栈阅读 + 症状到根因的跨层追踪
 - 验证：正确版 8/8，bug 版 `FAILED (3)`，只修表层 `FAILED (3)`，全修 `All tests passed`
 
-### RateLimiter_302 · 滑动窗口限流
+### 草案中被替换的五个
 
-- 文件：`Window.java`（时间戳队列 + prune）、`RateLimiter.java`（allow）、`LimiterService.java`
-- 调用链：`LimiterService.allow → RateLimiter.allow → Window.prune`
-- 根因：`prune` 的裁剪条件 `<= now - windowMs` 改为 `<`
-- 症状：特定时间序列下旧请求未被清除，第 N 次 allow 误判超限
-- 根因类型：off-by-one（边界）；定位难度：跨方法
-
-### JsonQuery_303 · 递归路径求值
-
-- 文件：`JsonNode.java`（树）、`JsonParser.java`（解析）、`JsonQuery.java`（eval）、`QueryService.java`
-- 调用链：`QueryService.get → JsonQuery.eval → JsonNode.child`
-- 根因：数组索引解析 `substring(1, len-1)` 改为 `substring(1, len)`
-- 症状：带数组的路径取值时索引解析出界或错位
-- 根因类型：off-by-one（字符串边界）；定位难度：跨方法
-
-### LruCache_304 · LRU 缓存
-
-- 文件：`DList.java`（双向链表）、`LruCache.java`（get/put/evict）、`CacheService.java`
-- 调用链：`CacheService.load → LruCache.get → DList.moveToHead`
-- 根因：`LruCache.get` 命中后漏调 `moveToHead`
-- 症状：get 返回值正确，但特定访问序列后淘汰了刚访问过的热点 key
-- 根因类型：状态更新遗漏；定位难度：跨方法（症状不指向 get 本身）
-
-### ExprEval_305 · 表达式求值
-
-- 文件：`Tokenizer.java`、`ExprEvaluator.java`（调度场）、`CalcService.java`
-- 调用链：`CalcService.eval → ExprEvaluator.run → Tokenizer.next`
-- 根因：优先级比较 `prec(op) <= prec(top)` 改为 `<`
-- 症状：同优先级运算符结合性错误，如 `a-b-c` 算成 `a-(b-c)`
-- 根因类型：条件逻辑；定位难度：跨方法
-
-### GraphPath_306 · 图最短路
-
-- 文件：`Graph.java`（邻接表）、`Bfs.java`（shortest）、`PathService.java`
-- 调用链：`PathService.distance → Bfs.shortest → Graph.neighbors`
-- 根因：`visited` 标记从"入队时"挪到"出队时"
-- 症状：特定图结构下同一节点重复入队，最短路距离错误
-- 根因类型：状态更新时机；定位难度：跨方法
+`RateLimiter_302`、`JsonQuery_303`、`LruCache_304`、`ExprEval_305`、`GraphPath_306`
+最初都按「单方法条件写错」设计（裁剪边界 `<=`、字符串下标、漏调 `moveToHead`、
+优先级比较用 `<=`、`visited` 标记时机）。落地时这批被全部重做：这类根因落在模型
+最熟悉的教科书分布上，修复率会虚高。最终规格见下文第二批（`LruCache_304`、
+`ExprEval_305`、`GraphPath_306`）与第四批（`RateLimiter_302`、`JsonQuery_303`）。
 
 ## 难度对标
 
 | 维度 | 本方案 | Defects4J 中等 |
 | :-- | :-- | :-- |
-| 文件数 | 4–7 生产（含干扰）+ 1 测试 | 1–3 |
+| 文件数 | 3–7 生产（含干扰）+ 1 测试（`List_999` 为单文件基础样例，不计入） | 1–3 |
 | 根因位置 | 底层，隔服务层，需从干扰链中分辨 | 单方法，偶跨文件 |
 | 症状指向 | 不指向根因（含异常堆栈只指中层） | 常不指向 |
 | 期望值可见 | 否（测试外置） | 测试可读但需推断 |
@@ -128,8 +96,8 @@ bug_id 用业务中性名（如 `RenderService_7`），避免 `NullRef` 之类�
    多处 bug 追加验证"只修一处仍失败"，异常类追加验证"只修表层仍失败"；
 4. 首批已落地 3 个（`List_999`、`SessionStore_11`、`RenderService_7`）；第二、三批各
    落地 5 个高难度样例；第四批再落地 7 个资源生命周期型样例。共 20 个已写入
-   `benchmark_bugs`。上面的 6 个规格中未实现的 4 个暂缓——其中 3 个是单点 off-by-one，
-   属于模型最熟悉的教科书模式，优先级下调。
+   `benchmark_bugs`。草案里另外 5 个没有按原规格实现——根因在落地时全部重做，
+   见上一节与第二、四批。
 
 ## 第二批：契约型高难度样例（已落地 5 个）
 
@@ -199,9 +167,9 @@ bug_id 用业务中性名（如 `RenderService_7`），避免 `NullRef` 之类�
   （等值时仍相等，碰撞合法）、重复 id 用 `<=` 插入（测试中 id 唯一的场景语义相同）、
   在 `trip()` 而非 `recordFailure` 里清零（第三条修复方案，与现方案等价）。
 
-`case_verify` 的 bug 版失败数相应更新为 4/3/6/3/6/7/4/6/2/3。
+`case_verify` 的 bug 版失败数相应更新为 4/3/6/3/6/7/4/6/2/3（前 10 个样例）。
 
-### 第四批：资源生命周期型样例（已落地 7 个）
+## 第四批：资源生命周期型样例（已落地 7 个）
 
 七个新样例把根因放在**状态/资源的生命周期节点**上——回绕、重置、状态切换、
 结算释放、删除遍历、入队条件、比较语义。共同特征是主流路径保持正确：
@@ -227,7 +195,7 @@ bug 版失败数为 4/3/6/3/6/7/4/6/2/3/2/6/3/2/4/3/5；
 另外补了一条超大键测试覆盖哈希环的回绕分支——原先的键范围 0–199 永远碰不到它，
 导致「回绕到环尾」这个错误变体被漏过。
 
-### 已知局限
+## 已知局限
 
 这 20 个仍是 AI 生成的小规模合成样例（生产类 18–122 行，多数 40–80 行），尚未做人类盲评（HPR）、
 Pass@1 难度校准或跨模型验证。定位是**可控回归集**：验证工具链改动与受控消融，

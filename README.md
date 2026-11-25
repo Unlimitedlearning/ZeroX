@@ -115,7 +115,7 @@ ZeroX/
 ├── src/worklog.py          # 独立版本控制模块（blob + append-only 事件 + 回滚）
 ├── src/audit.py            # 事后审计：Fixed 与 Verified Fixed，运行时不修改文件
 ├── case/                   # 不依赖 Defects4J 的 Java 样例：config.json + bugs/{id}/{src,test}/ + work/
-├── tools/                  # new_run.py（归档批次）、selftests/（离线自测，无需 WSL）
+├── tools/                  # new_run.py（归档批次）、show_setup_cmd.py（打印渲染后的命令）、selftests/（离线自测，无需 WSL）
 └── logs/                   # 运行日志、工作日志、blob 存储及基准指标
 ```
 
