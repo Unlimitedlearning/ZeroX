@@ -2,6 +2,8 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
+> **本项目已归档，不再更新（2026-11-25）。** 为什么停在此时、停在什么位置、哪些结论能用与不能用，见 [`docs/Filing.md`](docs/Filing.md)。
+
 ## 项目概述
 
 ZeroX 是一个基于模型上下文协议（MCP）的自动程序修复（APR）实验框架。工具链限定为 7 个，要求agent将推理写入外部工作日志 `work_log.jsonl`；该日志每轮被重建为常驻的「活状态卡」，使上下文压缩后的恢复不依赖agent主动读取历史。
