@@ -200,7 +200,11 @@ case/
 └── work/{bug_id}/                 # 工作区：由 setup_cmd 重建，git 忽略
 ```
 
-- 已落地三个样例：`List_999`（单文件生产类 `SortedInts`，基线 `7/10`，单一根因对应多个表象）、`SessionStore_11`（3 生产 + 3 干扰，双根因，只修一处仍失败）、`RenderService_7`（4 生产 + 3 干扰，空引用异常类，测试打印堆栈，只修表层仍失败）。
+- 已落地 20 个样例。基础三个：`List_999`（单文件生产类 `SortedInts`，基线 `7/10`，单一根因对应多个表象）、`SessionStore_11`（3 生产 + 3 干扰，双根因，只修一处仍失败）、`RenderService_7`（4 生产 + 3 干扰，空引用异常类，测试打印堆栈，只修表层仍失败）。
+- 高难度五个（症状不指向根因，表层修法无效）：`LruCache_304`（底层链表 `moveToHead` 的提前返回条件写反，只有访问最久未用节点后才暴露淘汰错误）、`ExprEval_305`（右结合运算符被当成左结合，普通优先级测试全过）、`GraphPath_306`（最短路距离正确但前驱指针错，只有路径断言能抓）、`Reservation_31`（先写库存后校验，异常本身正确但异常后状态被污染）、`Checksum_29`（重试路径用异或清除未置位的 bit，任务被静默跳过）。
+- 契约型五个（同样症状不指向根因，但根因是跨调用的契约而非局部条件）：`DedupQueue_401`（`equals` 重写而 `hashCode` 缺失，去重静默失效）、`TemplateEngine_402`（递归环检测的活跃集合返回时未回退，合法重复引用被误判为环）、`Pager_403`（插入不维持有序不变量，分页二分查找失效）、`PriorityBatch_404`（比较器不处理同优先级，队列不保证到达顺序）、`CircuitBreaker_405`（状态机的半开计数在失败时未清零，第二次恢复过快）。
+- 第四批七个（覆盖新领域，根因集中在"状态/资源的生命周期"）：`RateLimiter_302`（环形窗口回绕后最旧时间戳仍读首槽，限流误拒）、`JsonQuery_303`（批量路径查询复用游标但位置未归零，第二条起结果错位）、`CsvParser_406`（引号开启后未切换状态，引号后的分隔符不再切分）、`OrderBook_407`（结算释放的是原始冻结额而非剩余额，成交记录正确但账户不守恒）、`ShardRouter_408`（移除节点时正向遍历边删，虚拟点残留）、`TopoSort_409`（入度≤1 即入队，多前驱节点被重复调度）、`VersionOrder_410`（版本号分段用字典序比较，1.9 被判大于 1.10）。
+- 两道离线验收，不需要 WSL 或 API：`python tools/selftests/case_verify.py` 检查每个样例「注入 bug 后部分失败、修复后全过」（17 个高难度样例实测 bug 版分别失败 4/3/6/3/6/7/4/6/2/3/2/6/3/2/4/3/5 条）；`python tools/selftests/case_discriminator.py` 先还原正确实现，再注入 32 个「看似合理但语义错误」的变体，全部被拒绝才算测试有分辨力（实测 32/32）。在 bug 版上注入会产生假阳性——基线本来就挂在那几条上。
 - 测试输出契约统一：每条用例打印 `[PASS]` / `[FAIL]`，末行输出 `All tests passed` 或 `FAILED (n)`；判定以输出正则为准，不依赖进程退出码。
 - 源码与测试都在工作区**外部**，agent 只能改 `work/{bug_id}/` 里的副本，故无需 `patch_deny_globs`。`setup_cmd` 每次先清空工作区再复制，避免陈旧文件干扰。
 - 新增样例：按 `bugs/{bug_id}/src` 与 `bugs/{bug_id}/test` 放好文件，把 `{bug_id}` 加入 `case/config.json` 的 `benchmark_bugs` 即可，`setup_cmd` / `test_cmd` 无需改动。细节见 `case/README.md` 与 `case/MULTIFILE_DESIGN.md`。
